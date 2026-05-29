@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import concurrent.futures as cf
 import json
+import os
 import sys
 import unicodedata
 
@@ -20,7 +21,7 @@ import requests
 
 from .client import LoginError, PayPayClient
 from .config import Settings
-from . import parsers, costs, market
+from . import parsers, costs, market, config
 
 
 def _yen(v):
@@ -120,6 +121,27 @@ def cmd_fees(client: PayPayClient, args) -> int:
                 print("  " + _lj(r["date"], 12) + _lj(r["side"], 6) + _lj(r["brand"] or "", 16)
                       + _rj(f"{r['usd']:.2f}", 9) + _rj(f"{r['applied_fx']:.2f}", 9)
                       + _rj(f"{r['market_mid']:.2f}", 9) + _rj(_yen(r["cost"]), 8))
+
+    _emit(payload, args.json, render)
+    return 0
+
+
+def cmd_accounts(client, args) -> int:
+    """List configured account profiles (needs no credentials)."""
+    accts = config.list_accounts()
+    active = getattr(args, "account", None) or os.environ.get("PAYPAY_ACCOUNT") or config.DEFAULT_ACCOUNT
+    payload = {"accounts": accts, "active": active}
+
+    def render(p):
+        if not p["accounts"]:
+            print("no accounts configured.")
+            print("  default : add credentials to ~/.paypay-sec/.env")
+            print("  named   : add ~/.paypay-sec/<name>.env, then use -a <name>")
+            return
+        print("configured accounts (* = active for this invocation):")
+        for a in p["accounts"]:
+            print(f"  {'*' if a == p['active'] else ' '} {a}")
+        print("\nuse:  paypay -a <name> <command>   (or set PAYPAY_ACCOUNT)")
 
     _emit(payload, args.json, render)
     return 0
@@ -349,6 +371,9 @@ def build_parser() -> argparse.ArgumentParser:
                         help="market: usa | japan (aliases: jp, us, 米国株, 日本株). default usa")
     common.add_argument("--no-cache", action="store_true",
                         help="bypass the local response cache (always hit the API)")
+    common.add_argument("-a", "--account", default=None,
+                        help="account profile: reads ~/.paypay-sec/<name>.env "
+                             "(default account uses ~/.paypay-sec/.env)")
 
     p = argparse.ArgumentParser(prog="paypay", description="Read-only PayPay証券 client (Phase 1)")
     sub = p.add_subparsers(dest="command", required=True)
@@ -356,7 +381,8 @@ def build_parser() -> argparse.ArgumentParser:
                      ("balance", cmd_balance), ("portfolio", cmd_portfolio),
                      ("history", cmd_history), ("invtrust", cmd_invtrust),
                      ("total", cmd_total), ("assets", cmd_assets), ("trades", cmd_trades),
-                     ("fees", cmd_fees), ("cache-clear", cmd_cache_clear)):
+                     ("fees", cmd_fees), ("accounts", cmd_accounts),
+                     ("cache-clear", cmd_cache_clear)):
         sp = sub.add_parser(name, parents=[common])
         sp.set_defaults(func=fn)
         if name == "trades":
@@ -373,8 +399,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
+    # `accounts` only lists profiles — it needs no credentials / network.
+    if args.func is cmd_accounts:
+        return cmd_accounts(None, args)
     try:
-        client = PayPayClient(Settings.from_env(),
+        settings = Settings.from_env(getattr(args, "account", None))
+        client = PayPayClient(settings,
                               cache_ttl=0 if getattr(args, "no_cache", False) else None)
         return args.func(client, args)
     except LoginError as e:
