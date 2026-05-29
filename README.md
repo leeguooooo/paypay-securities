@@ -40,10 +40,17 @@ PAYPAY_COOKIE=...   # ログイン済みブラウザの Cookie ヘッダ全体(.
 
 ```bash
 cd skills/paypay-securities
-uv run paypay assets     # 保有資産の総覧(保有銘柄 + 現金 + 総資産合計)
-uv run paypay trades     # 取引履歴
-uv run paypay fees       # コスト分析(明示手数料 + 実測の為替スプレッド)
+uv run paypay assets               # 保有資産の総覧(保有銘柄 + 現金 + 総資産合計)
+uv run paypay review               # 復盘: 資産・実現/未実現損益・入金・コスト・リスク照合
+uv run paypay review --format lark # Feishu/Lark 向けの箇条書き出力
+uv run paypay trades-summary       # 銘柄別の買い/売り/純投入/実現損益
+uv run paypay risk                 # 保有比率 vs 自分のルール照合(売買助言ではない)
+uv run paypay fees                 # コスト分析(明示手数料 + 実測の為替スプレッド)
 ```
+
+どこからでも実行(`cd` 不要):ランチャーを PATH に通す —
+`ln -s "$HOME/.claude/skills/paypay-securities/bin/paypay" ~/.local/bin/paypay`
+→ `paypay review --format lark`。
 
 コマンド一覧と設計メモ:
 [`skills/paypay-securities/SKILL.md`](skills/paypay-securities/SKILL.md)。
