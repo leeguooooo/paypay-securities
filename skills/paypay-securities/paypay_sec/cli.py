@@ -85,6 +85,32 @@ def _emit(obj, as_json: bool, render):
         render(obj)
 
 
+def _expected_phrase(req) -> str:
+    qty_or_amt = req.qty if req.qty is not None else req.amount_jpy
+    # normalize numbers like 1.0 -> "1"
+    q = int(qty_or_amt) if float(qty_or_amt).is_integer() else qty_or_amt
+    return f"{req.symbol} {q}"
+
+
+def make_confirmer(reader=input):
+    """Return confirmer(req, preview) -> bool. Requires the user to type the exact
+    '<SYMBOL> <qty|amount>' phrase — defends against a reflexive Enter."""
+    def confirmer(req, preview) -> bool:
+        want = _expected_phrase(req)
+        side = req.side.value.upper()
+        total = (preview or {}).get("total_jpy")
+        size = f"qty {req.qty}" if req.qty is not None else f"¥{req.amount_jpy:,}"
+        total_frag = f"  est. total ¥{total:,}" if total is not None else ""
+        print(f"\n⚠ LIVE ORDER — {side} {req.symbol} {size}{total_frag}")
+        print(f"  To place this order, type exactly:  {want}")
+        try:
+            typed = (reader(f"  confirm> ") or "").strip()
+        except (EOFError, KeyboardInterrupt):
+            return False
+        return typed == want
+    return confirmer
+
+
 def cmd_login(client: PayPayClient, args) -> int:
     info = client.login()
     out = {

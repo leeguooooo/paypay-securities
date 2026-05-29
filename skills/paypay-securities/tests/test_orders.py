@@ -2,6 +2,7 @@ from _runner import run
 from paypay_sec.orders import build, OrderRequest, Side, OrderType, OrderError
 from paypay_sec.guards import TradeConfig, GuardContext
 from paypay_sec.orders import dry_run, place, PipelineResult
+from paypay_sec.cli import make_confirmer
 
 
 def test_build_limit_buy_by_qty():
@@ -125,6 +126,25 @@ def test_place_does_not_submit_when_guard_fails():
     res = place(req, TradeConfig(max_order_jpy=10000), GuardContext(),
                 confirm=_confirm_ok, submit=submit_fn, confirmer=lambda r, p: True)
     assert not res.submitted and submitted["n"] == 0
+
+
+def test_confirmer_accepts_exact_phrase():
+    req = build(market="usa", symbol="TSLA", side="buy", qty=1, limit=250.0)
+    preview = {"total_jpy": 40000}
+    yes = make_confirmer(reader=lambda prompt: "TSLA 1")
+    assert yes(req, preview) is True
+
+
+def test_confirmer_rejects_wrong_phrase():
+    req = build(market="usa", symbol="TSLA", side="buy", qty=1, limit=250.0)
+    no = make_confirmer(reader=lambda prompt: "yes")
+    assert no(req, {"total_jpy": 40000}) is False
+
+
+def test_confirmer_amount_phrase():
+    req = build(market="usa", symbol="QQQ", side="buy", amount_jpy=50000, limit=500.0)
+    yes = make_confirmer(reader=lambda prompt: "QQQ 50000")
+    assert yes(req, {"total_jpy": 50000}) is True
 
 
 if __name__ == "__main__":
