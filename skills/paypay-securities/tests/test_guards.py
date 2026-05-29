@@ -110,5 +110,24 @@ def test_guard_trading_hours_outside_window():
     assert any("hours" in s.lower() or "時段" in s for s in check_guards(_req(), cfg, ctx))
 
 
+def test_guard_trading_hours_inside_window():
+    cfg = TradeConfig(trading_hours={"usa": {"tz": "UTC", "windows": [["13:30", "20:00"]]}})
+    ctx = GuardContext(now=datetime(2026, 5, 29, 14, 0, tzinfo=timezone.utc), today_order_count=0)
+    assert check_guards(_req(), cfg, ctx) == []  # inside window -> no violation
+
+
+def test_guard_hours_undefined_market_no_violation():
+    cfg = TradeConfig(trading_hours={"japan": {"tz": "Asia/Tokyo", "windows": [["09:00", "15:00"]]}})
+    ctx = GuardContext(now=datetime(2026, 5, 29, 2, 0, tzinfo=timezone.utc), today_order_count=0)
+    # market 'usa' has no window defined -> _within_hours returns None -> no violation
+    assert check_guards(_req(market="usa"), cfg, ctx) == []
+
+
+def test_guard_collar_skips_nonpositive_quote():
+    cfg = TradeConfig(price_collar_pct=5)
+    ctx = GuardContext(now=None, today_order_count=0, current_quote=-1.0)
+    assert check_guards(_req(limit=9999.0), cfg, ctx) == []  # bad/negative quote -> skip, no crash
+
+
 if __name__ == "__main__":
     raise SystemExit(run(globals()))

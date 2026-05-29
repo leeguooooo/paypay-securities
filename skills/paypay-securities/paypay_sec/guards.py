@@ -71,9 +71,7 @@ def write_default_trade_config(account: Optional[str] = None, *, config_path: Op
     return path
 
 
-from dataclasses import dataclass as _dc
-
-@_dc(frozen=True)
+@dataclass(frozen=True)
 class GuardContext:
     """External facts the guards need; injected so the guards stay pure/testable."""
     now: Optional[datetime] = None
@@ -83,7 +81,11 @@ class GuardContext:
 
 
 def _within_hours(now: datetime, market: str, trading_hours: dict) -> Optional[bool]:
-    """True/False if a window is defined for the market, else None (no opinion)."""
+    """True/False if a window is defined for the market, else None (no opinion).
+
+    Only same-day windows are supported; a cross-midnight window like
+    ["22:00", "02:00"] is NOT handled by the string HH:MM comparison.
+    """
     spec = trading_hours.get(market)
     if not spec or now is None:
         return None
@@ -102,7 +104,10 @@ def _within_hours(now: datetime, market: str, trading_hours: dict) -> Optional[b
 def check_guards(req, cfg: TradeConfig, ctx: GuardContext, preview: Optional[dict] = None) -> List[str]:
     """Return a list of violation strings (empty = pass). Runs every check whose
     inputs are available; checks needing a `preview` (amount/pct) are skipped when
-    preview is None (pre-confirm pass) and enforced when it is given (post-confirm)."""
+    preview is None (pre-confirm pass) and enforced when it is given (post-confirm).
+
+    `req` is an OrderRequest (left untyped here because OrderType is imported
+    function-locally below to avoid the orders.py circular import)."""
     from .orders import OrderType
     v: List[str] = []
 
@@ -116,7 +121,7 @@ def check_guards(req, cfg: TradeConfig, ctx: GuardContext, preview: Optional[dic
         v.append(f"daily order cap reached ({ctx.today_order_count}/{cfg.daily_order_cap})")
 
     # price collar — only if we have both a limit and a current quote
-    if req.limit_price is not None and ctx.current_quote:
+    if req.limit_price is not None and ctx.current_quote is not None and ctx.current_quote > 0:
         dev = abs(req.limit_price - ctx.current_quote) / ctx.current_quote * 100.0
         if dev > cfg.price_collar_pct:
             v.append(f"price collar: limit deviates {dev:.1f}% from quote "
@@ -134,7 +139,7 @@ def check_guards(req, cfg: TradeConfig, ctx: GuardContext, preview: Optional[dic
         if total is not None:
             if total > cfg.max_order_jpy:
                 v.append(f"order total ¥{total:,} exceeds max_order_jpy ¥{cfg.max_order_jpy:,}")
-            if ctx.portfolio_total_jpy:
+            if ctx.portfolio_total_jpy is not None and ctx.portfolio_total_jpy > 0:
                 pct = 100.0 * total / ctx.portfolio_total_jpy
                 if pct > cfg.max_pct_of_portfolio:
                     v.append(f"order is {pct:.1f}% of portfolio (> max {cfg.max_pct_of_portfolio}%)")
