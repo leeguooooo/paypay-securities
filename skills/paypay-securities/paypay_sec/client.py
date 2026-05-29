@@ -372,3 +372,18 @@ class PayPayClient:
             except OSError:
                 pass
         return names
+
+    # ---- WRITE methods (orders). NO _run_resilient, NO _cached. Single-shot. ----
+    # Endpoint shapes are filled in from the Phase 0 capture
+    # (docs/superpowers/notes/2026-05-29-phase0-us-order-capture.md).
+    def order_confirm(self, req) -> dict:
+        raise NotImplementedError("order confirm endpoint pending Phase 0 capture")
+
+    def order_submit(self, token: str, req) -> dict:
+        raise NotImplementedError("order submit endpoint pending Phase 0 capture")
+
+    def open_orders(self, market: str = "usa") -> list:
+        raise NotImplementedError("open-orders endpoint pending Phase 0 capture")
+
+    def order_cancel(self, order_id: str, market: str = "usa") -> dict:
+        raise NotImplementedError("cancel endpoint pending Phase 0 capture")
