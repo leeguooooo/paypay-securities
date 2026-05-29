@@ -5,9 +5,9 @@
 A read-only command-line client for a **PayPay証券 (PayPay Securities, ペイペイ証券)**
 account — balance, holdings, mutual funds (投資信託), US stocks (米国株), transaction
 history, a measured cost analysis (incl. the FX spread PayPay never itemizes), and
-a portfolio **review** with realized/unrealized P&L and risk checks. Great for NISA
-and routine investment review. Distributed as an [agent skill](https://skills.sh)
-and usable as a plain CLI.
+a portfolio **review** with realized/unrealized P&L. Great for NISA and routine
+investment review. Data display only — no advice. Distributed as an
+[agent skill](https://skills.sh) and usable as a plain CLI.
 
 > Read-only: it never places or cancels orders. Use on your own account at your
 > own risk — automated access may conflict with PayPay証券's terms of service.
@@ -43,10 +43,9 @@ session + cache. `uv run paypay accounts` lists them.
 ```bash
 cd skills/paypay-securities
 uv run paypay assets               # consolidated holdings + cash + grand total
-uv run paypay review               # review: assets, realized/unrealized P&L, deposits, costs, risk
+uv run paypay review               # review: assets, realized/unrealized P&L, deposits, costs, holdings
 uv run paypay review --format lark # Feishu/Lark-friendly bullets
 uv run paypay trades-summary       # per-brand buy/sell/net-invested/realized P&L
-uv run paypay risk                 # holdings vs your concentration rules (not advice)
 uv run paypay fees                 # cost analysis (explicit fees + measured FX spread)
 ```
 

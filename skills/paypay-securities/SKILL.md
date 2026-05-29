@@ -4,8 +4,8 @@ description: >-
   Read-only CLI & agent skill for a PayPay証券 (PayPay Securities, ペイペイ証券)
   account: check portfolio, holdings, balance, 投資信託, 米国株, 取引履歴
   (transaction history), fees & FX-spread, and generate a 復盘/review with
-  realized & unrealized P&L and risk checks. Use when the user wants to view,
-  review, or report a PayPay証券 / PayPay investment account. Never trades.
+  realized & unrealized P&L. Use when the user wants to view, review, or report
+  a PayPay証券 / PayPay investment account. Data display only — never trades.
 ---
 
 # paypay-securities — read-only PayPay証券 client
@@ -75,23 +75,21 @@ uv run paypay total                 # aggregate 証券 + 投信 invested assets 
 uv run paypay assets                # one-shot consolidated holdings + cash + grand total (parallel)
 uv run paypay trades [--pages N]    # transaction ledger (買付/売却/入金/手数料) + running cash balance
 uv run paypay fees [--detail]       # cost analysis: explicit fees + measured FX spread (+ optional price spread)
-uv run paypay review                # 复盘 summary: assets, realized/unrealized P&L, deposits, costs, risk checks
+uv run paypay review                # 复盘 summary: assets, realized/unrealized P&L, deposits, costs, holdings
 uv run paypay trades-summary        # per-brand buy/sell/net-invested/net-shares/realized P&L
-uv run paypay risk                  # holdings vs your concentration rules (PASS / over-limit)
 uv run paypay accounts              # list configured account profiles
 uv run paypay cache-clear           # clear the local response cache
 ```
 
 Any command takes `-a <name>` to target a non-default account, and
 `--format table|lark|json`. **`--format lark`** emits Feishu/Lark-friendly
-bullets (bold numbers, `+¥`/`-¥`, no wide tables) — use it for `review`,
-`trades-summary`, `risk` when posting to Lark.
+bullets (bold numbers, `+¥`/`-¥`, no wide tables) — use it for `review` /
+`trades-summary` when posting to Lark.
 
-**`review` / `risk` are FACTUAL only** — metrics + checks against YOUR rules; they
-do NOT give buy/sell advice. Risk thresholds default to single-stock 15% /
-leveraged 5% / US-equity 90% / cash-floor 0%; override in
-`~/.paypay-sec/rules.json` (e.g. `{"single_stock_max_pct": 20}`). Realized P&L
-uses average-cost basis.
+**Scope: data display only.** Every command just shows your account's data (or
+factual calculations on it — totals, realized P&L by average-cost basis, cost
+aggregation). It gives NO judgments, NO risk/position rules, NO buy/sell advice,
+and never trades.
 
 **Run from anywhere (no `cd`):** symlink the bundled launcher onto your PATH —
 `ln -s "$HOME/.claude/skills/paypay-securities/bin/paypay" ~/.local/bin/paypay` —
@@ -142,8 +140,8 @@ Flags (place AFTER the subcommand, e.g. `uv run paypay portfolio -m usa -a secon
   (ledger and 取引報告書 PDFs both show 手数料=¥0; cost is baked into 約定価格 +
   為替レート), so the FX-spread number is reconstructed, and the price spread
   (~0.5%/0.7%) is only an optional `--price-spread-pct` estimate.
-- `report.py` — `review` / `trades-summary` / `risk` aggregation: deposits,
-  per-brand buy/sell/net, realized P&L (avg-cost), concentration + rule checks.
+- `report.py` — `review` / `trades-summary` aggregation: deposits, per-brand
+  buy/sell/net, realized P&L (avg-cost). Pure facts — no rules/judgments.
 - `cli.py` — argparse subcommands + rendering (CJK-width-aware tables; table/lark/json).
 
 Dev-only (kept at repo root, NOT shipped with the skill): `tests/` (the fixtures
