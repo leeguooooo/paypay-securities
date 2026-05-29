@@ -2,10 +2,12 @@
 
 [日本語](README.md) | **English**
 
-A read-only command-line client for a **PayPay証券 (PayPay Securities)** account —
-balance, holdings, mutual funds, transaction history, and a measured cost
-analysis (including the FX spread PayPay never itemizes). Distributed as an
-[agent skill](https://skills.sh) and usable as a plain CLI.
+A read-only command-line client for a **PayPay証券 (PayPay Securities, ペイペイ証券)**
+account — balance, holdings, mutual funds (投資信託), US stocks (米国株), transaction
+history, a measured cost analysis (incl. the FX spread PayPay never itemizes), and
+a portfolio **review** with realized/unrealized P&L and risk checks. Great for NISA
+and routine investment review. Distributed as an [agent skill](https://skills.sh)
+and usable as a plain CLI.
 
 > Read-only: it never places or cancels orders. Use on your own account at your
 > own risk — automated access may conflict with PayPay証券's terms of service.

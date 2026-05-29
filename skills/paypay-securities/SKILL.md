@@ -1,12 +1,11 @@
 ---
 name: paypay-securities
 description: >-
-  Read-only access to a PayPay証券 (PayPay Securities, formerly One Tap BUY)
-  account via its web frontend. Use when the user wants to check their PayPay
-  証券 portfolio, holdings, balance / valuation, unrealized P&L, or asset
-  history from the command line. Logs in through /login.json with a trusted-
-  device cookie (no SMS) and parses the server-rendered pages. Phase 1 is
-  READ-ONLY — it never places or cancels orders.
+  Read-only CLI & agent skill for a PayPay証券 (PayPay Securities, ペイペイ証券)
+  account: check portfolio, holdings, balance, 投資信託, 米国株, 取引履歴
+  (transaction history), fees & FX-spread, and generate a 復盘/review with
+  realized & unrealized P&L and risk checks. Use when the user wants to view,
+  review, or report a PayPay証券 / PayPay investment account. Never trades.
 ---
 
 # paypay-securities — read-only PayPay証券 client
