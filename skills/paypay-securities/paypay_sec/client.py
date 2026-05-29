@@ -22,13 +22,20 @@ from pathlib import Path
 
 import requests
 
-from .config import Settings
+from .config import HOME, DEFAULT_ACCOUNT, Settings
 
 BASE = "https://www.paypay-sec.co.jp"
 _UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
        "(KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36")
 _DOMAIN = "www.paypay-sec.co.jp"
-SESSION_FILE = Path.home() / ".paypay-sec" / "session.json"
+SESSION_FILE = HOME / "session.json"   # default account (back-compat)
+
+
+def state_dir(account: str | None) -> Path:
+    """Per-account dir holding session.json + cache/. The default account uses
+    ~/.paypay-sec/ directly (back-compat); named accounts get a subdirectory so
+    their sessions/caches never collide."""
+    return HOME if account in (None, DEFAULT_ACCOUNT) else HOME / account
 
 # user-facing market name -> path slug used by /trade/portfolio/<slug> etc.
 MARKET_ALIASES = {
@@ -51,15 +58,17 @@ class SessionExpired(RuntimeError):
 
 class PayPayClient:
     def __init__(self, settings: Settings | None = None, *,
-                 session_file: Path = SESSION_FILE, use_cache: bool = True,
+                 session_file: Path | None = None, use_cache: bool = True,
                  cache_ttl: int | None = None):
         self.settings = settings or Settings.from_env()
         self.token: str | None = None
-        self.session_file = session_file
+        # per-account state dir (default account → ~/.paypay-sec/, named → subdir)
+        sd = state_dir(self.settings.account)
+        self.session_file = session_file or (sd / "session.json")
         self._from_cache = False
         # response cache: avoids re-hitting (and throttling) the API when several
         # commands / analyses want the same data within a short window.
-        self._cache_dir = session_file.parent / "cache"
+        self._cache_dir = self.session_file.parent / "cache"
         self._cache_ttl = (cache_ttl if cache_ttl is not None
                            else int(os.environ.get("PAYPAY_CACHE_TTL", "120")))
         self._session = requests.Session()

@@ -31,6 +31,11 @@ PAYPAY_PASSWORD=...
 PAYPAY_COOKIE=...   # ログイン済みブラウザの Cookie ヘッダ全体(..._SMS_AUTH_STRING デバイストークンを含むこと)
 ```
 
+**複数アカウント:** 既定アカウントは `~/.paypay-sec/.env`、別名アカウント `<name>` は
+`~/.paypay-sec/<name>.env` を読みます。`-a <name>`(または `PAYPAY_ACCOUNT`)で切り替え:
+`uv run paypay assets -a second`。アカウントごとにセッション・キャッシュは独立。
+`uv run paypay accounts` で一覧表示。
+
 ## 使い方
 
 ```bash

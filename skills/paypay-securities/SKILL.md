@@ -53,6 +53,13 @@ this path is searched first, so the CLI works from any directory). Template in
 Never commit credentials or pass them on the command line. (`PAYPAY_ENV` overrides
 the path; `./.env` / `./spike/.env` are also searched for dev checkouts.)
 
+**Multiple accounts:** each account is a profile. The default account reads
+`~/.paypay-sec/.env`; a named account `<name>` reads `~/.paypay-sec/<name>.env`.
+Select one with `-a <name>` (or the `PAYPAY_ACCOUNT` env var) — e.g.
+`uv run paypay assets -a second`. Each account keeps its OWN session + response
+cache (default → `~/.paypay-sec/`, named → `~/.paypay-sec/<name>/`) so they never
+collide. `paypay accounts` lists the configured profiles.
+
 ## Commands
 
 Run from this skill's directory: `uv run paypay <cmd>` (uv resolves deps from the
@@ -69,8 +76,11 @@ uv run paypay total                 # aggregate 証券 + 投信 invested assets 
 uv run paypay assets                # one-shot consolidated holdings + cash + grand total (parallel)
 uv run paypay trades [--pages N]    # transaction ledger (買付/売却/入金/手数料) + running cash balance
 uv run paypay fees [--detail]       # cost analysis: explicit fees + measured FX spread (+ optional price spread)
+uv run paypay accounts              # list configured account profiles
 uv run paypay cache-clear           # clear the local response cache
 ```
+
+Any command takes `-a <name>` to target a non-default account.
 
 **`total` / `assets` scope:** 証券 (株+ETF) + 投信 holdings + the account cash
 balance, giving the full grand total that matches the app's 保有資産 figure. The
@@ -92,10 +102,12 @@ only on a cold start or when the session has expired (a fetch bouncing to
 `/login/` triggers exactly one automatic re-login). This keeps load off the
 login endpoint instead of authenticating on every command.
 
-Flags (place AFTER the subcommand, e.g. `uv run paypay portfolio -m usa --json`):
+Flags (place AFTER the subcommand, e.g. `uv run paypay portfolio -m usa -a second --json`):
 - `-m, --market <usa|japan>` — market segment. Aliases: `jp`→`japan`, `us`→`usa`,
   `米国株`, `日本株`. Default `usa`.
+- `-a, --account <name>` — account profile (default reads `~/.paypay-sec/.env`).
 - `--json` — machine-readable output.
+- `--no-cache` — bypass the response cache.
 
 ## Architecture (for maintenance)
 
