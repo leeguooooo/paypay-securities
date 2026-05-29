@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Location-independent launcher — run `paypay` from any directory.
+# Symlink onto your PATH, e.g.:
+#   ln -s "$HOME/.claude/skills/paypay-securities/bin/paypay" ~/.local/bin/paypay
+# then: paypay review --format lark
+set -euo pipefail
+SKILL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+exec uv run --project "$SKILL_DIR" paypay "$@"

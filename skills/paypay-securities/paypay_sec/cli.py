@@ -21,7 +21,7 @@ import requests
 
 from .client import LoginError, PayPayClient
 from .config import Settings
-from . import parsers, costs, market, config
+from . import parsers, costs, market, config, report
 
 
 def _yen(v):
@@ -55,6 +55,27 @@ def _lj(s, width: int) -> str:   # left-justify to display width
 def _rj(s, width: int) -> str:   # right-justify to display width
     s = _trunc(s, width)
     return " " * max(0, width - _dw(s)) + s
+
+
+def _signed_yen(v):
+    if v is None:
+        return "—"
+    return f"+¥{v:,}" if v >= 0 else f"-¥{abs(v):,}"
+
+
+def _fmt(args) -> str:
+    if getattr(args, "json", False):
+        return "json"
+    return getattr(args, "fmt", None) or "table"
+
+
+def _emit_fmt(payload, fmt, table_fn, lark_fn) -> None:
+    if fmt == "json":
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+    elif fmt == "lark":
+        lark_fn(payload)
+    else:
+        table_fn(payload)
 
 
 def _emit(obj, as_json: bool, render):
@@ -123,6 +144,172 @@ def cmd_fees(client: PayPayClient, args) -> int:
                       + _rj(f"{r['market_mid']:.2f}", 9) + _rj(_yen(r["cost"]), 8))
 
     _emit(payload, args.json, render)
+    return 0
+
+
+def _gather(client: PayPayClient, pages: int = 8) -> dict:
+    """Fetch everything a review needs, concurrently."""
+    client.ensure_session()
+    tasks = {
+        "ledger": lambda: client.settlement_records(max_pages=pages),
+        "sec": lambda: parsers.parse_holdings(client.brands_html("usa")),
+        "inv": lambda: parsers.parse_invtrust(client.invtrust_top()),
+        "names": client.invtrust_brands,
+    }
+    out = {}
+    with cf.ThreadPoolExecutor(max_workers=len(tasks)) as ex:
+        futs = {k: ex.submit(fn) for k, fn in tasks.items()}
+        for k, f in futs.items():
+            try:
+                out[k] = f.result()
+            except Exception:  # noqa: BLE001
+                out[k] = None
+
+    ledger = out.get("ledger") or []
+    txns = parsers.parse_transactions(ledger)
+    names = out.get("names") or {}
+    holdings = []
+    for h in (out.get("sec") or []):
+        if h.is_cash:
+            continue
+        holdings.append({"name": h.name, "category": "証券", "valuation": h.valuation or 0,
+                         "unrealized_pl": h.unrealized_pl})
+    inv = out.get("inv")
+    if inv:
+        for h in inv.holdings:
+            holdings.append({"name": names.get(str(h["brand_id"])) or f"投信#{h['brand_id']}",
+                             "category": "投信", "valuation": h["valuation"] or 0,
+                             "unrealized_pl": h["unrealized_pl"]})
+    for h in holdings:
+        h["kind"] = report.classify(h["name"], h["category"])
+        h["is_stock"] = h["kind"] == "stock"
+    cash = parsers.current_cash(ledger) or 0
+    total = sum(h["valuation"] for h in holdings) + cash
+    tdates = [t["date"] for t in txns if t["type"] in costs.TRADE_TYPES and t["date"]]
+    series = market.usdjpy_series(min(tdates), max(tdates)) if tdates else {}
+    return {"txns": txns, "holdings": holdings, "cash": cash, "total": total, "fx_series": series}
+
+
+def cmd_review(client: PayPayClient, args) -> int:
+    g = _gather(client, pages=getattr(args, "pages", 8))
+    agg = report.aggregate_trades(g["txns"])
+    fx_cost = costs.compute_costs(g["txns"], g["fx_series"])["fx_spread_cost"]
+    rules = report.load_rules()
+    risk = report.evaluate_risk(g["holdings"], g["total"], g["cash"], rules)
+    unreal = sum((h["unrealized_pl"] or 0) for h in g["holdings"])
+    total, cash = g["total"], g["cash"]
+    hold = sorted(g["holdings"], key=lambda x: -x["valuation"])
+    for h in hold:
+        h["pct"] = round(100.0 * h["valuation"] / total, 1) if total else 0
+    p = {
+        "period": {"from": agg["date_from"], "to": agg["date_to"]},
+        "total_assets": total, "cash": cash, "invested": total - cash,
+        "unrealized_pl": unreal, "realized_pl": agg["realized_pl"],
+        "explicit_fees": agg["explicit_fees"], "fx_spread_cost": fx_cost,
+        "total_cost": agg["explicit_fees"] + fx_cost,
+        "deposits": agg["deposits"], "withdrawals": agg["withdrawals"],
+        "holdings": hold, "trades_by_brand": agg["brands"], "risk": risk,
+        "note": "事実とユーザー定義ルールの照合のみ。売買助言ではありません。",
+    }
+
+    def table(p):
+        pr = p["period"]
+        print(f"PayPay証券 復盘  ({pr['from']} 〜 {pr['to']})\n")
+        print(f"  総資産   : {_yen(p['total_assets'])}   (投資 {_yen(p['invested'])} / 現金 {_yen(p['cash'])})")
+        print(f"  未実現損益: {_signed_yen(p['unrealized_pl'])}")
+        print(f"  実現損益  : {_signed_yen(p['realized_pl'])}  (平均取得単価ベース)")
+        print(f"  取引コスト: {_yen(p['total_cost'])}  (手数料 {_yen(p['explicit_fees'])} + 為替 {_yen(p['fx_spread_cost'])})")
+        print(f"  累計入金  : {_yen(p['deposits'])}   出金: {_yen(p['withdrawals'])}")
+        print("\n  保有:")
+        for h in p["holdings"]:
+            print("    " + _lj(h["name"], 30) + _rj(_yen(h["valuation"]), 11)
+                  + _rj(f"{h['pct']}%", 7) + _rj(_signed_yen(h["unrealized_pl"]), 10))
+        print("\n  リスク照合 (ユーザールール):")
+        for c in p["risk"]["checks"]:
+            print(f"    {'✅' if c['ok'] else '⚠️ '} {c['rule']}: {c['metric']} (上限/下限 {c['limit']})")
+        print(f"\n  注: {p['note']}")
+
+    def lark(p):
+        pr = p["period"]
+        L = [f"**PayPay証券 復盘 ({pr['from']}〜{pr['to']})**", "",
+             "**資産**",
+             f"- 総資産: **{_yen(p['total_assets'])}**(投資 {_yen(p['invested'])} / 現金 {_yen(p['cash'])})",
+             "**損益**",
+             f"- 未実現: **{_signed_yen(p['unrealized_pl'])}**",
+             f"- 実現(平均取得単価): **{_signed_yen(p['realized_pl'])}**",
+             f"- 取引コスト: **{_yen(p['total_cost'])}**(手数料 {_yen(p['explicit_fees'])}+為替 {_yen(p['fx_spread_cost'])})",
+             f"- 累計入金: **{_yen(p['deposits'])}**",
+             "**保有**"]
+        for h in p["holdings"]:
+            L.append(f"- {h['name']}: **{_yen(h['valuation'])}** ({h['pct']}%) {_signed_yen(h['unrealized_pl'])}")
+        L.append("**リスク照合**")
+        for c in p["risk"]["checks"]:
+            L.append(f"- {'✅' if c['ok'] else '⚠️'} {c['rule']}: {c['metric']} / {c['limit']}")
+        L.append(f"\n> {p['note']}")
+        print("\n".join(L))
+
+    _emit_fmt(p, _fmt(args), table, lark)
+    return 0
+
+
+def cmd_trades_summary(client: PayPayClient, args) -> int:
+    txns = parsers.parse_transactions(client.settlement_records(max_pages=getattr(args, "pages", 8)))
+    agg = report.aggregate_trades(txns)
+    p = {"period": {"from": agg["date_from"], "to": agg["date_to"]},
+         "deposits": agg["deposits"], "withdrawals": agg["withdrawals"],
+         "explicit_fees": agg["explicit_fees"], "realized_pl": agg["realized_pl"],
+         "brands": agg["brands"]}
+
+    def table(p):
+        print(f"取引集計 ({p['period']['from']} 〜 {p['period']['to']})\n")
+        print(_lj("BRAND", 26) + _rj("BUY", 11) + _rj("SELL", 11) + _rj("NET投入", 11)
+              + _rj("NET株", 13) + _rj("実現損益", 10))
+        print("-" * 82)
+        for b in p["brands"]:
+            print(_lj(b["name"], 26) + _rj(_yen(b["buy_yen"]), 11) + _rj(_yen(b["sell_yen"]), 11)
+                  + _rj(_yen(b["net_invested"]), 11) + _rj(f"{b['net_shares']:.4f}", 13)
+                  + _rj(_signed_yen(b["realized_pl"]), 10))
+        print("-" * 82)
+        print(f"  累計入金 {_yen(p['deposits'])} / 出金 {_yen(p['withdrawals'])} / "
+              f"手数料 {_yen(p['explicit_fees'])} / 実現損益合計 {_signed_yen(p['realized_pl'])}")
+
+    def lark(p):
+        L = [f"**取引集計 ({p['period']['from']}〜{p['period']['to']})**", ""]
+        for b in p["brands"]:
+            L.append(f"- **{b['name']}**: 買 {_yen(b['buy_yen'])} / 売 {_yen(b['sell_yen'])} / "
+                     f"純投入 {_yen(b['net_invested'])} / 残 {b['net_shares']:.4f}株 / "
+                     f"実現 {_signed_yen(b['realized_pl'])}")
+        L.append(f"- 累計入金 **{_yen(p['deposits'])}** / 手数料 {_yen(p['explicit_fees'])} / "
+                 f"実現損益合計 **{_signed_yen(p['realized_pl'])}**")
+        print("\n".join(L))
+
+    _emit_fmt(p, _fmt(args), table, lark)
+    return 0
+
+
+def cmd_risk(client: PayPayClient, args) -> int:
+    g = _gather(client, pages=1)
+    rules = report.load_rules()
+    risk = report.evaluate_risk(g["holdings"], g["total"], g["cash"], rules)
+    p = {"total_assets": g["total"], **risk, "rules": rules,
+         "note": "ユーザー定義ルールとの照合のみ。売買助言ではありません。"}
+
+    def table(p):
+        print(f"リスク照合  (総資産 {_yen(p['total_assets'])})\n")
+        for c in p["checks"]:
+            print(f"  {'✅ PASS' if c['ok'] else '⚠️  OVER'}  {c['rule']:<24} {c['metric']}  (基準 {c['limit']})")
+        if p["breaches"]:
+            print(f"\n  超過 {len(p['breaches'])} 件。閾値は ~/.paypay-sec/rules.json で調整可。")
+        print(f"\n  注: {p['note']}")
+
+    def lark(p):
+        L = [f"**リスク照合**(総資産 {_yen(p['total_assets'])})", ""]
+        for c in p["checks"]:
+            L.append(f"- {'✅' if c['ok'] else '⚠️'} {c['rule']}: {c['metric']} / 基準 {c['limit']}")
+        L.append(f"\n> {p['note']}")
+        print("\n".join(L))
+
+    _emit_fmt(p, _fmt(args), table, lark)
     return 0
 
 
@@ -367,6 +554,8 @@ def build_parser() -> argparse.ArgumentParser:
     # (e.g. `paypay portfolio -m usa --json`)
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--json", action="store_true", help="machine-readable JSON output")
+    common.add_argument("--format", dest="fmt", choices=("table", "lark", "json"), default=None,
+                        help="output format: table (default) | lark (Feishu bullets) | json")
     common.add_argument("-m", "--market", default="usa",
                         help="market: usa | japan (aliases: jp, us, 米国株, 日本株). default usa")
     common.add_argument("--no-cache", action="store_true",
@@ -381,13 +570,17 @@ def build_parser() -> argparse.ArgumentParser:
                      ("balance", cmd_balance), ("portfolio", cmd_portfolio),
                      ("history", cmd_history), ("invtrust", cmd_invtrust),
                      ("total", cmd_total), ("assets", cmd_assets), ("trades", cmd_trades),
-                     ("fees", cmd_fees), ("accounts", cmd_accounts),
-                     ("cache-clear", cmd_cache_clear)):
+                     ("fees", cmd_fees), ("review", cmd_review),
+                     ("trades-summary", cmd_trades_summary), ("risk", cmd_risk),
+                     ("accounts", cmd_accounts), ("cache-clear", cmd_cache_clear)):
         sp = sub.add_parser(name, parents=[common])
         sp.set_defaults(func=fn)
         if name == "trades":
             sp.add_argument("--pages", type=int, default=2,
                             help="how many pages of ledger history to fetch (20 rows each)")
+        if name in ("review", "trades-summary"):
+            sp.add_argument("--pages", type=int, default=8,
+                            help="how many pages of ledger history to scan (20 rows each)")
         if name == "fees":
             sp.add_argument("--pages", type=int, default=4,
                             help="how many pages of ledger history to scan")

@@ -77,9 +77,11 @@ class PayPayClient:
         if use_cache:
             self._load_session()                    # reuse a prior session if present
 
-    def _cached(self, key: str, producer):
+    def _cached(self, key: str, producer, cache_if=None):
         """Return a fresh-enough cached response for `key`, else call producer()
-        and cache its (JSON-serializable) result. ttl<=0 disables caching."""
+        and cache its (JSON-serializable) result. ttl<=0 disables caching.
+        `cache_if(result)` (optional) gates whether the result is worth caching —
+        used to avoid caching empty/throttled responses."""
         if self._cache_ttl <= 0:
             return producer()
         fp = self._cache_dir / (hashlib.sha1(key.encode("utf-8")).hexdigest() + ".json")
@@ -90,12 +92,13 @@ class PayPayClient:
         except (OSError, ValueError, KeyError):
             pass
         data = producer()
-        try:
-            self._cache_dir.mkdir(parents=True, exist_ok=True)
-            fp.write_text(json.dumps({"ts": int(time.time()), "data": data}, ensure_ascii=False),
-                          encoding="utf-8")
-        except OSError:
-            pass
+        if cache_if is None or cache_if(data):
+            try:
+                self._cache_dir.mkdir(parents=True, exist_ok=True)
+                fp.write_text(json.dumps({"ts": int(time.time()), "data": data}, ensure_ascii=False),
+                              encoding="utf-8")
+            except OSError:
+                pass
         return data
 
     def clear_cache(self) -> int:
@@ -274,7 +277,20 @@ class PayPayClient:
                 r.raise_for_status()
                 return r.json()
 
-            j = self._cached(f"SETTLE off={offset}", lambda: self._run_resilient(do))
+            def fetch_page(off=offset) -> dict:
+                # an empty page 0 is almost always throttling, not end-of-data —
+                # retry with backoff before giving up.
+                j = self._run_resilient(do)
+                tries = 1
+                while off == 0 and not (j.get("CO_TRADE_HIST") or []) and tries < 4:
+                    time.sleep(1.5 * tries)
+                    tries += 1
+                    j = self._run_resilient(do)
+                return j
+
+            # don't cache an empty page-0 (so the next run can retry past a throttle)
+            j = self._cached(f"SETTLE off={offset}", fetch_page,
+                             cache_if=lambda r: offset > 0 or bool(r.get("CO_TRADE_HIST")))
             recs = j.get("CO_TRADE_HIST") or []
             fresh = [x for x in recs if x.get("SEQ_NO") not in seen]
             for x in fresh:

@@ -40,10 +40,17 @@ session + cache. `uv run paypay accounts` lists them.
 
 ```bash
 cd skills/paypay-securities
-uv run paypay assets     # consolidated holdings + cash + grand total
-uv run paypay trades     # transaction ledger
-uv run paypay fees       # cost analysis (explicit fees + measured FX spread)
+uv run paypay assets               # consolidated holdings + cash + grand total
+uv run paypay review               # review: assets, realized/unrealized P&L, deposits, costs, risk
+uv run paypay review --format lark # Feishu/Lark-friendly bullets
+uv run paypay trades-summary       # per-brand buy/sell/net-invested/realized P&L
+uv run paypay risk                 # holdings vs your concentration rules (not advice)
+uv run paypay fees                 # cost analysis (explicit fees + measured FX spread)
 ```
+
+Run from anywhere (no `cd`): put the launcher on PATH —
+`ln -s "$HOME/.claude/skills/paypay-securities/bin/paypay" ~/.local/bin/paypay`
+→ `paypay review --format lark`.
 
 Full command reference and architecture notes: [`skills/paypay-securities/SKILL.md`](skills/paypay-securities/SKILL.md).
 
