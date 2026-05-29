@@ -1,0 +1,23 @@
+# Secrets — never commit
+.env
+**/.env
+*.session
+~/.paypay-sec/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# downloaded statements (personal financial PDFs)
+statements/
+
+# test fixtures contain REAL account HTML/JSON (PII) — never commit / ship
+tests/fixtures/
+
+# dev tests hold real account data (member id, holdings) — not shipped
+tests/
+
+# separate mobile-API MITM research — contains PII (member id, login flow). NOT part of the skill.
+research/
+docs/
