@@ -1,0 +1,20 @@
+[project]
+name = "paypay-securities"
+version = "0.1.0"
+description = "Read-only client + CLI for the PayPay証券 web frontend (Phase 1)"
+requires-python = ">=3.9"
+dependencies = [
+    "requests>=2.31",
+    "beautifulsoup4>=4.12",
+    "lxml>=5.0",
+]
+
+[project.scripts]
+paypay = "paypay_sec.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["paypay_sec"]
