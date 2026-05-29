@@ -1,5 +1,7 @@
 from _runner import run
 from paypay_sec.orders import build, OrderRequest, Side, OrderType, OrderError
+from paypay_sec.guards import TradeConfig, GuardContext
+from paypay_sec.orders import dry_run, place, PipelineResult
 
 
 def test_build_limit_buy_by_qty():
@@ -67,6 +69,62 @@ def test_build_rejects_unknown_side():
         assert False
     except OrderError:
         pass
+
+
+def _confirm_ok(req):
+    return {"token": "TOK123", "total_jpy": 40000, "est_price": 250.0, "fee_jpy": 0, "raw": {}}
+
+
+def test_dry_run_passes_guards_and_returns_preview():
+    req = build(market="usa", symbol="TSLA", side="buy", qty=1, limit=250.0)
+    res = dry_run(req, TradeConfig(), GuardContext(today_order_count=0), confirm=_confirm_ok)
+    assert isinstance(res, PipelineResult)
+    assert res.ok and res.violations == [] and res.preview["token"] == "TOK123"
+    assert res.submitted is False
+
+
+def test_dry_run_blocks_on_guard_before_confirm():
+    called = {"n": 0}
+    def confirm_spy(req):
+        called["n"] += 1; return _confirm_ok(req)
+    req = build(market="japan", symbol="TSLA", side="buy", qty=1, limit=250.0)
+    res = dry_run(req, TradeConfig(allow_markets=["usa"]), GuardContext(), confirm=confirm_spy)
+    assert not res.ok and res.violations
+    assert called["n"] == 0  # fail fast: never hit confirm when pre-checks fail
+
+
+def test_dry_run_blocks_on_post_confirm_amount():
+    req = build(market="usa", symbol="TSLA", side="buy", qty=1, limit=250.0)
+    res = dry_run(req, TradeConfig(max_order_jpy=10000), GuardContext(), confirm=_confirm_ok)
+    assert not res.ok and any("max_order_jpy" in s for s in res.violations)
+    assert res.submitted is False
+
+
+def test_place_requires_confirmer_true_to_submit():
+    submitted = {"tok": None}
+    def submit_fn(token, req): submitted["tok"] = token; return {"order_id": "OID9"}
+    req = build(market="usa", symbol="TSLA", side="buy", qty=1, limit=250.0)
+    res = place(req, TradeConfig(), GuardContext(), confirm=_confirm_ok, submit=submit_fn,
+                confirmer=lambda req, preview: True)
+    assert res.submitted and res.order_id == "OID9" and submitted["tok"] == "TOK123"
+
+
+def test_place_aborts_when_confirmer_false():
+    submitted = {"n": 0}
+    def submit_fn(token, req): submitted["n"] += 1; return {}
+    req = build(market="usa", symbol="TSLA", side="buy", qty=1, limit=250.0)
+    res = place(req, TradeConfig(), GuardContext(), confirm=_confirm_ok, submit=submit_fn,
+                confirmer=lambda req, preview: False)
+    assert not res.submitted and submitted["n"] == 0
+
+
+def test_place_does_not_submit_when_guard_fails():
+    submitted = {"n": 0}
+    def submit_fn(token, req): submitted["n"] += 1; return {}
+    req = build(market="usa", symbol="TSLA", side="buy", qty=1, limit=250.0)
+    res = place(req, TradeConfig(max_order_jpy=10000), GuardContext(),
+                confirm=_confirm_ok, submit=submit_fn, confirmer=lambda r, p: True)
+    assert not res.submitted and submitted["n"] == 0
 
 
 if __name__ == "__main__":

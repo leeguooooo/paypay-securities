@@ -6,11 +6,12 @@ tokens are single-use. The agent never runs the live submit (human only).
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
-from typing import Callable, Optional
+from typing import Callable, List, Optional
 
 from .client import normalize_market
+from .guards import check_guards, TradeConfig, GuardContext
 
 
 class OrderError(ValueError):
@@ -67,3 +68,55 @@ def build(*, market: str, symbol: str, side: str, qty: Optional[float] = None,
     return OrderRequest(market=normalize_market(market), symbol=sym, side=side_e,
                         order_type=ot, qty=qty, amount_jpy=amount_jpy,
                         limit_price=limit, account=account)
+
+
+@dataclass
+class PipelineResult:
+    ok: bool                       # guards passed (and, for place(), eligible to submit)
+    violations: List[str] = field(default_factory=list)
+    preview: Optional[dict] = None
+    submitted: bool = False
+    order_id: Optional[str] = None
+    aborted_reason: Optional[str] = None
+
+
+def _run_guards_and_confirm(req: OrderRequest, cfg: TradeConfig, ctx: GuardContext,
+                            confirm: Callable[[OrderRequest], dict]) -> PipelineResult:
+    pre = check_guards(req, cfg, ctx, preview=None)
+    if pre:
+        return PipelineResult(ok=False, violations=pre)
+    preview = confirm(req)                                  # network or mock; NO retry inside
+    post = check_guards(req, cfg, ctx, preview=preview)
+    if post:
+        return PipelineResult(ok=False, violations=post, preview=preview)
+    return PipelineResult(ok=True, violations=[], preview=preview)
+
+
+def dry_run(req: OrderRequest, cfg: TradeConfig, ctx: GuardContext,
+            confirm: Callable[[OrderRequest], dict]) -> PipelineResult:
+    """build -> guards -> confirm. Never submits."""
+    return _run_guards_and_confirm(req, cfg, ctx, confirm)
+
+
+def place(req: OrderRequest, cfg: TradeConfig, ctx: GuardContext,
+          confirm: Callable[[OrderRequest], dict],
+          submit: Callable[[str, OrderRequest], dict],
+          confirmer: Callable[[OrderRequest, dict], bool]) -> PipelineResult:
+    """Full path. Submits only if guards pass AND confirmer() returns True.
+    `submit` is called at most once and is never retried by this layer."""
+    res = _run_guards_and_confirm(req, cfg, ctx, confirm)
+    if not res.ok:
+        return res
+    if not confirmer(req, res.preview):
+        res.aborted_reason = "user did not confirm"
+        return res
+    token = (res.preview or {}).get("token")
+    if not token:
+        res.ok = False
+        res.aborted_reason = "confirm returned no token"
+        return res
+    out = submit(token, req)                                 # single-shot, no retry
+    res.submitted = True
+    res.order_id = (out or {}).get("order_id")
+    res.preview = {**(res.preview or {}), "submit_response": out}
+    return res
