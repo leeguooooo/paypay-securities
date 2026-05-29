@@ -632,9 +632,11 @@ def cmd_cancel(client, args) -> int:
     if not getattr(args, "execute", False):
         print(f"🔎 DRY-RUN: would cancel order {args.order_id}. Re-run with --execute.")
         return 0
-    typed_ok = (input(f"  To cancel, type the order id exactly: {args.order_id}\n  confirm> ").strip()
-                == str(args.order_id))
-    if not typed_ok:
+    try:
+        typed = input(f"  To cancel, type the order id exactly: {args.order_id}\n  confirm> ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print("cancel aborted"); return 1
+    if typed != str(args.order_id):
         print("cancel aborted (phrase mismatch)"); return 1
     try:
         out = client.order_cancel(args.order_id, args.market)
