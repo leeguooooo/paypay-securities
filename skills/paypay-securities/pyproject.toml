@@ -1,7 +1,9 @@
 [project]
 name = "paypay-securities"
 version = "0.1.0"
-description = "Read-only client + CLI for the PayPay証券 web frontend (Phase 1)"
+description = "Read-only CLI for a PayPay証券 (PayPay Securities) account — portfolio, holdings, 投資信託/米国株, transaction history, fees, and review/復盘."
+keywords = ["paypay", "paypay-securities", "paypay証券", "ペイペイ証券", "portfolio",
+            "投資信託", "米国株", "nisa", "investment", "agent-skill", "claude-code", "cli"]
 requires-python = ">=3.9"
 dependencies = [
     "requests>=2.31",
