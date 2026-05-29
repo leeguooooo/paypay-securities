@@ -180,9 +180,6 @@ def _gather(client: PayPayClient, pages: int = 8) -> dict:
             holdings.append({"name": names.get(str(h["brand_id"])) or f"投信#{h['brand_id']}",
                              "category": "投信", "valuation": h["valuation"] or 0,
                              "unrealized_pl": h["unrealized_pl"]})
-    for h in holdings:
-        h["kind"] = report.classify(h["name"], h["category"])
-        h["is_stock"] = h["kind"] == "stock"
     cash = parsers.current_cash(ledger) or 0
     total = sum(h["valuation"] for h in holdings) + cash
     tdates = [t["date"] for t in txns if t["type"] in costs.TRADE_TYPES and t["date"]]
@@ -194,8 +191,6 @@ def cmd_review(client: PayPayClient, args) -> int:
     g = _gather(client, pages=getattr(args, "pages", 8))
     agg = report.aggregate_trades(g["txns"])
     fx_cost = costs.compute_costs(g["txns"], g["fx_series"])["fx_spread_cost"]
-    rules = report.load_rules()
-    risk = report.evaluate_risk(g["holdings"], g["total"], g["cash"], rules)
     unreal = sum((h["unrealized_pl"] or 0) for h in g["holdings"])
     total, cash = g["total"], g["cash"]
     hold = sorted(g["holdings"], key=lambda x: -x["valuation"])
@@ -208,8 +203,8 @@ def cmd_review(client: PayPayClient, args) -> int:
         "explicit_fees": agg["explicit_fees"], "fx_spread_cost": fx_cost,
         "total_cost": agg["explicit_fees"] + fx_cost,
         "deposits": agg["deposits"], "withdrawals": agg["withdrawals"],
-        "holdings": hold, "trades_by_brand": agg["brands"], "risk": risk,
-        "note": "事実とユーザー定義ルールの照合のみ。売買助言ではありません。",
+        "holdings": hold, "trades_by_brand": agg["brands"],
+        "note": "事実データのみ。投資助言・推奨ではありません。",
     }
 
     def table(p):
@@ -224,9 +219,6 @@ def cmd_review(client: PayPayClient, args) -> int:
         for h in p["holdings"]:
             print("    " + _lj(h["name"], 30) + _rj(_yen(h["valuation"]), 11)
                   + _rj(f"{h['pct']}%", 7) + _rj(_signed_yen(h["unrealized_pl"]), 10))
-        print("\n  リスク照合 (ユーザールール):")
-        for c in p["risk"]["checks"]:
-            print(f"    {'✅' if c['ok'] else '⚠️ '} {c['rule']}: {c['metric']} (上限/下限 {c['limit']})")
         print(f"\n  注: {p['note']}")
 
     def lark(p):
@@ -242,9 +234,6 @@ def cmd_review(client: PayPayClient, args) -> int:
              "**保有**"]
         for h in p["holdings"]:
             L.append(f"- {h['name']}: **{_yen(h['valuation'])}** ({h['pct']}%) {_signed_yen(h['unrealized_pl'])}")
-        L.append("**リスク照合**")
-        for c in p["risk"]["checks"]:
-            L.append(f"- {'✅' if c['ok'] else '⚠️'} {c['rule']}: {c['metric']} / {c['limit']}")
         L.append(f"\n> {p['note']}")
         print("\n".join(L))
 
@@ -281,32 +270,6 @@ def cmd_trades_summary(client: PayPayClient, args) -> int:
                      f"実現 {_signed_yen(b['realized_pl'])}")
         L.append(f"- 累計入金 **{_yen(p['deposits'])}** / 手数料 {_yen(p['explicit_fees'])} / "
                  f"実現損益合計 **{_signed_yen(p['realized_pl'])}**")
-        print("\n".join(L))
-
-    _emit_fmt(p, _fmt(args), table, lark)
-    return 0
-
-
-def cmd_risk(client: PayPayClient, args) -> int:
-    g = _gather(client, pages=1)
-    rules = report.load_rules()
-    risk = report.evaluate_risk(g["holdings"], g["total"], g["cash"], rules)
-    p = {"total_assets": g["total"], **risk, "rules": rules,
-         "note": "ユーザー定義ルールとの照合のみ。売買助言ではありません。"}
-
-    def table(p):
-        print(f"リスク照合  (総資産 {_yen(p['total_assets'])})\n")
-        for c in p["checks"]:
-            print(f"  {'✅ PASS' if c['ok'] else '⚠️  OVER'}  {c['rule']:<24} {c['metric']}  (基準 {c['limit']})")
-        if p["breaches"]:
-            print(f"\n  超過 {len(p['breaches'])} 件。閾値は ~/.paypay-sec/rules.json で調整可。")
-        print(f"\n  注: {p['note']}")
-
-    def lark(p):
-        L = [f"**リスク照合**(総資産 {_yen(p['total_assets'])})", ""]
-        for c in p["checks"]:
-            L.append(f"- {'✅' if c['ok'] else '⚠️'} {c['rule']}: {c['metric']} / 基準 {c['limit']}")
-        L.append(f"\n> {p['note']}")
         print("\n".join(L))
 
     _emit_fmt(p, _fmt(args), table, lark)
@@ -571,7 +534,7 @@ def build_parser() -> argparse.ArgumentParser:
                      ("history", cmd_history), ("invtrust", cmd_invtrust),
                      ("total", cmd_total), ("assets", cmd_assets), ("trades", cmd_trades),
                      ("fees", cmd_fees), ("review", cmd_review),
-                     ("trades-summary", cmd_trades_summary), ("risk", cmd_risk),
+                     ("trades-summary", cmd_trades_summary),
                      ("accounts", cmd_accounts), ("cache-clear", cmd_cache_clear)):
         sp = sub.add_parser(name, parents=[common])
         sp.set_defaults(func=fn)
