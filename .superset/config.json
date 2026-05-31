@@ -1,0 +1,3 @@
+{
+  "setup": ["uv sync --project skills/paypay-securities"]
+}
