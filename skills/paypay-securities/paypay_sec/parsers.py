@@ -221,6 +221,46 @@ def parse_transactions(records: list) -> list[dict]:
     return out
 
 
+# 投信 settlement view (MARKET_ID=99): same CO_TRADE_HIST shape as the 証券
+# ledger, but a separate market with its own type meanings — code 8 is 譲渡益税
+# (not 手数料/税) and 54 is 送金手数料 (the per-即時入金 transfer fee).
+INVTRUST_SUMMARY_TYPES = {"1": "買付", "2": "売却", "3": "入金", "4": "出金",
+                          "8": "譲渡益税", "11": "分配金", "31": "約定明細",
+                          "54": "送金手数料"}
+ACCOUNT_TYPE_NAMES = {"1": "一般", "2": "特定", "3": "NISA成長", "4": "NISAつみたて"}
+
+
+def parse_invtrust_transactions(records: list) -> list[dict]:
+    """Clean the 投信 settlement feed (`/v0/history/settlements.json?MARKET_ID=99`)
+    into trade rows: 買付/売却/入金/譲渡益税/送金手数料 with 口数 + 基準価額 + running
+    cash. Drops the paired 約定明細 detail lines (type 31)."""
+    def num(v):
+        try:
+            return float(v) if v not in (None, "") else None
+        except (TypeError, ValueError):
+            return None
+
+    out = []
+    for r in records:
+        st = str(r.get("SUMMARY_TYPE"))
+        if st == "31":
+            continue
+        amt = num(r.get("AMOUNT"))
+        bal = num(r.get("CASH_BALANCE"))
+        acct = r.get("ACCOUNT_TYPE")
+        out.append({
+            "date": r.get("BASE_D"),
+            "type": INVTRUST_SUMMARY_TYPES.get(st, f"type{st}"),
+            "brand": r.get("BRAND_NM"),
+            "account_type": ACCOUNT_TYPE_NAMES.get(str(acct), acct),
+            "price": num(r.get("PRICE")),          # 基準価額 (per 10,000口)
+            "qty": num(r.get("QTY")),              # 口数
+            "amount": int(round(amt)) if amt is not None else None,
+            "cash_balance": int(round(bal)) if bal is not None else None,
+        })
+    return out
+
+
 def current_cash(records: list) -> Optional[int]:
     """Latest running cash balance (= the app's 現金) from the ledger."""
     for r in records:

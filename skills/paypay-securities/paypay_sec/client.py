@@ -300,6 +300,53 @@ class PayPayClient:
                 break
         return out
 
+    def invtrust_settlement_records(self, max_pages: int = 3) -> list:
+        """投信 (mutual-fund) transaction ledger via the SPA's settlements feed
+        (MARKET_ID=99) — a SEPARATE market view from the 証券 ajax ledger, holding
+        the 買付/売却/入金/譲渡益税/送金手数料 rows for 投資信託. Same CO_TRADE_HIST
+        shape AND the same gotcha: PAGE_NUM is a RECORD OFFSET (PAGE_NUM=n returns
+        records n..n+19), not a page index — so we step by the page size and de-dup
+        by SEQ_NO, exactly like settlement_records. MINI_CLIENT_SEQ_NO is NOT
+        required. The 入金/送金手数料 rows are account-wide (identical to the 証券
+        ledger); only 買付/売却/譲渡益税 are 投信-specific."""
+        self.ensure_session()
+        out: list = []
+        seen: set = set()
+        for i in range(max_pages):
+            offset = i * self._SETTLEMENT_PAGE_SIZE
+
+            def do(off=offset) -> dict:
+                r = self._session.get(
+                    f"{BASE}/v0/history/settlements.json?MARKET_ID=99&PAGE_NUM={off}&OS=pc",
+                    headers={"X-Requested-With": "XMLHttpRequest",
+                             "Referer": f"{BASE}/investment_trust/"},
+                    timeout=30, allow_redirects=False)
+                if r.status_code in (301, 302):
+                    raise SessionExpired("invtrust_settlements")
+                r.raise_for_status()
+                return r.json()
+
+            def fetch_page(off=offset) -> dict:
+                # empty page 0 == throttling, not end-of-data — back off and retry
+                j = self._run_resilient(do)
+                tries = 1
+                while off == 0 and not (j.get("CO_TRADE_HIST") or []) and tries < 4:
+                    time.sleep(1.5 * tries)
+                    tries += 1
+                    j = self._run_resilient(do)
+                return j
+
+            j = self._cached(f"INVSETTLE off={offset}", fetch_page,
+                             cache_if=lambda r: offset > 0 or bool(r.get("CO_TRADE_HIST")))
+            recs = j.get("CO_TRADE_HIST") or []
+            fresh = [x for x in recs if x.get("SEQ_NO") not in seen]
+            for x in fresh:
+                seen.add(x.get("SEQ_NO"))
+            out.extend(fresh)
+            if not j.get("NEXT_FLG") or not fresh:
+                break
+        return out
+
     # ---- 投信 (mutual funds): Vue SPA backed by a JSON API ----
     # The SPA posts these exact FormData fields; an empty body makes the
     # server hang, so they are required.

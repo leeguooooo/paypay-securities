@@ -85,6 +85,25 @@ def _emit(obj, as_json: bool, render):
         render(obj)
 
 
+def _persist_cash(client: PayPayClient, cash):
+    """現金 with a persistent fallback for when the settlement ledger throttles to
+    empty. Pass the freshly-parsed cash (may be None); on success it's cached to
+    disk, on failure we fall back to the last good value. Returns (yen, fresh) —
+    fresh=False means the number is a stale disk value, not live; None = nothing
+    on record yet, so callers must NOT silently treat it as ¥0."""
+    path = client.session_file.parent / "last_cash.json"
+    if cash is not None:
+        try:
+            path.write_text(json.dumps({"cash": int(cash)}), encoding="utf-8")
+        except OSError:
+            pass
+        return cash, True
+    try:
+        return json.loads(path.read_text(encoding="utf-8")).get("cash"), False
+    except (OSError, ValueError):
+        return None, False
+
+
 def cmd_login(client: PayPayClient, args) -> int:
     info = client.login()
     out = {
@@ -152,6 +171,9 @@ def _gather(client: PayPayClient, pages: int = 8) -> dict:
     client.ensure_session()
     tasks = {
         "ledger": lambda: client.settlement_records(max_pages=pages),
+        # 投信 ledger is a separate, churnier feed (≈14 pages); fetch generously —
+        # it stops early on NEXT_FLG, so the cap is just an upper bound.
+        "invledger": lambda: client.invtrust_settlement_records(max_pages=max(pages, 30)),
         "sec": lambda: parsers.parse_holdings(client.brands_html("usa")),
         "inv": lambda: parsers.parse_invtrust(client.invtrust_top()),
         "names": client.invtrust_brands,
@@ -180,41 +202,74 @@ def _gather(client: PayPayClient, pages: int = 8) -> dict:
             holdings.append({"name": names.get(str(h["brand_id"])) or f"投信#{h['brand_id']}",
                              "category": "投信", "valuation": h["valuation"] or 0,
                              "unrealized_pl": h["unrealized_pl"]})
-    cash = parsers.current_cash(ledger) or 0
-    total = sum(h["valuation"] for h in holdings) + cash
+    inv_txns = parsers.parse_invtrust_transactions(out.get("invledger") or [])
+    cash, cash_fresh = _persist_cash(client, parsers.current_cash(ledger))
+    total = sum(h["valuation"] for h in holdings) + (cash or 0)
     tdates = [t["date"] for t in txns if t["type"] in costs.TRADE_TYPES and t["date"]]
     series = market.usdjpy_series(min(tdates), max(tdates)) if tdates else {}
-    return {"txns": txns, "holdings": holdings, "cash": cash, "total": total, "fx_series": series}
+    return {"txns": txns, "inv_txns": inv_txns, "holdings": holdings,
+            "cash": cash or 0, "cash_fresh": cash_fresh, "total": total, "fx_series": series}
 
 
 def cmd_review(client: PayPayClient, args) -> int:
     g = _gather(client, pages=getattr(args, "pages", 8))
     agg = report.aggregate_trades(g["txns"])
+    inv = report.aggregate_invtrust(g.get("inv_txns") or [])
     fx_cost = costs.compute_costs(g["txns"], g["fx_series"])["fx_spread_cost"]
     unreal = sum((h["unrealized_pl"] or 0) for h in g["holdings"])
     total, cash = g["total"], g["cash"]
     hold = sorted(g["holdings"], key=lambda x: -x["valuation"])
     for h in hold:
         h["pct"] = round(100.0 * h["valuation"] / total, 1) if total else 0
+
+    # Realized P&L spans BOTH ledgers: 証券 (ajax_settlement) + 投信 (MARKET_ID=99).
+    # Costs likewise add the 投信 譲渡益税 (tax withheld on 特定 sells) + 送金手数料.
+    realized_sec, realized_inv = agg["realized_pl"], inv["realized_pl"]
+    realized_total = realized_sec + realized_inv
+    inv_tax, inv_transfer = inv["capital_gains_tax"], inv["transfer_fees"]
+    total_cost = agg["explicit_fees"] + fx_cost + inv_tax + inv_transfer
+
+    # Bottom-line total return = total assets − net deposits (mark-to-market, after
+    # all costs, since inception). Folding in 投信 realized shrinks the residual to
+    # whatever is still unattributed (distributions, cost-basis gaps, FX timing).
+    net_deposit = agg["deposits"] - agg["withdrawals"]
+    total_return = total - net_deposit
+    residual = total_return - (unreal + realized_total)
     p = {
         "period": {"from": agg["date_from"], "to": agg["date_to"]},
-        "total_assets": total, "cash": cash, "invested": total - cash,
-        "unrealized_pl": unreal, "realized_pl": agg["realized_pl"],
+        "total_assets": total, "cash": cash, "cash_fresh": g.get("cash_fresh", True),
+        "invested": total - cash,
+        "unrealized_pl": unreal,
+        "realized_sec": realized_sec, "realized_inv": realized_inv,
+        "realized_total": realized_total, "inv_reconciles": inv["reconciles"],
         "explicit_fees": agg["explicit_fees"], "fx_spread_cost": fx_cost,
-        "total_cost": agg["explicit_fees"] + fx_cost,
+        "inv_capital_gains_tax": inv_tax, "inv_transfer_fees": inv_transfer,
+        "total_cost": total_cost,
         "deposits": agg["deposits"], "withdrawals": agg["withdrawals"],
+        "net_deposit": net_deposit, "total_return": total_return,
+        "ledger_residual": residual,
         "holdings": hold, "trades_by_brand": agg["brands"],
+        "invtrust_trades_by_brand": inv["brands"], "invtrust_sells_yen": inv["sells_yen"],
         "note": "事実データのみ。投資助言・推奨ではありません。",
     }
 
+    def _inv_line(p):
+        mark = "" if p["inv_reconciles"] else "  ⚠取得単価不足→過小評価"
+        return f"{_signed_yen(p['realized_inv'])}{mark}"
+
     def table(p):
         pr = p["period"]
+        cstale = "" if p.get("cash_fresh", True) else " ⚠stale(取得失敗)"
         print(f"PayPay証券 復盘  ({pr['from']} 〜 {pr['to']})\n")
-        print(f"  総資産   : {_yen(p['total_assets'])}   (投資 {_yen(p['invested'])} / 現金 {_yen(p['cash'])})")
-        print(f"  未実現損益: {_signed_yen(p['unrealized_pl'])}")
-        print(f"  実現損益  : {_signed_yen(p['realized_pl'])}  (平均取得単価ベース)")
-        print(f"  取引コスト: {_yen(p['total_cost'])}  (手数料 {_yen(p['explicit_fees'])} + 為替 {_yen(p['fx_spread_cost'])})")
-        print(f"  累計入金  : {_yen(p['deposits'])}   出金: {_yen(p['withdrawals'])}")
+        print(f"  総資産   : {_yen(p['total_assets'])}   (投資 {_yen(p['invested'])} / 現金 {_yen(p['cash'])}{cstale})")
+        print(f"  純入金   : {_yen(p['net_deposit'])}   (入金 {_yen(p['deposits'])} − 出金 {_yen(p['withdrawals'])})")
+        print(f"  総収益   : {_signed_yen(p['total_return'])}  (総資産 − 純入金 = 取得来の実質損益)")
+        print(f"    └ 未実現(現保有)   : {_signed_yen(p['unrealized_pl'])}")
+        print(f"    └ 実現(証券)       : {_signed_yen(p['realized_sec'])}  (移動平均)")
+        print(f"    └ 実現(投信)       : {_inv_line(p)}")
+        print(f"    └ その他(未集計)   : {_signed_yen(p['ledger_residual'])}")
+        print(f"  取引コスト: {_yen(p['total_cost'])}  (証券手数料 {_yen(p['explicit_fees'])} + 為替 {_yen(p['fx_spread_cost'])}"
+              f" + 投信譲渡益税 {_yen(p['inv_capital_gains_tax'])} + 送金手数料 {_yen(p['inv_transfer_fees'])})")
         print("\n  保有:")
         for h in p["holdings"]:
             print("    " + _lj(h["name"], 30) + _rj(_yen(h["valuation"]), 11)
@@ -226,11 +281,15 @@ def cmd_review(client: PayPayClient, args) -> int:
         L = [f"**PayPay証券 復盘 ({pr['from']}〜{pr['to']})**", "",
              "**資産**",
              f"- 総資産: **{_yen(p['total_assets'])}**(投資 {_yen(p['invested'])} / 現金 {_yen(p['cash'])})",
+             f"- 純入金: **{_yen(p['net_deposit'])}**(入金 {_yen(p['deposits'])} − 出金 {_yen(p['withdrawals'])})",
              "**損益**",
-             f"- 未実現: **{_signed_yen(p['unrealized_pl'])}**",
-             f"- 実現(平均取得単価): **{_signed_yen(p['realized_pl'])}**",
-             f"- 取引コスト: **{_yen(p['total_cost'])}**(手数料 {_yen(p['explicit_fees'])}+為替 {_yen(p['fx_spread_cost'])})",
-             f"- 累計入金: **{_yen(p['deposits'])}**",
+             f"- 総収益(総資産−純入金): **{_signed_yen(p['total_return'])}**",
+             f"  - 未実現(現保有): {_signed_yen(p['unrealized_pl'])}",
+             f"  - 実現(証券): {_signed_yen(p['realized_sec'])}",
+             f"  - 実現(投信): {_inv_line(p)}",
+             f"  - その他(未集計): {_signed_yen(p['ledger_residual'])}",
+             f"- 取引コスト: **{_yen(p['total_cost'])}**(証券手数料 {_yen(p['explicit_fees'])}+為替 {_yen(p['fx_spread_cost'])}"
+             f"+投信譲渡益税 {_yen(p['inv_capital_gains_tax'])}+送金手数料 {_yen(p['inv_transfer_fees'])})",
              "**保有**"]
         for h in p["holdings"]:
             L.append(f"- {h['name']}: **{_yen(h['valuation'])}** ({h['pct']}%) {_signed_yen(h['unrealized_pl'])}")
@@ -380,14 +439,16 @@ def cmd_total(client: PayPayClient, args) -> int:
     inv = parsers.parse_invtrust(client.invtrust_top())
     inv_val = inv.valuation or 0
     invested = sec_total + inv_val
-    cash = parsers.current_cash(client.settlement_records(max_pages=1))
+    cash, cash_fresh = _persist_cash(client, parsers.current_cash(client.settlement_records(max_pages=1)))
     grand_total = invested + (cash or 0)
+    if not cash_fresh:
+        errors.append("cash: throttled→stale")
     payload = {
         "securities_by_market": sec_by_market,
         "securities_total": sec_total,
         "invtrust_valuation": inv.valuation,
         "invested_total": invested,
-        "cash": cash,
+        "cash": cash, "cash_fresh": cash_fresh,
         "grand_total": grand_total,
         "invtrust_sell_pending": inv.sell_order_pending,
         "errors": errors,
@@ -396,10 +457,11 @@ def cmd_total(client: PayPayClient, args) -> int:
     }
 
     def render(p):
+        cstale = "" if p.get("cash_fresh", True) else "  ⚠stale(取得失敗)"
         print("PayPay証券 — total assets (read-only)\n")
         print(f"  証券 (株+ETF)   : {_yen(p['securities_total'])}")
         print(f"  投信 (基金)      : {_yen(p['invtrust_valuation'])}")
-        print(f"  現金            : {_yen(p['cash'])}")
+        print(f"  現金            : {_yen(p['cash'])}{cstale}")
         print(f"  {'─' * 30}")
         print(f"  総資産 合計      : {_yen(p['grand_total'])}")
         print(f"\n  (うち投資資産 {_yen(p['invested_total'])} / 投信 売却申込中 {_yen(p['invtrust_sell_pending'])} settling)")
@@ -433,7 +495,7 @@ def cmd_assets(client: PayPayClient, args) -> int:
     inv = parsers.parse_invtrust(out["inv_top"]) if out.get("inv_top") else None
     names = out.get("names") or {}
     sec = out.get("sec_usa") or []
-    cash = out.get("cash")
+    cash, cash_fresh = _persist_cash(client, out.get("cash"))
 
     rows = []
     if inv:
@@ -450,7 +512,7 @@ def cmd_assets(client: PayPayClient, args) -> int:
     payload = {
         "holdings": rows,
         "invested_total": invested,
-        "cash": cash,
+        "cash": cash, "cash_fresh": cash_fresh,
         "grand_total": grand_total,
         "invtrust_sell_pending": inv.sell_order_pending if inv else None,
         "note": "grand_total = invested holdings + 証券 cash balance, matching the "
@@ -458,17 +520,25 @@ def cmd_assets(client: PayPayClient, args) -> int:
     }
 
     def render(p):
+        # Weights are over the GRAND TOTAL (incl. cash) to match the app's 資産割合
+        # donut — the app's denominator is 総資産, not just 投資資産.
+        denom = p["grand_total"] or 0
         print("PayPay証券 — consolidated assets (read-only)\n")
         print(_lj("CATEGORY", 9) + _lj("NAME", 34) + _rj("VALUATION", 12)
               + _rj("WEIGHT", 8) + _rj("P&L", 10))
         print("-" * 73)
         for r in sorted(p["holdings"], key=lambda x: -(x["valuation"] or 0)):
-            wt = f"{100 * (r['valuation'] or 0) / invested:.1f}%" if invested else "—"
+            wt = f"{100 * (r['valuation'] or 0) / denom:.1f}%" if denom else "—"
             print(_lj(r["category"], 9) + _lj(r["name"] or "", 34)
                   + _rj(_yen(r["valuation"]), 12) + _rj(wt, 8) + _rj(_yen(r["unrealized_pl"]), 10))
-        print("-" * 70)
+        if p["cash"]:
+            cash_wt = f"{100 * p['cash'] / denom:.1f}%" if denom else "—"
+            print(_lj("現金", 9) + _lj("(buyable cash)", 34)
+                  + _rj(_yen(p["cash"]), 12) + _rj(cash_wt, 8) + _rj("—", 10))
+        print("-" * 73)
+        cstale = "" if p.get("cash_fresh", True) else "  ⚠stale(取得失敗)"
         print(f"  投資資産 : {_yen(p['invested_total'])}")
-        print(f"  現金     : {_yen(p['cash'])}")
+        print(f"  現金     : {_yen(p['cash'])}{cstale}")
         print(f"  総資産合計: {_yen(p['grand_total'])}")
         print(f"\n  投信 売却申込中 (settling): {_yen(p['invtrust_sell_pending'])}")
         print("  注: CFD(別ログイン)は未集計。")
@@ -512,6 +582,72 @@ def cmd_history(client: PayPayClient, args) -> int:
     return 0
 
 
+def cmd_invtrust_history(client: PayPayClient, args) -> int:
+    """投信 (mutual-fund) transaction ledger — the MARKET_ID=99 settlements feed
+    that the 証券 ajax ledger never shows: 買付/売却/入金/譲渡益税/送金手数料."""
+    recs = client.invtrust_settlement_records(max_pages=getattr(args, "pages", 20))
+    txns = parsers.parse_invtrust_transactions(recs)
+    agg = report.aggregate_invtrust(txns)
+
+    # current holdings split by 口座区分 (NISA成長 / つみたて / 特定), matching the
+    # app's NISA badges. All 口 of one fund share a single 基準価額, so splitting the
+    # fund's valuation by each lot's net 口数 is exact.
+    inv = parsers.parse_invtrust(client.invtrust_top())
+    names = client.invtrust_brands()
+    fund_val = {names.get(str(h["brand_id"])): (h["valuation"] or 0)
+                for h in (inv.holdings if inv else []) if names.get(str(h["brand_id"]))}
+    lots = [b for b in agg["brands"] if b["net_shares"] > 1e-6]
+    brand_shares: dict = {}
+    for b in lots:
+        brand_shares[b["brand"]] = brand_shares.get(b["brand"], 0.0) + b["net_shares"]
+    holdings = []
+    for b in lots:
+        tot = brand_shares.get(b["brand"]) or 0
+        val = round(fund_val.get(b["brand"], 0) * b["net_shares"] / tot) if tot else 0
+        holdings.append({"brand": b["brand"], "acct": b["acct"], "net_shares": b["net_shares"],
+                         "cost": b["net_invested"], "valuation": val,
+                         "unrealized_pl": val - b["net_invested"]})
+    holdings.sort(key=lambda x: -x["valuation"])
+
+    payload = {"transactions": txns, "holdings_by_lot": holdings,
+               "summary": {k: agg[k] for k in ("realized_pl", "reconciles",
+                           "capital_gains_tax", "transfer_fees", "deposits_gross",
+                           "distributions", "buys_yen", "sells_yen", "brands",
+                           "date_from", "date_to")}}
+
+    def render(p):
+        s = p["summary"]
+        print(f"投信 取引明細 (MARKET_ID=99)  {s['date_from']} 〜 {s['date_to']}\n")
+        print(_lj("DATE", 12) + _lj("TYPE", 10) + _lj("口座", 12) + _lj("BRAND", 26)
+              + _rj("口数", 11) + _rj("AMOUNT", 11) + _rj("BALANCE", 12))
+        print("-" * 94)
+        for t in p["transactions"]:
+            qty = f"{t['qty']:,.0f}" if t["qty"] else "—"
+            print(_lj(t["date"] or "", 12) + _lj(t["type"] or "", 10)
+                  + _lj(str(t["account_type"] or "—"), 12) + _lj((t["brand"] or "—")[:24], 26)
+                  + _rj(qty, 11) + _rj(_yen(t["amount"]), 11) + _rj(_yen(t["cash_balance"]), 12))
+        print("-" * 94)
+        print(f"  買付 {_yen(s['buys_yen'])}  /  売却 {_yen(s['sells_yen'])}  /  入金(振替含) {_yen(s['deposits_gross'])}")
+        print(f"  譲渡益税 {_yen(s['capital_gains_tax'])}  /  送金手数料 {_yen(s['transfer_fees'])}  /  分配金 {_yen(s['distributions'])}")
+        mark = "" if s["reconciles"] else "   ⚠ 一部ロットで売却口数>取得口数(取得単価不足→過小評価)"
+        print(f"  実現損益(移動平均): {_signed_yen(s['realized_pl'])}{mark}")
+        if p["holdings_by_lot"]:
+            print("\n  現保有(口座別):")
+            print("    " + _lj("BRAND", 32) + _lj("口座", 14) + _rj("口数", 11)
+                  + _rj("取得額", 11) + _rj("評価額", 11) + _rj("含み損益", 10))
+            for h in p["holdings_by_lot"]:
+                print("    " + _lj((h["brand"] or "")[:30], 32) + _lj(h["acct"] or "—", 14)
+                      + _rj(f"{h['net_shares']:,.0f}", 11) + _rj(_yen(h["cost"]), 11)
+                      + _rj(_yen(h["valuation"]), 11) + _rj(_signed_yen(h["unrealized_pl"]), 10))
+        if s["brands"]:
+            print("\n  銘柄×口座別 実現損益:")
+            for b in s["brands"]:
+                print("    " + _lj(b["name"], 42) + _rj(_signed_yen(b["realized_pl"]), 11))
+
+    _emit(payload, args.json, render)
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     # shared flags live on a parent so they work AFTER the subcommand
     # (e.g. `paypay portfolio -m usa --json`)
@@ -533,6 +669,7 @@ def build_parser() -> argparse.ArgumentParser:
                      ("balance", cmd_balance), ("portfolio", cmd_portfolio),
                      ("history", cmd_history), ("invtrust", cmd_invtrust),
                      ("total", cmd_total), ("assets", cmd_assets), ("trades", cmd_trades),
+                     ("invtrust-history", cmd_invtrust_history),
                      ("fees", cmd_fees), ("review", cmd_review),
                      ("trades-summary", cmd_trades_summary),
                      ("accounts", cmd_accounts), ("cache-clear", cmd_cache_clear)):
@@ -544,6 +681,9 @@ def build_parser() -> argparse.ArgumentParser:
         if name in ("review", "trades-summary"):
             sp.add_argument("--pages", type=int, default=8,
                             help="how many pages of ledger history to scan (20 rows each)")
+        if name == "invtrust-history":
+            sp.add_argument("--pages", type=int, default=20,
+                            help="how many pages of 投信 ledger to fetch (20 rows each)")
         if name == "fees":
             sp.add_argument("--pages", type=int, default=4,
                             help="how many pages of ledger history to scan")
