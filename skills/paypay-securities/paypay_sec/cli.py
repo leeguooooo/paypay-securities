@@ -715,7 +715,7 @@ def build_parser() -> argparse.ArgumentParser:
         g = sp_.add_mutually_exclusive_group(required=True)
         g.add_argument("--qty", type=float, help="number of shares (株数指定)")
         g.add_argument("--amount", type=int, help="order amount in JPY (金額指定)")
-        sp_.add_argument("--limit", type=float, default=None, help="limit price (required unless --market-order)")
+        sp_.add_argument("--limit", type=float, default=None, help="limit price (指値); optional — US fills at the quote, omit for a market-priced order")
         sp_.add_argument("--market-order", action="store_true", help="place a market order (成行) — blocked unless allowed in trade.json")
         sp_.add_argument("--account-type", dest="account_type", type=int, choices=(2, 3, 4), default=2,
                          help="brokerage account: 2=特定(cash, default) | 3=成長投資枠NISA | 4=つみたて")
