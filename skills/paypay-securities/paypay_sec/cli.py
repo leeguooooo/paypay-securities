@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures as cf
+import getpass
 import json
 import os
 import sys
@@ -555,16 +556,27 @@ def _order_common(client, args, side: str) -> int:
         req = _orders.build(market=args.market, symbol=args.symbol, side=side,
                             qty=args.qty, amount_jpy=args.amount, limit=args.limit,
                             market_order=getattr(args, "market_order", False),
-                            account=getattr(args, "account", None))
+                            account=getattr(args, "account", None),
+                            account_type=getattr(args, "account_type", 2))
     except _orders.OrderError as e:
         print(f"error: {e}", file=sys.stderr); return 2
     cfg = _guards.load_trade_config(getattr(args, "account", None))
     ctx = _guard_ctx(client, args)
     confirm = lambda r: client.order_confirm(r)
+    # TRADE_PASSWORD (取引パスワード) is prompted (not echoed, never stored) only if/when
+    # we actually submit — the agent never supplies it; the human does, at the keyboard.
+    _pw = {}
+    def _trade_pw():
+        if "v" not in _pw:
+            try:
+                _pw["v"] = getpass.getpass("  取引パスワード (trade password): ")
+            except (EOFError, KeyboardInterrupt):
+                _pw["v"] = ""
+        return _pw["v"]
     try:
         if getattr(args, "execute", False):
             res = _orders.place(req, cfg, ctx, confirm=confirm,
-                                submit=lambda tok, r: client.order_submit(tok, r),
+                                submit=lambda tok, r: client.order_submit(tok, r, trade_password=_trade_pw()),
                                 confirmer=make_confirmer())
         else:
             res = _orders.dry_run(req, cfg, ctx, confirm=confirm)
@@ -575,6 +587,14 @@ def _order_common(client, args, side: str) -> int:
                        "limit": req.limit_price, "status": "confirm_pending_phase0"},
                       account=getattr(args, "account", None))
         return 3
+    except (RuntimeError, requests.RequestException) as e:
+        # confirm rejected (e.g. market closed / over buyable), session, or submit error
+        print(f"error: {e}", file=sys.stderr)
+        _audit.record({"kind": "error", "symbol": req.symbol, "side": side,
+                       "qty": req.qty, "amount_jpy": req.amount_jpy,
+                       "limit": req.limit_price, "error": str(e)[:200]},
+                      account=getattr(args, "account", None))
+        return 1
 
     _audit.record({"kind": "submit" if res.submitted else "dry_run",
                    "symbol": req.symbol, "side": side, "qty": req.qty,
@@ -582,19 +602,20 @@ def _order_common(client, args, side: str) -> int:
                    "violations": res.violations, "order_id": res.order_id},
                   account=getattr(args, "account", None))
 
-    def render(res):
-        if res.violations:
+    def render(d):
+        # d is res.__dict__ (a plain dict — _emit also json-serializes it)
+        if d.get("violations"):
             print("⛔ order blocked by guards:")
-            for v in res.violations:
+            for v in d["violations"]:
                 print(f"   - {v}")
             return
-        pv = res.preview or {}
-        print(f"{'✅ SUBMITTED' if res.submitted else '🔎 DRY-RUN (not sent)'}  "
+        pv = d.get("preview") or {}
+        print(f"{'✅ SUBMITTED' if d.get('submitted') else '🔎 DRY-RUN (not sent)'}  "
               f"{side.upper()} {req.symbol}")
         if pv.get("total_jpy") is not None:
             print(f"   est. total : ¥{pv['total_jpy']:,}   est. price: {pv.get('est_price')}   fee: ¥{pv.get('fee_jpy', 0):,}")
-        if res.submitted:
-            print(f"   order id   : {res.order_id}")
+        if d.get("submitted"):
+            print(f"   order id   : {d.get('order_id')}")
         elif not getattr(args, 'execute', False):
             print("   (re-run with --execute to place; you will be asked to type a confirmation)")
 
@@ -696,6 +717,8 @@ def build_parser() -> argparse.ArgumentParser:
         g.add_argument("--amount", type=int, help="order amount in JPY (金額指定)")
         sp_.add_argument("--limit", type=float, default=None, help="limit price (required unless --market-order)")
         sp_.add_argument("--market-order", action="store_true", help="place a market order (成行) — blocked unless allowed in trade.json")
+        sp_.add_argument("--account-type", dest="account_type", type=int, choices=(2, 3, 4), default=2,
+                         help="brokerage account: 2=特定(cash, default) | 3=成長投資枠NISA | 4=つみたて")
         sp_.add_argument("--execute", action="store_true", help="actually place the order (default is dry-run)")
 
     ords = sub.add_parser("orders", parents=[common]); ords.set_defaults(func=cmd_orders)

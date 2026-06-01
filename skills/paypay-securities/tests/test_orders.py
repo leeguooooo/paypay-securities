@@ -39,9 +39,22 @@ def test_build_rejects_neither_qty_nor_amount():
         pass
 
 
-def test_build_limit_requires_price():
+def test_build_no_limit_is_market_at_quote():
+    # PayPay US orders fill at the prevailing quote — no per-order limit required.
+    r = build(market="usa", symbol="TSLA", side="buy", qty=1)
+    assert r.limit_price is None and r.order_type is OrderType.LIMIT
+
+
+def test_build_amount_no_limit_ok():
+    r = build(market="usa", symbol="QQQ", side="buy", amount_jpy=1000)
+    assert r.amount_jpy == 1000 and r.limit_price is None
+
+
+def test_build_account_type_validated():
+    r = build(market="usa", symbol="TSLA", side="buy", amount_jpy=1000, account_type=3)
+    assert r.account_type == 3
     try:
-        build(market="usa", symbol="TSLA", side="buy", qty=1)  # no limit, not market
+        build(market="usa", symbol="TSLA", side="buy", amount_jpy=1000, account_type=9)
         assert False
     except OrderError:
         pass

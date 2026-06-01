@@ -38,11 +38,19 @@ class OrderRequest:
     amount_jpy: Optional[int] = None
     limit_price: Optional[float] = None
     account: Optional[str] = None
+    account_type: int = 2          # 2=特定(taxable, cash) 3=成長投資枠NISA 4=つみたて
+
+
+# brokerage account-type aliases (the web's ACCOUNT_TYPE field)
+ACCOUNT_TYPES = {"特定": 2, "tokutei": 2, "taxable": 2, "cash": 2,
+                 "nisa": 3, "成長": 3, "growth": 3,
+                 "つみたて": 4, "tsumitate": 4}
 
 
 def build(*, market: str, symbol: str, side: str, qty: Optional[float] = None,
           amount_jpy: Optional[int] = None, limit: Optional[float] = None,
-          market_order: bool = False, account: Optional[str] = None) -> OrderRequest:
+          market_order: bool = False, account: Optional[str] = None,
+          account_type: int = 2) -> OrderRequest:
     try:
         side_e = Side(side.strip().lower())
     except ValueError as e:
@@ -56,18 +64,19 @@ def build(*, market: str, symbol: str, side: str, qty: Optional[float] = None,
         raise OrderError("--qty must be positive")
     if amount_jpy is not None and amount_jpy <= 0:
         raise OrderError("--amount must be positive")
+    # PayPay US orders are 金額指定/株数指定 executed at the prevailing quote — a per-
+    # order limit price is OPTIONAL (give --limit only for a 指値 order; otherwise the
+    # order fills at market). --market-order forces 成行 and forbids a limit price.
     ot = OrderType.MARKET if market_order else OrderType.LIMIT
-    if ot is OrderType.MARKET:
-        if limit is not None:
-            raise OrderError("a market order must not carry a limit price")
-    else:
-        if limit is None:
-            raise OrderError("a limit order requires --limit PRICE (or pass --market-order)")
-        if limit <= 0:
-            raise OrderError("--limit must be positive")
+    if ot is OrderType.MARKET and limit is not None:
+        raise OrderError("a market order must not carry a limit price")
+    if limit is not None and limit <= 0:
+        raise OrderError("--limit must be positive")
+    if account_type not in (2, 3, 4):
+        raise OrderError("account_type must be 2(特定) | 3(成長投資枠) | 4(つみたて)")
     return OrderRequest(market=normalize_market(market), symbol=sym, side=side_e,
                         order_type=ot, qty=qty, amount_jpy=amount_jpy,
-                        limit_price=limit, account=account)
+                        limit_price=limit, account=account, account_type=account_type)
 
 
 @dataclass
