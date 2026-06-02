@@ -15,9 +15,20 @@ statements/
 # test fixtures contain REAL account HTML/JSON (PII) — never commit / ship
 tests/fixtures/
 
-# dev tests hold real account data (member id, holdings) — not shipped
-tests/
+# ROOT dev tests hold real account data (member id, holdings) — not shipped.
+# Anchored to repo root so the PII-free skills/.../tests/ (guard/order logic) CAN ship.
+/tests/
 
 # separate mobile-API MITM research — contains PII (member id, login flow). NOT part of the skill.
 research/
 docs/
+
+# iOS/RE artifacts — copyrighted app binary + reverse-engineering dumps. NEVER commit (public repo).
+*.ipa
+dump/
+tmp_unzip/
+.omx/
+vphone_*.py
+
+# local Claude Code session/config
+.claude/

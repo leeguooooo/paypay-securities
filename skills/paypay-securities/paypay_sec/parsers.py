@@ -314,3 +314,34 @@ def parse_history_series(html: str) -> dict:
         "end_date": grab(r"var\s+endDate\s*=\s*'([^']+)'"),
         "points": series,
     }
+
+
+def parse_open_orders(html: str) -> list[dict]:
+    """未約定 / 予約注文 rows from /trade/preorder/ (table.d_table).
+
+    Returns [] when there are no pending orders. Each row is a dict keyed by the
+    table header text, plus a best-effort canonical ``order_id`` pulled from a
+    cancel link / data-attr / hidden input. The exact column→field mapping is
+    finalized against a live pending order (none existed at capture time)."""
+    soup = BeautifulSoup(html, "lxml")
+    table = soup.select_one("table.d_table")
+    if not table:
+        return []
+    rows = table.select("tr")
+    if len(rows) <= 1:
+        return []
+    headers = [c.get_text(strip=True) for c in rows[0].select("th, td")]
+    out: list[dict] = []
+    for tr in rows[1:]:
+        cells = tr.select("td")
+        if not cells:
+            continue
+        rec = {(headers[i] if i < len(headers) and headers[i] else f"col{i}"):
+               td.get_text(strip=True) for i, td in enumerate(cells)}
+        m = re.search(r"(?:ORDER_NO|order_no|orderNo)[\"'=:\s]+(\d+)", str(tr))
+        if not m:
+            a = tr.find("a", href=re.compile(r"\d"))
+            m = re.search(r"(\d{6,})", a.get("href", "")) if a else None
+        rec["order_id"] = m.group(1) if m else None
+        out.append(rec)
+    return out

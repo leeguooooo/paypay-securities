@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures as cf
+import getpass
 import json
 import os
 import sys
@@ -22,6 +23,8 @@ import requests
 from .client import LoginError, PayPayClient
 from .config import Settings
 from . import parsers, costs, market, config, report
+from . import orders as _orders, guards as _guards, audit as _audit
+from datetime import datetime, timezone
 
 
 def _yen(v):
@@ -102,6 +105,32 @@ def _persist_cash(client: PayPayClient, cash):
         return json.loads(path.read_text(encoding="utf-8")).get("cash"), False
     except (OSError, ValueError):
         return None, False
+
+
+def _expected_phrase(req) -> str:
+    qty_or_amt = req.qty if req.qty is not None else req.amount_jpy
+    # normalize numbers like 1.0 -> "1"
+    q = int(qty_or_amt) if float(qty_or_amt).is_integer() else qty_or_amt
+    return f"{req.symbol} {q}"
+
+
+def make_confirmer(reader=input):
+    """Return confirmer(req, preview) -> bool. Requires the user to type the exact
+    '<SYMBOL> <qty|amount>' phrase — defends against a reflexive Enter."""
+    def confirmer(req, preview) -> bool:
+        want = _expected_phrase(req)
+        side = req.side.value.upper()
+        total = (preview or {}).get("total_jpy")
+        size = f"qty {req.qty}" if req.qty is not None else f"¥{req.amount_jpy:,}"
+        total_frag = f"  est. total ¥{total:,}" if total is not None else ""
+        print(f"\n⚠ LIVE ORDER — {side} {req.symbol} {size}{total_frag}")
+        print(f"  To place this order, type exactly:  {want}")
+        try:
+            typed = (reader(f"  confirm> ") or "").strip()
+        except (EOFError, KeyboardInterrupt):
+            return False
+        return typed == want
+    return confirmer
 
 
 def cmd_login(client: PayPayClient, args) -> int:
@@ -653,6 +682,134 @@ def cmd_invtrust_history(client: PayPayClient, args) -> int:
     return 0
 
 
+def _guard_ctx(client, args) -> "_guards.GuardContext":
+    acct = getattr(args, "account", None)
+    return _guards.GuardContext(
+        now=datetime.now(timezone.utc),
+        today_order_count=_audit.count_today(account=acct, kind="submit"),
+        current_quote=None,        # Task 13: fill from a quote fetch
+        portfolio_total_jpy=None,  # Task 13: fill from portfolio total
+    )
+
+
+def _order_common(client, args, side: str) -> int:
+    try:
+        req = _orders.build(market=args.market, symbol=args.symbol, side=side,
+                            qty=args.qty, amount_jpy=args.amount, limit=args.limit,
+                            market_order=getattr(args, "market_order", False),
+                            account=getattr(args, "account", None),
+                            account_type=getattr(args, "account_type", 2))
+    except _orders.OrderError as e:
+        print(f"error: {e}", file=sys.stderr); return 2
+    cfg = _guards.load_trade_config(getattr(args, "account", None))
+    ctx = _guard_ctx(client, args)
+    confirm = lambda r: client.order_confirm(r)
+    # TRADE_PASSWORD (取引パスワード) is prompted (not echoed, never stored) only if/when
+    # we actually submit — the agent never supplies it; the human does, at the keyboard.
+    _pw = {}
+    def _trade_pw():
+        if "v" not in _pw:
+            try:
+                _pw["v"] = getpass.getpass("  取引パスワード (trade password): ")
+            except (EOFError, KeyboardInterrupt):
+                _pw["v"] = ""
+        return _pw["v"]
+    try:
+        if getattr(args, "execute", False):
+            res = _orders.place(req, cfg, ctx, confirm=confirm,
+                                submit=lambda tok, r: client.order_submit(tok, r, trade_password=_trade_pw()),
+                                confirmer=make_confirmer())
+        else:
+            res = _orders.dry_run(req, cfg, ctx, confirm=confirm)
+    except NotImplementedError as e:
+        print(f"[pending Phase 0] guards OK, but {e}", file=sys.stderr)
+        _audit.record({"kind": "dry_run", "symbol": req.symbol, "side": side,
+                       "qty": req.qty, "amount_jpy": req.amount_jpy,
+                       "limit": req.limit_price, "status": "confirm_pending_phase0"},
+                      account=getattr(args, "account", None))
+        return 3
+    except (RuntimeError, requests.RequestException) as e:
+        # confirm rejected (e.g. market closed / over buyable), session, or submit error
+        print(f"error: {e}", file=sys.stderr)
+        _audit.record({"kind": "error", "symbol": req.symbol, "side": side,
+                       "qty": req.qty, "amount_jpy": req.amount_jpy,
+                       "limit": req.limit_price, "error": str(e)[:200]},
+                      account=getattr(args, "account", None))
+        return 1
+
+    _audit.record({"kind": "submit" if res.submitted else "dry_run",
+                   "symbol": req.symbol, "side": side, "qty": req.qty,
+                   "amount_jpy": req.amount_jpy, "limit": req.limit_price,
+                   "violations": res.violations, "order_id": res.order_id},
+                  account=getattr(args, "account", None))
+
+    def render(d):
+        # d is res.__dict__ (a plain dict — _emit also json-serializes it)
+        if d.get("violations"):
+            print("⛔ order blocked by guards:")
+            for v in d["violations"]:
+                print(f"   - {v}")
+            return
+        pv = d.get("preview") or {}
+        print(f"{'✅ SUBMITTED' if d.get('submitted') else '🔎 DRY-RUN (not sent)'}  "
+              f"{side.upper()} {req.symbol}")
+        if pv.get("total_jpy") is not None:
+            print(f"   est. total : ¥{pv['total_jpy']:,}   est. price: {pv.get('est_price')}   fee: ¥{pv.get('fee_jpy', 0):,}")
+        if d.get("submitted"):
+            print(f"   order id   : {d.get('order_id')}")
+        elif not getattr(args, 'execute', False):
+            print("   (re-run with --execute to place; you will be asked to type a confirmation)")
+
+    _emit(res.__dict__, getattr(args, "json", False), render)
+    return 0 if (res.submitted or not res.violations) else 1
+
+
+def cmd_buy(client, args) -> int:
+    return _order_common(client, args, "buy")
+
+
+def cmd_sell(client, args) -> int:
+    return _order_common(client, args, "sell")
+
+
+def cmd_orders(client, args) -> int:
+    try:
+        rows = client.open_orders(args.market)
+    except NotImplementedError as e:
+        print(f"[pending Phase 0] {e}", file=sys.stderr); return 3
+    payload = {"open_orders": rows}
+    def render(p):
+        print("未約定注文 (open orders)\n")
+        print(_lj("ORDER_ID", 18) + _lj("SIDE", 6) + _lj("SYMBOL", 10)
+              + _rj("QTY", 10) + _rj("LIMIT", 10) + "  STATUS")
+        for r in p["open_orders"]:
+            print(_lj(str(r.get("order_id","")), 18) + _lj(r.get("side",""), 6)
+                  + _lj(r.get("symbol",""), 10) + _rj(str(r.get("qty","")), 10)
+                  + _rj(str(r.get("limit","")), 10) + "  " + str(r.get("status","")))
+    _emit(payload, getattr(args, "json", False), render)
+    return 0
+
+
+def cmd_cancel(client, args) -> int:
+    if not getattr(args, "execute", False):
+        print(f"🔎 DRY-RUN: would cancel order {args.order_id}. Re-run with --execute.")
+        return 0
+    try:
+        typed = input(f"  To cancel, type the order id exactly: {args.order_id}\n  confirm> ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print("cancel aborted"); return 1
+    if typed != str(args.order_id):
+        print("cancel aborted (phrase mismatch)"); return 1
+    try:
+        out = client.order_cancel(args.order_id, args.market)
+    except NotImplementedError as e:
+        print(f"[pending Phase 0] {e}", file=sys.stderr); return 3
+    _audit.record({"kind": "cancel", "order_id": args.order_id, "response": out},
+                  account=getattr(args, "account", None))
+    print(f"✅ cancel requested for {args.order_id}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     # shared flags live on a parent so they work AFTER the subcommand
     # (e.g. `paypay portfolio -m usa --json`)
@@ -695,6 +852,25 @@ def build_parser() -> argparse.ArgumentParser:
             sp.add_argument("--detail", action="store_true", help="show per-trade FX spread")
             sp.add_argument("--price-spread-pct", type=float, default=0.0,
                             help="add an estimated price-spread cost at this %% of US turnover")
+
+    buy = sub.add_parser("buy", parents=[common]); buy.set_defaults(func=cmd_buy)
+    sell = sub.add_parser("sell", parents=[common]); sell.set_defaults(func=cmd_sell)
+    for sp_ in (buy, sell):
+        sp_.add_argument("symbol", help="ticker, e.g. TSLA")
+        g = sp_.add_mutually_exclusive_group(required=True)
+        g.add_argument("--qty", type=float, help="number of shares (株数指定)")
+        g.add_argument("--amount", type=int, help="order amount in JPY (金額指定)")
+        sp_.add_argument("--limit", type=float, default=None, help="limit price (指値); optional — US fills at the quote, omit for a market-priced order")
+        sp_.add_argument("--market-order", action="store_true", help="place a market order (成行) — blocked unless allowed in trade.json")
+        sp_.add_argument("--account-type", dest="account_type", type=int, choices=(2, 3, 4), default=2,
+                         help="brokerage account: 2=特定(cash, default) | 3=成長投資枠NISA | 4=つみたて")
+        sp_.add_argument("--execute", action="store_true", help="actually place the order (default is dry-run)")
+
+    ords = sub.add_parser("orders", parents=[common]); ords.set_defaults(func=cmd_orders)
+    canc = sub.add_parser("cancel", parents=[common]); canc.set_defaults(func=cmd_cancel)
+    canc.add_argument("order_id", help="order id from `paypay orders`")
+    canc.add_argument("--execute", action="store_true", help="actually cancel (default is dry-run)")
+
     return p
 
 

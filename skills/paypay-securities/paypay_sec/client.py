@@ -16,10 +16,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
+import re
 import time
 from pathlib import Path
 
+from bs4 import BeautifulSoup
 import requests
 
 from .config import HOME, DEFAULT_ACCOUNT, Settings
@@ -29,6 +32,8 @@ _UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
        "(KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36")
 _DOMAIN = "www.paypay-sec.co.jp"
 SESSION_FILE = HOME / "session.json"   # default account (back-compat)
+_BRAND_HREF_RE = re.compile(r"/trade/brand/(\d+)/0")
+_BRAND_LOGO_RE = re.compile(r"304x304_([a-z0-9._-]+)\.(?:png|jpe?g)", re.I)
 
 
 def state_dir(account: str | None) -> Path:
@@ -419,3 +424,178 @@ class PayPayClient:
             except OSError:
                 pass
         return names
+
+    # ---- WRITE methods (orders). NO _run_resilient, NO _cached. Single-shot. ----
+    # Confirm is a server-side preview only. It does not include TRADE_PASSWORD
+    # and it must not call ajax_buy_complete / ajax_sell_complete.
+    def _order_json_get(self, path: str, referer: str) -> dict:
+        self.ensure_session()
+        r = self._session.get(
+            f"{BASE}{path}",
+            headers={"X-Requested-With": "XMLHttpRequest", "Referer": f"{BASE}{referer}"},
+            timeout=30,
+            allow_redirects=False,
+        )
+        if r.status_code in (301, 302):
+            raise SessionExpired(path)
+        r.raise_for_status()
+        try:
+            return r.json()
+        except ValueError as e:
+            raise RuntimeError(f"{path} did not return JSON") from e
+
+    def _order_json_post(self, path: str, data: dict, referer: str) -> dict:
+        self.ensure_session()
+        r = self._session.post(
+            f"{BASE}{path}",
+            data=data,
+            headers={
+                "X-Requested-With": "XMLHttpRequest",
+                "Origin": BASE,
+                "Referer": f"{BASE}{referer}",
+                "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+            },
+            timeout=30,
+            allow_redirects=False,
+        )
+        if r.status_code in (301, 302):
+            raise SessionExpired(path)
+        r.raise_for_status()
+        try:
+            return r.json()
+        except ValueError as e:
+            raise RuntimeError(f"{path} did not return JSON") from e
+
+    def _brand_id_for_symbol(self, symbol: str, market: str = "usa") -> str:
+        """Resolve a US ticker to PayPay's internal BRAND_ID.
+
+        The summary page exposes `/trade/brand/<id>/0` links. For US stocks the
+        logo asset filename also carries the ticker, e.g. `304x304_aapl.png`.
+        """
+        sym = (symbol or "").strip().upper()
+        if not sym:
+            raise RuntimeError("symbol is required")
+        if sym.isdigit():
+            return sym
+        html = self.summary_html(market)
+        soup = BeautifulSoup(html, "lxml")
+        for card in soup.select("div.mypage_brand_icon"):
+            a = card.find("a")
+            href = a.get("href", "") if a else ""
+            id_match = _BRAND_HREF_RE.search(href)
+            logo_match = _BRAND_LOGO_RE.search(str(card))
+            if id_match and logo_match and logo_match.group(1).upper() == sym:
+                return id_match.group(1)
+        raise RuntimeError(f"could not resolve ticker {sym!r} to a PayPay BRAND_ID")
+
+    @staticmethod
+    def _order_amount_jpy(req, brand: dict) -> int:
+        if getattr(req, "amount_jpy", None) is not None:
+            return int(req.amount_jpy)
+        qty = getattr(req, "qty", None)
+        limit = getattr(req, "limit_price", None)
+        if qty is None or limit is None:
+            raise RuntimeError("confirm requires either amount_jpy or qty+limit_price")
+        fx = float(brand.get("EXCHANGE_RATE") or 0)
+        if fx <= 0:
+            raise RuntimeError("confirm could not read a positive exchange rate")
+        return int(math.ceil(float(qty) * float(limit) * fx))
+
+    @staticmethod
+    def _message(resp: dict) -> str:
+        msgs = resp.get("MESSAGE_ARRAY") or resp.get("MESSAGE")
+        if isinstance(msgs, list):
+            return "; ".join(str(x) for x in msgs)
+        return str(msgs or "unknown error")
+
+    # The web order flow (FuelPHP, www.paypay-sec.co.jp — NOT cert-pinned, NO passkey):
+    #   confirm/見積 (preview only): POST /trade/brand/ajax_(buy|sell)_popup.json
+    #     → {STATUS, HTML}; HTML carries ORDER_CONFIRM_NO + the order fields as hidden
+    #       inputs + a TRADE_PASSWORD field.
+    #   submit/真下単: POST /trade/brand/ajax_(buy|sell)_complete with those hidden
+    #     fields + ORDER_CONFIRM_NO + TRADE_PASSWORD + CSRF_TOKEN (= fuel_csrf_token cookie).
+    # NOTE: confirm/submit response *field names* are finalized against a live capture
+    # when the US market is open (closed → buyable=0 → confirm STATUS=false). The hidden-
+    # field extraction below is format-agnostic so it survives that finalization.
+    @staticmethod
+    def _hidden_fields(html: str) -> dict:
+        return dict(re.findall(
+            r'<input[^>]*name=["\']([A-Za-z_]+)["\'][^>]*value=["\']([^"\']*)["\']', html or ""))
+
+    def _confirm(self, req, side: str) -> dict:
+        market = normalize_market(getattr(req, "market", "usa"))
+        if market != "usa":
+            raise NotImplementedError("order confirm currently supports US stocks only")
+        brand_id = self._brand_id_for_symbol(req.symbol, market)
+        account_type = int(getattr(req, "account_type", None) or 2)
+        ref = f"/trade/brand/{side}/{brand_id}"
+        live = self._order_json_get(f"/trade/brand/ajax_detail/{brand_id}/0", referer=ref)
+        brand = live.get("brand") or {}
+        amount_jpy = self._order_amount_jpy(req, brand)
+        popup = self._order_json_post(
+            f"/trade/brand/ajax_{side}_popup.json",
+            data={"amountTyp": 0, "val": amount_jpy, "BRAND_ID": brand_id, "buyAllChange": 0,
+                  "globalOrderAmountLower": brand.get("ORDER_AMOUNT_LOWER") or 1,
+                  "preorder": 0, "PLAN_TYPE": 0, "KEY": "", "PAYPAY_FLG": 0,
+                  "ACCOUNT_TYPE": account_type},
+            referer=ref)
+        if not popup.get("STATUS"):
+            raise RuntimeError(f"order confirm rejected: {self._message(popup)}")
+        fields = self._hidden_fields(popup.get("HTML") or popup.get("html") or "")
+        token = str(fields.get("ORDER_CONFIRM_NO") or "")
+        # stash the exact fields the matching submit must echo back, keyed by token
+        self._pending_orders = getattr(self, "_pending_orders", {})
+        self._pending_orders[token] = {"side": side, "brand_id": brand_id, "fields": fields,
+                                       "account_type": account_type, "referer": ref}
+        return {
+            "token": token,
+            "total_jpy": int(float(fields.get("ORDER_AMOUNT") or amount_jpy)),
+            "est_price": fields.get("ORDER_PRICE") or brand.get("PRICE"),
+            "fee_jpy": int(float(fields.get("ORDER_FEE") or fields.get("FEE") or 0)),
+            "brand_id": brand_id, "symbol": req.symbol, "account_type": account_type,
+            "raw": {"fields": fields, "message": self._message(popup)},
+        }
+
+    def order_confirm(self, req) -> dict:
+        side = getattr(getattr(req, "side", None), "value", getattr(req, "side", None))
+        return self._confirm(req, "sell" if side == "sell" else "buy")
+
+    def order_submit(self, token: str, req, trade_password: str = "") -> dict:
+        """Place the order. Single-shot, NO retry. Requires the TRADE_PASSWORD and a
+        prior order_confirm (whose ORDER_CONFIRM_NO == token)."""
+        if not trade_password:
+            raise RuntimeError("order_submit requires the TRADE_PASSWORD (取引パスワード)")
+        pending = getattr(self, "_pending_orders", {}).get(token)
+        if not pending:
+            raise RuntimeError("no confirmed order for this token — call order_confirm first")
+        side = pending["side"]
+        form = dict(pending["fields"])           # echo back exactly what confirm returned
+        form["ORDER_CONFIRM_NO"] = token
+        form["TRADE_PASSWORD"] = trade_password
+        form["CSRF_TOKEN"] = self._session.cookies.get("fuel_csrf_token") or form.get("CSRF_TOKEN", "")
+        form.setdefault("IS_NON_INSIDER_TRADING_CONFIRMED", "1")
+        form.setdefault("ACCOUNT_TYPE", str(pending["account_type"]))
+        resp = self._order_json_post(f"/trade/brand/ajax_{side}_complete", data=form,
+                                     referer=pending["referer"])
+        self._pending_orders.pop(token, None)    # single-use token
+        if not resp.get("STATUS"):
+            raise RuntimeError(f"order submit rejected: {self._message(resp)}")
+        rfields = self._hidden_fields(resp.get("HTML") or "")
+        return {"order_id": rfields.get("ORDER_NO") or resp.get("ORDER_NO")
+                or rfields.get("ORDER_CONFIRM_NO") or token, "raw": resp}
+
+    def open_orders(self, market: str = "usa") -> list:
+        """未約定/予約注文 from /trade/preorder/ (parsed in parsers.parse_open_orders)."""
+        from . import parsers
+        return parsers.parse_open_orders(self.fetch("/trade/preorder/"))
+
+    def order_cancel(self, order_id: str, market: str = "usa") -> dict:
+        """Cancel a pending order. The cancel endpoint/fields are finalized against a
+        live open order (needs an actual pending order to capture)."""
+        resp = self._order_json_post(
+            "/trade/preorder/ajax_cancel",
+            data={"ORDER_NO": order_id, "CSRF_TOKEN": self._session.cookies.get("fuel_csrf_token") or ""},
+            referer="/trade/preorder/")
+        if not resp.get("STATUS"):
+            raise RuntimeError(f"cancel rejected: {self._message(resp)}")
+        return {"order_id": order_id, "raw": resp}
