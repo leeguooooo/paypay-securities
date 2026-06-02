@@ -22,3 +22,13 @@ tests/fixtures/
 # separate mobile-API MITM research — contains PII (member id, login flow). NOT part of the skill.
 research/
 docs/
+
+# iOS/RE artifacts — copyrighted app binary + reverse-engineering dumps. NEVER commit (public repo).
+*.ipa
+dump/
+tmp_unzip/
+.omx/
+vphone_*.py
+
+# local Claude Code session/config
+.claude/
