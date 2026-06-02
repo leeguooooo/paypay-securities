@@ -235,11 +235,15 @@ def cmd_review(client: PayPayClient, args) -> int:
     net_deposit = agg["deposits"] - agg["withdrawals"]
     total_return = total - net_deposit
     residual = total_return - (unreal + realized_total)
+    # 評価損益率 (App頭条と同じ "含み損益 ÷ 取得原価") for the 持仓盈亏 block
+    holdings_value = total - cash
+    cost_basis = holdings_value - unreal
+    unreal_pct = round(100.0 * unreal / cost_basis, 2) if cost_basis else 0.0
     p = {
         "period": {"from": agg["date_from"], "to": agg["date_to"]},
         "total_assets": total, "cash": cash, "cash_fresh": g.get("cash_fresh", True),
         "invested": total - cash,
-        "unrealized_pl": unreal,
+        "unrealized_pl": unreal, "unrealized_pct": unreal_pct,
         "realized_sec": realized_sec, "realized_inv": realized_inv,
         "realized_total": realized_total, "inv_reconciles": inv["reconciles"],
         "explicit_fees": agg["explicit_fees"], "fx_spread_cost": fx_cost,
@@ -253,47 +257,48 @@ def cmd_review(client: PayPayClient, args) -> int:
         "note": "事実データのみ。投資助言・推奨ではありません。",
     }
 
-    def _inv_line(p):
-        mark = "" if p["inv_reconciles"] else "  ⚠取得単価不足→過小評価"
-        return f"{_signed_yen(p['realized_inv'])}{mark}"
-
+    # Three numbers that answer three different questions — kept distinct so a
+    # negative 評価損益 (holdings underwater) never gets read as an overall loss,
+    # nor a positive 実現 as the final result (it's gross, before tax/fees).
     def table(p):
         pr = p["period"]
         cstale = "" if p.get("cash_fresh", True) else " ⚠stale(取得失敗)"
+        rmark = "" if p["inv_reconciles"] else " ⚠過小評価"
         print(f"PayPay証券 復盘  ({pr['from']} 〜 {pr['to']})\n")
-        print(f"  総資産   : {_yen(p['total_assets'])}   (投資 {_yen(p['invested'])} / 現金 {_yen(p['cash'])}{cstale})")
-        print(f"  純入金   : {_yen(p['net_deposit'])}   (入金 {_yen(p['deposits'])} − 出金 {_yen(p['withdrawals'])})")
-        print(f"  総収益   : {_signed_yen(p['total_return'])}  (総資産 − 純入金 = 取得来の実質損益)")
-        print(f"    └ 未実現(現保有)   : {_signed_yen(p['unrealized_pl'])}")
-        print(f"    └ 実現(証券)       : {_signed_yen(p['realized_sec'])}  (移動平均)")
-        print(f"    └ 実現(投信)       : {_inv_line(p)}")
-        print(f"    └ その他(未集計)   : {_signed_yen(p['ledger_residual'])}")
-        print(f"  取引コスト: {_yen(p['total_cost'])}  (証券手数料 {_yen(p['explicit_fees'])} + 為替 {_yen(p['fx_spread_cost'])}"
-              f" + 投信譲渡益税 {_yen(p['inv_capital_gains_tax'])} + 送金手数料 {_yen(p['inv_transfer_fees'])})")
-        print("\n  保有:")
+
+        print(f"① 持仓盈亏  評価損益(=App頭条, 今の保有)  : {_signed_yen(p['unrealized_pl'])} ({p['unrealized_pct']:+.2f}%)")
         for h in p["holdings"]:
-            print("    " + _lj(h["name"], 30) + _rj(_yen(h["valuation"]), 11)
-                  + _rj(f"{h['pct']}%", 7) + _rj(_signed_yen(h["unrealized_pl"]), 10))
+            print("     " + _lj(h["name"], 30) + _rj(_yen(h["valuation"]), 11)
+                  + _rj(_signed_yen(h["unrealized_pl"]), 10))
+
+        print(f"\n② 累計実現  実現損益(売って確定, 税引前)  : {_signed_yen(p['realized_total'])}{rmark}")
+        print(f"     証券 {_signed_yen(p['realized_sec'])} / 投信 {_signed_yen(p['realized_inv'])}"
+              f"   ※移動平均推計; App「実現損益合計」が正(米株特定はFX差)")
+
+        print(f"\n③ 整体盈亏  通算 = 総資産 − 純入金 ★最終  : {_signed_yen(p['total_return'])}")
+        print(f"     総資産 {_yen(p['total_assets'])}(現金 {_yen(p['cash'])}{cstale}) − 純入金 {_yen(p['net_deposit'])}")
+        print(f"     = 実現益から 譲渡益税 {_yen(p['inv_capital_gains_tax'])}・送金手数料 {_yen(p['inv_transfer_fees'])}・為替等を差引いた後の値")
+
+        print(f"\n  取引コスト {_yen(p['total_cost'])}  (証券手数料 {_yen(p['explicit_fees'])} + 為替 {_yen(p['fx_spread_cost'])}"
+              f" + 投信譲渡益税 {_yen(p['inv_capital_gains_tax'])} + 送金手数料 {_yen(p['inv_transfer_fees'])})")
         print(f"\n  注: {p['note']}")
 
     def lark(p):
         pr = p["period"]
+        cstale = "" if p.get("cash_fresh", True) else " ⚠stale"
+        rmark = "" if p["inv_reconciles"] else " ⚠過小評価"
         L = [f"**PayPay証券 復盘 ({pr['from']}〜{pr['to']})**", "",
-             "**資産**",
-             f"- 総資産: **{_yen(p['total_assets'])}**(投資 {_yen(p['invested'])} / 現金 {_yen(p['cash'])})",
-             f"- 純入金: **{_yen(p['net_deposit'])}**(入金 {_yen(p['deposits'])} − 出金 {_yen(p['withdrawals'])})",
-             "**損益**",
-             f"- 総収益(総資産−純入金): **{_signed_yen(p['total_return'])}**",
-             f"  - 未実現(現保有): {_signed_yen(p['unrealized_pl'])}",
-             f"  - 実現(証券): {_signed_yen(p['realized_sec'])}",
-             f"  - 実現(投信): {_inv_line(p)}",
-             f"  - その他(未集計): {_signed_yen(p['ledger_residual'])}",
-             f"- 取引コスト: **{_yen(p['total_cost'])}**(証券手数料 {_yen(p['explicit_fees'])}+為替 {_yen(p['fx_spread_cost'])}"
-             f"+投信譲渡益税 {_yen(p['inv_capital_gains_tax'])}+送金手数料 {_yen(p['inv_transfer_fees'])})",
-             "**保有**"]
+             f"**① 持仓盈亏** 評価損益(=App頭条, 今の保有): **{_signed_yen(p['unrealized_pl'])}** ({p['unrealized_pct']:+.2f}%)"]
         for h in p["holdings"]:
-            L.append(f"- {h['name']}: **{_yen(h['valuation'])}** ({h['pct']}%) {_signed_yen(h['unrealized_pl'])}")
-        L.append(f"\n> {p['note']}")
+            L.append(f"  - {h['name']}: {_yen(h['valuation'])} {_signed_yen(h['unrealized_pl'])}")
+        L += [f"**② 累計実現** 実現損益(売って確定, 税引前): **{_signed_yen(p['realized_total'])}**{rmark}",
+              f"  - 証券 {_signed_yen(p['realized_sec'])} / 投信 {_signed_yen(p['realized_inv'])} ※移動平均推計; App「実現損益合計」が正",
+              f"**③ 整体盈亏** 通算 = 総資産 − 純入金 ★最終: **{_signed_yen(p['total_return'])}**",
+              f"  - 総資産 {_yen(p['total_assets'])}(現金 {_yen(p['cash'])}{cstale}) − 純入金 {_yen(p['net_deposit'])}",
+              f"  - 実現益から 譲渡益税 {_yen(p['inv_capital_gains_tax'])}・送金手数料 {_yen(p['inv_transfer_fees'])}・為替等を差引いた後",
+              f"- 取引コスト {_yen(p['total_cost'])}(証券手数料 {_yen(p['explicit_fees'])}+為替 {_yen(p['fx_spread_cost'])}"
+              f"+投信譲渡益税 {_yen(p['inv_capital_gains_tax'])}+送金手数料 {_yen(p['inv_transfer_fees'])})",
+              f"\n> {p['note']}"]
         print("\n".join(L))
 
     _emit_fmt(p, _fmt(args), table, lark)

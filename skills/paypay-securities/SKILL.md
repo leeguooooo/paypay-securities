@@ -76,7 +76,7 @@ uv run paypay total                 # aggregate 証券 + 投信 invested assets 
 uv run paypay assets                # one-shot consolidated holdings + cash + grand total (parallel)
 uv run paypay trades [--pages N]    # 証券 transaction ledger (買付/売却/入金/手数料) + running cash balance
 uv run paypay fees [--detail]       # cost analysis: explicit fees + measured FX spread (+ optional price spread)
-uv run paypay review                # 复盘 summary: assets, realized/unrealized P&L (証券+投信), deposits, costs, holdings
+uv run paypay review                # 复盘: 2 blocks — 持仓盈亏(評価損益=App頭条) + 账户盈亏(通算=総資産−純入金); + realized/costs
 uv run paypay trades-summary        # per-brand buy/sell/net-invested/net-shares/realized P&L
 uv run paypay accounts              # list configured account profiles
 uv run paypay cache-clear           # clear the local response cache
