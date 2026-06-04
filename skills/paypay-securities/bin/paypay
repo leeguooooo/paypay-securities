@@ -5,4 +5,8 @@
 # then: paypay review --format lark
 set -euo pipefail
 SKILL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# Drop an outer VIRTUAL_ENV so `uv run` doesn't print the
+# "VIRTUAL_ENV does not match the project environment" warning that pollutes
+# output (uv manages this project's own .venv via --project).
+unset VIRTUAL_ENV
 exec uv run --project "$SKILL_DIR" paypay "$@"

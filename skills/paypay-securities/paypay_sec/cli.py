@@ -12,7 +12,9 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures as cf
+import contextlib
 import getpass
+import io
 import json
 import os
 import sys
@@ -22,9 +24,42 @@ import requests
 
 from .client import LoginError, PayPayClient
 from .config import Settings
-from . import parsers, costs, market, config, report
+from . import parsers, costs, market, config, report, i18n, snapshots
 from . import orders as _orders, guards as _guards, audit as _audit
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+
+# Output language for human-facing (table/lark) renders; set from --lang in main().
+# JSON output is never localized — its keys are a stable machine contract.
+_LANG = "ja"
+
+# JST — PayPay証券 reports in Japan time; as_of stamps use it.
+_JST = timezone(timedelta(hours=9))
+
+
+def _now_jst_str() -> str:
+    return datetime.now(timezone.utc).astimezone(_JST).strftime("%Y-%m-%d %H:%M JST")
+
+
+# --all pages until NEXT_FLG=false; this is the upper bound that keeps a stuck
+# feed from looping forever (settlement_records already stops at NEXT_FLG).
+_ALL_PAGES_CAP = 500
+
+
+def _pages(args, default: int) -> int:
+    """Resolve the ledger page count: a big cap when --all, else --pages/default."""
+    if getattr(args, "fetch_all", False):
+        return _ALL_PAGES_CAP
+    return getattr(args, "pages", default)
+
+
+def _basis_hint(reconciles: bool, fetched_all: bool) -> str:
+    """Warn (don't hide) when realized P&L rests on an incomplete cost basis —
+    i.e. a sell with no matching buy in the fetched window. Points at --all."""
+    if reconciles:
+        return ""
+    tail = "" if fetched_all else " — `--all` で全履歴を取得して再計算を"
+    return ("⚠ 売却>取得の銘柄あり: 取得原価が不足 → 実現損益・原価が過小/不完全の可能性"
+            + tail)
 
 
 def _yen(v):
@@ -72,20 +107,61 @@ def _fmt(args) -> str:
     return getattr(args, "fmt", None) or "table"
 
 
+def _run_localized(render, payload) -> None:
+    """Run a render fn (which prints) and localize its output per _LANG.
+    JSON never reaches here, so machine output is unaffected."""
+    if _LANG == "zh":
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            render(payload)
+        sys.stdout.write(i18n.localize(buf.getvalue(), _LANG))
+    else:
+        render(payload)
+
+
+_SOURCE_LABELS = {"securities": "証券", "invtrust": "投信", "cash": "現金",
+                  "fx": "為替", "ledger": "取引履歴", "invledger": "投信履歴", "names": "投信名称"}
+
+
+def _source_warnings(sources: dict) -> list:
+    """Loud, non-silent warnings for any source that failed or went stale, so a
+    report never looks complete when a feed actually dropped out."""
+    warn = []
+    for k, v in (sources or {}).items():
+        lab = _SOURCE_LABELS.get(k, k)
+        if v == "failed":
+            warn.append(f"⚠ {lab} の取得に失敗 — この値は本回欠落/不完全の可能性")
+        elif v == "stale":
+            warn.append(f"⚠ {lab} は stale(前回キャッシュ値, ライブ取得できず)")
+    return warn
+
+
+def _freshness_block(p: dict, lines) -> None:
+    """Append the as_of stamp + per-source freshness + warnings to `lines`
+    (a list the caller `print`s/joins). Used by table & lark renderers."""
+    if p.get("as_of"):
+        lines.append(f"  查询时间 {p['as_of']}")
+    src = p.get("sources")
+    if src:
+        lines.append("  データ鮮度: " + "  ".join(f"{_SOURCE_LABELS.get(k, k)}={v}" for k, v in src.items()))
+        for w in _source_warnings(src):
+            lines.append("  " + w)
+
+
 def _emit_fmt(payload, fmt, table_fn, lark_fn) -> None:
     if fmt == "json":
         print(json.dumps(payload, ensure_ascii=False, indent=2))
     elif fmt == "lark":
-        lark_fn(payload)
+        _run_localized(lark_fn, payload)
     else:
-        table_fn(payload)
+        _run_localized(table_fn, payload)
 
 
 def _emit(obj, as_json: bool, render):
     if as_json:
         print(json.dumps(obj, ensure_ascii=False, indent=2))
     else:
-        render(obj)
+        _run_localized(render, obj)
 
 
 def _persist_cash(client: PayPayClient, cash):
@@ -156,7 +232,7 @@ def cmd_logout(client: PayPayClient, args) -> int:
 
 
 def cmd_fees(client: PayPayClient, args) -> int:
-    txns = parsers.parse_transactions(client.settlement_records(max_pages=getattr(args, "pages", 3)))
+    txns = parsers.parse_transactions(client.settlement_records(max_pages=_pages(args, 3)))
     trade_dates = [t["date"] for t in txns if t["type"] in costs.TRADE_TYPES and t["date"]]
     series = market.usdjpy_series(min(trade_dates), max(trade_dates)) if trade_dates else {}
     result = costs.compute_costs(txns, series)
@@ -236,12 +312,21 @@ def _gather(client: PayPayClient, pages: int = 8) -> dict:
     total = sum(h["valuation"] for h in holdings) + (cash or 0)
     tdates = [t["date"] for t in txns if t["type"] in costs.TRADE_TYPES and t["date"]]
     series = market.usdjpy_series(min(tdates), max(tdates)) if tdates else {}
+    sources = {
+        "securities": "ok" if out.get("sec") is not None else "failed",
+        "invtrust": "ok" if out.get("inv") is not None else "failed",
+        "ledger": "ok" if out.get("ledger") else "failed",
+        "invledger": "ok" if out.get("invledger") is not None else "failed",
+        "cash": "live" if cash_fresh else ("stale" if cash is not None else "failed"),
+        "fx": "ok" if series else "missing",
+    }
     return {"txns": txns, "inv_txns": inv_txns, "holdings": holdings,
-            "cash": cash or 0, "cash_fresh": cash_fresh, "total": total, "fx_series": series}
+            "cash": cash or 0, "cash_fresh": cash_fresh, "total": total,
+            "fx_series": series, "sources": sources}
 
 
 def cmd_review(client: PayPayClient, args) -> int:
-    g = _gather(client, pages=getattr(args, "pages", 8))
+    g = _gather(client, pages=_pages(args, 8))
     agg = report.aggregate_trades(g["txns"])
     inv = report.aggregate_invtrust(g.get("inv_txns") or [])
     fx_cost = costs.compute_costs(g["txns"], g["fx_series"])["fx_spread_cost"]
@@ -269,12 +354,14 @@ def cmd_review(client: PayPayClient, args) -> int:
     cost_basis = holdings_value - unreal
     unreal_pct = round(100.0 * unreal / cost_basis, 2) if cost_basis else 0.0
     p = {
+        "as_of": _now_jst_str(), "sources": g.get("sources"),
         "period": {"from": agg["date_from"], "to": agg["date_to"]},
         "total_assets": total, "cash": cash, "cash_fresh": g.get("cash_fresh", True),
         "invested": total - cash,
         "unrealized_pl": unreal, "unrealized_pct": unreal_pct,
         "realized_sec": realized_sec, "realized_inv": realized_inv,
         "realized_total": realized_total, "inv_reconciles": inv["reconciles"],
+        "sec_reconciles": agg["reconciles"], "fetched_all": getattr(args, "fetch_all", False),
         "explicit_fees": agg["explicit_fees"], "fx_spread_cost": fx_cost,
         "inv_capital_gains_tax": inv_tax, "inv_transfer_fees": inv_transfer,
         "total_cost": total_cost,
@@ -293,7 +380,7 @@ def cmd_review(client: PayPayClient, args) -> int:
         pr = p["period"]
         cstale = "" if p.get("cash_fresh", True) else " ⚠stale(取得失敗)"
         rmark = "" if p["inv_reconciles"] else " ⚠過小評価"
-        print(f"PayPay証券 復盘  ({pr['from']} 〜 {pr['to']})\n")
+        print(f"PayPay証券 復盘  (取引履歴 {pr['from']} 〜 {pr['to']})\n")
 
         print(f"① 持仓盈亏  評価損益(=App頭条, 今の保有)  : {_signed_yen(p['unrealized_pl'])} ({p['unrealized_pct']:+.2f}%)")
         for h in p["holdings"]:
@@ -303,6 +390,9 @@ def cmd_review(client: PayPayClient, args) -> int:
         print(f"\n② 累計実現  実現損益(売って確定, 税引前)  : {_signed_yen(p['realized_total'])}{rmark}")
         print(f"     証券 {_signed_yen(p['realized_sec'])} / 投信 {_signed_yen(p['realized_inv'])}"
               f"   ※移動平均推計; App「実現損益合計」が正(米株特定はFX差)")
+        bh = _basis_hint(p.get("sec_reconciles", True) and p["inv_reconciles"], p.get("fetched_all", False))
+        if bh:
+            print("     " + bh)
 
         print(f"\n③ 整体盈亏  通算 = 総資産 − 純入金 ★最終  : {_signed_yen(p['total_return'])}")
         print(f"     総資産 {_yen(p['total_assets'])}(現金 {_yen(p['cash'])}{cstale}) − 純入金 {_yen(p['net_deposit'])}")
@@ -310,24 +400,35 @@ def cmd_review(client: PayPayClient, args) -> int:
 
         print(f"\n  取引コスト {_yen(p['total_cost'])}  (証券手数料 {_yen(p['explicit_fees'])} + 為替 {_yen(p['fx_spread_cost'])}"
               f" + 投信譲渡益税 {_yen(p['inv_capital_gains_tax'])} + 送金手数料 {_yen(p['inv_transfer_fees'])})")
+        fl = []
+        _freshness_block(p, fl)
+        if fl:
+            print()
+            for line in fl:
+                print(line)
         print(f"\n  注: {p['note']}")
 
     def lark(p):
         pr = p["period"]
         cstale = "" if p.get("cash_fresh", True) else " ⚠stale"
         rmark = "" if p["inv_reconciles"] else " ⚠過小評価"
-        L = [f"**PayPay証券 復盘 ({pr['from']}〜{pr['to']})**", "",
+        L = [f"**PayPay証券 復盘 (取引履歴 {pr['from']}〜{pr['to']})**", "",
              f"**① 持仓盈亏** 評価損益(=App頭条, 今の保有): **{_signed_yen(p['unrealized_pl'])}** ({p['unrealized_pct']:+.2f}%)"]
         for h in p["holdings"]:
             L.append(f"  - {h['name']}: {_yen(h['valuation'])} {_signed_yen(h['unrealized_pl'])}")
+        bh = _basis_hint(p.get("sec_reconciles", True) and p["inv_reconciles"], p.get("fetched_all", False))
         L += [f"**② 累計実現** 実現損益(売って確定, 税引前): **{_signed_yen(p['realized_total'])}**{rmark}",
-              f"  - 証券 {_signed_yen(p['realized_sec'])} / 投信 {_signed_yen(p['realized_inv'])} ※移動平均推計; App「実現損益合計」が正",
+              f"  - 証券 {_signed_yen(p['realized_sec'])} / 投信 {_signed_yen(p['realized_inv'])} ※移動平均推計; App「実現損益合計」が正"]
+        if bh:
+            L.append(f"  - {bh}")
+        L += [
               f"**③ 整体盈亏** 通算 = 総資産 − 純入金 ★最終: **{_signed_yen(p['total_return'])}**",
               f"  - 総資産 {_yen(p['total_assets'])}(現金 {_yen(p['cash'])}{cstale}) − 純入金 {_yen(p['net_deposit'])}",
               f"  - 実現益から 譲渡益税 {_yen(p['inv_capital_gains_tax'])}・送金手数料 {_yen(p['inv_transfer_fees'])}・為替等を差引いた後",
               f"- 取引コスト {_yen(p['total_cost'])}(証券手数料 {_yen(p['explicit_fees'])}+為替 {_yen(p['fx_spread_cost'])}"
-              f"+投信譲渡益税 {_yen(p['inv_capital_gains_tax'])}+送金手数料 {_yen(p['inv_transfer_fees'])})",
-              f"\n> {p['note']}"]
+              f"+投信譲渡益税 {_yen(p['inv_capital_gains_tax'])}+送金手数料 {_yen(p['inv_transfer_fees'])})"]
+        _freshness_block(p, L)
+        L.append(f"\n> {p['note']}")
         print("\n".join(L))
 
     _emit_fmt(p, _fmt(args), table, lark)
@@ -335,11 +436,12 @@ def cmd_review(client: PayPayClient, args) -> int:
 
 
 def cmd_trades_summary(client: PayPayClient, args) -> int:
-    txns = parsers.parse_transactions(client.settlement_records(max_pages=getattr(args, "pages", 8)))
+    txns = parsers.parse_transactions(client.settlement_records(max_pages=_pages(args, 8)))
     agg = report.aggregate_trades(txns)
     p = {"period": {"from": agg["date_from"], "to": agg["date_to"]},
          "deposits": agg["deposits"], "withdrawals": agg["withdrawals"],
          "explicit_fees": agg["explicit_fees"], "realized_pl": agg["realized_pl"],
+         "reconciles": agg["reconciles"], "fetched_all": getattr(args, "fetch_all", False),
          "brands": agg["brands"]}
 
     def table(p):
@@ -354,6 +456,9 @@ def cmd_trades_summary(client: PayPayClient, args) -> int:
         print("-" * 82)
         print(f"  累計入金 {_yen(p['deposits'])} / 出金 {_yen(p['withdrawals'])} / "
               f"手数料 {_yen(p['explicit_fees'])} / 実現損益合計 {_signed_yen(p['realized_pl'])}")
+        bh = _basis_hint(p.get("reconciles", True), p.get("fetched_all", False))
+        if bh:
+            print("  " + bh)
 
     def lark(p):
         L = [f"**取引集計 ({p['period']['from']}〜{p['period']['to']})**", ""]
@@ -363,6 +468,9 @@ def cmd_trades_summary(client: PayPayClient, args) -> int:
                      f"実現 {_signed_yen(b['realized_pl'])}")
         L.append(f"- 累計入金 **{_yen(p['deposits'])}** / 手数料 {_yen(p['explicit_fees'])} / "
                  f"実現損益合計 **{_signed_yen(p['realized_pl'])}**")
+        bh = _basis_hint(p.get("reconciles", True), p.get("fetched_all", False))
+        if bh:
+            L.append(f"- {bh}")
         print("\n".join(L))
 
     _emit_fmt(p, _fmt(args), table, lark)
@@ -387,6 +495,211 @@ def cmd_accounts(client, args) -> int:
         print("\nuse:  paypay -a <name> <command>   (or set PAYPAY_ACCOUNT)")
 
     _emit(payload, args.json, render)
+    return 0
+
+
+def cmd_doctor(client, args) -> int:
+    """Diagnose local setup + login readiness. Needs no network — it inspects the
+    account's .env, cookie, cached session, and cache dir, and says whether the
+    next login would need an SMS code."""
+    from .client import state_dir as _state_dir
+    account = (getattr(args, "account", None) or os.environ.get("PAYPAY_ACCOUNT")
+               or config.DEFAULT_ACCOUNT)
+    env_path = config.env_file_for(account)
+    config.load_dotenv(account)
+
+    member_id = os.environ.get("PAYPAY_MEMBER_ID", "").strip()
+    password_set = bool(os.environ.get("PAYPAY_PASSWORD", "").strip())
+    cookie = os.environ.get("PAYPAY_COOKIE", "").strip()
+    has_device_token = "SMS_AUTH_STRING" in cookie
+
+    sd = _state_dir(account)
+    session_file, cache_dir = sd / "session.json", sd / "cache"
+    session_exists = session_file.exists()
+    token_cached, last_session = False, None
+    if session_exists:
+        try:
+            token_cached = bool(json.loads(session_file.read_text(encoding="utf-8")).get("token"))
+        except (OSError, ValueError):
+            pass
+        try:
+            mt = session_file.stat().st_mtime
+            last_session = (datetime.fromtimestamp(mt, tz=timezone.utc)
+                            .astimezone(_JST).strftime("%Y-%m-%d %H:%M JST"))
+        except OSError:
+            pass
+    cache_count = len(list(cache_dir.glob("*.json"))) if cache_dir.exists() else 0
+
+    # gating checks (define "ready to run unattended")
+    checks = [
+        {"ok": env_path is not None, "name": "credential file",
+         "detail": str(env_path) if env_path else
+                   f"missing — create {'~/.paypay-sec/.env' if account==config.DEFAULT_ACCOUNT else f'~/.paypay-sec/{account}.env'}"},
+        {"ok": bool(member_id), "name": "PAYPAY_MEMBER_ID", "detail": "set" if member_id else "missing"},
+        {"ok": password_set, "name": "PAYPAY_PASSWORD", "detail": "set" if password_set else "missing"},
+        {"ok": bool(cookie), "name": "PAYPAY_COOKIE", "detail": "set" if cookie else "missing"},
+        {"ok": has_device_token, "name": "trusted-device token",
+         "detail": "cookie carries _SMS_AUTH_STRING (SMS skipped)" if has_device_token
+                   else "cookie LACKS _SMS_AUTH_STRING → login will demand an SMS code"},
+    ]
+    payload = {
+        "account": account, "env_file": str(env_path) if env_path else None,
+        "member_id_set": bool(member_id), "password_set": password_set,
+        "cookie_set": bool(cookie), "has_device_token": has_device_token,
+        "sms_would_be_required": not has_device_token,
+        "session_cached": session_exists, "session_token_cached": token_cached,
+        "last_session_refresh": last_session,
+        "cache_dir": str(cache_dir), "cache_files": cache_count,
+        "accounts": config.list_accounts(),
+        "checks": checks,
+        "ready": all(c["ok"] for c in checks),
+    }
+
+    def render(p):
+        print(f"paypay doctor — account '{p['account']}'\n")
+        for c in p["checks"]:
+            print(f"  [{'OK' if c['ok'] else '!!'}] {_lj(c['name'], 22)} {c['detail']}")
+        sess = (f"yes (token={'yes' if p['session_token_cached'] else 'no'}, "
+                f"last {p['last_session_refresh'] or '?'})" if p["session_cached"]
+                else "none yet — the first command will log in")
+        print(f"\n  cached session             : {sess}")
+        print(f"  SMS required on next login : "
+              f"{'YES — cookie missing trusted-device token' if p['sms_would_be_required'] else 'no'}")
+        print(f"  response cache             : {p['cache_files']} files in {p['cache_dir']}")
+        print(f"  configured accounts        : {', '.join(p['accounts']) or '(none)'}")
+        print(f"\n  → {'READY' if p['ready'] else 'NOT READY — resolve the !! items above, then `paypay login`'}")
+
+    _emit(payload, args.json, render)
+    return 0 if payload["ready"] else 1
+
+
+def _build_snapshot(client: PayPayClient, args) -> dict:
+    """Compute the account's headline numbers for a snapshot (review-level)."""
+    g = _gather(client, pages=_pages(args, 8))
+    agg = report.aggregate_trades(g["txns"])
+    inv = report.aggregate_invtrust(g.get("inv_txns") or [])
+    unreal = sum((h["unrealized_pl"] or 0) for h in g["holdings"])
+    total, cash = g["total"], g["cash"]
+    holdings = [{"name": h["name"], "category": h["category"],
+                 "valuation": h["valuation"], "unrealized_pl": h["unrealized_pl"]}
+                for h in sorted(g["holdings"], key=lambda x: -x["valuation"])]
+    return {
+        "ts": snapshots.now_ts(), "as_of": _now_jst_str(),
+        "grand_total": total, "cash": cash, "invested": total - cash,
+        "unrealized_pl": unreal,
+        "realized_total": agg["realized_pl"] + inv["realized_pl"],
+        "net_deposit": agg["deposits"] - agg["withdrawals"],
+        "deposits": agg["deposits"], "withdrawals": agg["withdrawals"],
+        "holdings": holdings, "sources": g.get("sources"),
+    }
+
+
+def cmd_snapshot(client: PayPayClient, args) -> int:
+    """Save / list account snapshots — the CLI's own long-term time series."""
+    account = getattr(args, "account", None)
+    if getattr(args, "snap_cmd", "save") == "list":
+        paths = snapshots.list_paths(account)
+        rows = []
+        for p in paths:
+            s = snapshots.load(p)
+            rows.append({k: s.get(k) for k in ("ts", "as_of", "grand_total", "cash", "realized_total")})
+        payload = {"snapshots": rows}
+
+        def render(pl):
+            if not pl["snapshots"]:
+                print("no snapshots yet — run `paypay snapshot save`")
+                return
+            print("saved snapshots:\n")
+            print("  " + _lj("ID", 18) + _lj("AS_OF", 22) + _rj("総資産", 12) + _rj("実現", 11))
+            for s in pl["snapshots"]:
+                print("  " + _lj(s["ts"] or "", 18) + _lj(s.get("as_of") or "", 22)
+                      + _rj(_yen(s.get("grand_total")), 12) + _rj(_signed_yen(s.get("realized_total")), 11))
+
+        _emit(payload, args.json, render)
+        return 0
+
+    snap = _build_snapshot(client, args)
+    path = snapshots.save(account, snap)
+    payload = {"saved": str(path), **snap}
+
+    def render(p):
+        print(f"snapshot saved: {p['saved']}")
+        print(f"  総資産 {_yen(p['grand_total'])}  現金 {_yen(p['cash'])}  "
+              f"実現 {_signed_yen(p['realized_total'])}  純入金 {_yen(p['net_deposit'])}")
+
+    _emit(payload, args.json, render)
+    return 0
+
+
+def _diff_payload(base: dict, cur: dict) -> dict:
+    """Pure diff of two snapshot dicts. Separated for unit testing."""
+    bmap = {h["name"]: h for h in base.get("holdings", [])}
+    cmap = {h["name"]: h for h in cur.get("holdings", [])}
+    hold_changes = []
+    for name in sorted(set(bmap) | set(cmap)):
+        bv = (bmap.get(name) or {}).get("valuation") or 0
+        cv = (cmap.get(name) or {}).get("valuation") or 0
+        if bv != cv:
+            hold_changes.append({"name": name, "from": bv, "to": cv, "delta": cv - bv})
+    keys = ("grand_total", "invested", "cash", "net_deposit", "unrealized_pl", "realized_total")
+    return {
+        "from": {"ts": base.get("ts"), "as_of": base.get("as_of")},
+        "to": {"ts": cur.get("ts"), "as_of": cur.get("as_of")},
+        "delta": {k: (cur.get(k) or 0) - (base.get(k) or 0) for k in keys},
+        "holdings_changed": hold_changes,
+        "sources": cur.get("sources"),
+        "note": "事実の差分のみ。投資助言ではありません。",
+    }
+
+
+def cmd_diff(client: PayPayClient, args) -> int:
+    """Diff a live read against a saved snapshot baseline (--days N, else latest)."""
+    account = getattr(args, "account", None)
+    days = getattr(args, "days", None)
+    base = snapshots.nearest_before(account, days) if days else snapshots.latest(account)
+    if not base:
+        print("no baseline snapshot — run `paypay snapshot save` first", file=sys.stderr)
+        return 1
+    cur = _build_snapshot(client, args)
+    payload = _diff_payload(base, cur)
+
+    def table(p):
+        fr, to, d = p["from"], p["to"], p["delta"]
+        print(f"PayPay証券 — 差分  {fr['as_of'] or fr['ts']}  →  {to['as_of'] or to['ts']}\n")
+        print(f"  総資産     : {_signed_yen(d['grand_total'])}")
+        print(f"  投資資産   : {_signed_yen(d['invested'])}")
+        print(f"  現金       : {_signed_yen(d['cash'])}")
+        print(f"  純入金     : {_signed_yen(d['net_deposit'])}  (この間の入出金)")
+        print(f"  評価損益   : {_signed_yen(d['unrealized_pl'])}")
+        print(f"  実現損益   : {_signed_yen(d['realized_total'])}  (累計の増分 = この間の確定)")
+        if p["holdings_changed"]:
+            print("\n  持仓变化:")
+            for h in p["holdings_changed"]:
+                print("    " + _lj(h["name"], 28) + _rj(_yen(h["from"]), 12) + " → "
+                      + _rj(_yen(h["to"]), 12) + "  " + _signed_yen(h["delta"]))
+        fl = []
+        _freshness_block({"sources": p.get("sources")}, fl)
+        if fl:
+            print()
+            for line in fl:
+                print(line)
+        print(f"\n  注: {p['note']}")
+
+    def lark(p):
+        fr, to, d = p["from"], p["to"], p["delta"]
+        L = [f"**PayPay証券 差分 {fr['as_of'] or fr['ts']} → {to['as_of'] or to['ts']}**", "",
+             f"- 総資産: **{_signed_yen(d['grand_total'])}**",
+             f"- 投資資産: {_signed_yen(d['invested'])} / 現金: {_signed_yen(d['cash'])}",
+             f"- 純入金(この間): {_signed_yen(d['net_deposit'])}",
+             f"- 評価損益: {_signed_yen(d['unrealized_pl'])} / 実現損益(増分): **{_signed_yen(d['realized_total'])}**"]
+        if p["holdings_changed"]:
+            L.append("- 持仓变化:")
+            for h in p["holdings_changed"]:
+                L.append(f"  - {h['name']}: {_yen(h['from'])} → {_yen(h['to'])} ({_signed_yen(h['delta'])})")
+        L.append(f"\n> {p['note']}")
+        print("\n".join(L))
+
+    _emit_fmt(payload, _fmt(args), table, lark)
     return 0
 
 
@@ -477,7 +790,13 @@ def cmd_total(client: PayPayClient, args) -> int:
     grand_total = invested + (cash or 0)
     if not cash_fresh:
         errors.append("cash: throttled→stale")
+    sources = {
+        "securities": "ok" if any(v for v in sec_by_market.values()) else "failed",
+        "invtrust": "ok" if inv.valuation is not None else "failed",
+        "cash": "live" if cash_fresh else ("stale" if cash is not None else "failed"),
+    }
     payload = {
+        "as_of": _now_jst_str(),
         "securities_by_market": sec_by_market,
         "securities_total": sec_total,
         "invtrust_valuation": inv.valuation,
@@ -486,6 +805,7 @@ def cmd_total(client: PayPayClient, args) -> int:
         "grand_total": grand_total,
         "invtrust_sell_pending": inv.sell_order_pending,
         "errors": errors,
+        "sources": sources,
         "note": ("grand_total = 証券 + 投信 holdings + 証券 cash balance, matching the "
                  "app's 保有資産 total. CFD (separate login) is not included."),
     }
@@ -502,14 +822,21 @@ def cmd_total(client: PayPayClient, args) -> int:
         if p["errors"]:
             print(f"\n  ⚠ 一部市場の取得に失敗(集計から除外): {', '.join(p['errors'])}")
         print("\n  注: CFD は別ログインのため未集計。")
+        fl = []
+        _freshness_block(p, fl)
+        if fl:
+            print()
+            for line in fl:
+                print(line)
 
     _emit(payload, args.json, render)
     return 0
 
 
-def cmd_assets(client: PayPayClient, args) -> int:
-    """One-shot consolidated view: 証券 + 投信 holdings + securities cash.
-    Independent fetches run concurrently (login is established first)."""
+def _consolidated_holdings(client: PayPayClient):
+    """Concurrent fetch of 証券(usa) + 投信 holdings + securities cash. Degrades
+    per source (a failed feed → that source marked 'failed', not a crash).
+    Returns (rows, cash, cash_fresh, invtrust_sell_pending, sources)."""
     client.ensure_session()
     tasks = {
         "sec_usa": lambda: parsers.parse_holdings(client.brands_html("usa")),
@@ -528,27 +855,152 @@ def cmd_assets(client: PayPayClient, args) -> int:
 
     inv = parsers.parse_invtrust(out["inv_top"]) if out.get("inv_top") else None
     names = out.get("names") or {}
-    sec = out.get("sec_usa") or []
     cash, cash_fresh = _persist_cash(client, out.get("cash"))
-
     rows = []
     if inv:
         for h in inv.holdings:
             rows.append({"category": "投信", "name": names.get(str(h["brand_id"])) or f"#{h['brand_id']}",
                          "valuation": h["valuation"], "unrealized_pl": h["unrealized_pl"]})
-    for h in sec:
+    for h in (out.get("sec_usa") or []):
         if h.is_cash:
             continue
         rows.append({"category": "証券", "name": h.name,
                      "valuation": h.valuation, "unrealized_pl": h.unrealized_pl})
+    sources = {
+        "securities": "ok" if out.get("sec_usa") is not None else "failed",
+        "invtrust": "ok" if out.get("inv_top") is not None else "failed",
+        "cash": "live" if cash_fresh else ("stale" if cash is not None else "failed"),
+    }
+    return rows, cash, cash_fresh, (inv.sell_order_pending if inv else None), sources
+
+
+# Best-effort ETF classification (factual labelling, not a judgment): a holding is
+# called an ETF when its name is a known ETF ticker or contains "ETF".
+_ETF_TICKERS = {
+    "QQQ", "QQQM", "TQQQ", "SQQQ", "SPY", "SPLG", "VOO", "VTI", "IVV", "SPXL",
+    "SOXL", "SOXX", "SMH", "DIA", "IWM", "ARKK", "VGT", "XLK", "SCHD", "JEPI",
+    "JEPQ", "VYM", "VT", "VEA", "VWO", "GLD", "SLV", "TLT", "AGG", "BND", "VUG",
+}
+
+
+def _kind_of(row: dict) -> str:
+    if row.get("category") == "投信":
+        return "投信"
+    name = (row.get("name") or "").upper()
+    if "ETF" in name or any(t == tok for tok in name.replace("/", " ").split() for t in _ETF_TICKERS) \
+            or name in _ETF_TICKERS:
+        return "ETF"
+    return "個股"
+
+
+def _risk_payload(rows: list, cash, sell_pending, sources: dict) -> dict:
+    """Pure structural-exposure math over consolidated holdings (FACTS ONLY).
+    Separated from cmd_risk so it's unit-testable without network."""
+    invested = sum(r.get("valuation") or 0 for r in rows)
+    total = invested + (cash or 0)
+
+    def pct(x):
+        return round(100.0 * (x or 0) / total, 1) if total else 0.0
+
+    positions = sorted(
+        ({"name": r.get("name"), "category": r.get("category"), "kind": _kind_of(r),
+          "valuation": r.get("valuation") or 0, "weight_pct": pct(r.get("valuation"))} for r in rows),
+        key=lambda x: -x["valuation"])
+    by_kind, by_cat = {}, {}
+    for pos in positions:
+        by_kind[pos["kind"]] = by_kind.get(pos["kind"], 0) + pos["valuation"]
+        by_cat[pos["category"]] = by_cat.get(pos["category"], 0) + pos["valuation"]
+    if cash:
+        by_kind["現金"] = by_kind.get("現金", 0) + cash
+        by_cat["現金"] = by_cat.get("現金", 0) + cash
+    usd_assets = sum(p["valuation"] for p in positions if p["category"] == "証券")  # US-listed
+    largest = positions[0] if positions else None
+    return {
+        "as_of": _now_jst_str(),
+        "grand_total": total, "invested_total": invested,
+        "cash": cash, "cash_pct": pct(cash or 0),
+        "largest_position": ({"name": largest["name"], "weight_pct": largest["weight_pct"]}
+                             if largest else None),
+        "top1_pct": positions[0]["weight_pct"] if positions else 0.0,
+        "top3_pct": round(sum(p["weight_pct"] for p in positions[:3]), 1),
+        "top5_pct": round(sum(p["weight_pct"] for p in positions[:5]), 1),
+        "usd_asset_pct": pct(usd_assets),
+        "by_kind_pct": {k: round(100.0 * v / total, 1) for k, v in by_kind.items()} if total else {},
+        "by_category_pct": {k: round(100.0 * v / total, 1) for k, v in by_cat.items()} if total else {},
+        "positions": positions,
+        "invtrust_sell_pending": sell_pending,
+        "sources": sources,
+        "note": "構造・ウェイトの事実のみ。リスク評価・推奨・売買助言ではありません。",
+    }
+
+
+def cmd_risk(client: PayPayClient, args) -> int:
+    """Structural exposure of the account — FACTS ONLY (weights, concentration,
+    category/currency split). No risk verdicts, no buy/sell advice."""
+    rows, cash, cash_fresh, sell_pending, sources = _consolidated_holdings(client)
+    payload = _risk_payload(rows, cash, sell_pending, sources)
+
+    def table(p):
+        print(f"PayPay証券 — 持仓结构 / exposure (事実のみ)\n")
+        print(f"  総資産 {_yen(p['grand_total'])}  (投資 {_yen(p['invested_total'])} + 現金 {_yen(p['cash'])} = {p['cash_pct']}%)")
+        lg = p["largest_position"]
+        print(f"  最大单一持仓 : {lg['name'] if lg else '—'} {lg['weight_pct'] if lg else 0}%")
+        print(f"  集中度       : top1 {p['top1_pct']}% / top3 {p['top3_pct']}% / top5 {p['top5_pct']}%")
+        print(f"  米国株(USD建) : {p['usd_asset_pct']}%")
+        print(f"  种类构成     : " + " / ".join(f"{k} {v}%" for k, v in p["by_kind_pct"].items()))
+        print(f"  账户构成     : " + " / ".join(f"{k} {v}%" for k, v in p["by_category_pct"].items()))
+        print("\n  持仓ウェイト:")
+        print("    " + _lj("NAME", 28) + _lj("种类", 8) + _rj("市值", 12) + _rj("占比", 8))
+        for pos in p["positions"]:
+            print("    " + _lj(pos["name"] or "", 28) + _lj(pos["kind"], 8)
+                  + _rj(_yen(pos["valuation"]), 12) + _rj(f"{pos['weight_pct']}%", 8))
+        if p["cash"]:
+            print("    " + _lj("現金", 28) + _lj("現金", 8)
+                  + _rj(_yen(p["cash"]), 12) + _rj(f"{p['cash_pct']}%", 8))
+        fl = []
+        _freshness_block(p, fl)
+        if fl:
+            print()
+            for line in fl:
+                print(line)
+        print(f"\n  注: {p['note']}")
+
+    def lark(p):
+        lg = p["largest_position"]
+        L = [f"**PayPay証券 持仓结构 (事実のみ)**", "",
+             f"- 総資産 **{_yen(p['grand_total'])}** (投資 {_yen(p['invested_total'])} + 現金 {_yen(p['cash'])} = {p['cash_pct']}%)",
+             f"- 最大单一持仓: **{lg['name'] if lg else '—'} {lg['weight_pct'] if lg else 0}%**",
+             f"- 集中度: top1 {p['top1_pct']}% / top3 {p['top3_pct']}% / top5 {p['top5_pct']}%",
+             f"- 米国株(USD建): {p['usd_asset_pct']}%",
+             f"- 种类构成: " + " / ".join(f"{k} {v}%" for k, v in p["by_kind_pct"].items()),
+             f"- 账户构成: " + " / ".join(f"{k} {v}%" for k, v in p["by_category_pct"].items()),
+             "- 持仓ウェイト:"]
+        for pos in p["positions"]:
+            L.append(f"  - {pos['name']} ({pos['kind']}): {_yen(pos['valuation'])} / {pos['weight_pct']}%")
+        if p["cash"]:
+            L.append(f"  - 現金: {_yen(p['cash'])} / {p['cash_pct']}%")
+        _freshness_block(p, L)
+        L.append(f"\n> {p['note']}")
+        print("\n".join(L))
+
+    _emit_fmt(payload, _fmt(args), table, lark)
+    return 0
+
+
+def cmd_assets(client: PayPayClient, args) -> int:
+    """One-shot consolidated view: 証券 + 投信 holdings + securities cash.
+    Independent fetches run concurrently (login is established first)."""
+    rows, cash, cash_fresh, sell_pending, sources = _consolidated_holdings(client)
     invested = sum(r["valuation"] or 0 for r in rows)
     grand_total = invested + (cash or 0)
     payload = {
+        "as_of": _now_jst_str(),
         "holdings": rows,
         "invested_total": invested,
         "cash": cash, "cash_fresh": cash_fresh,
         "grand_total": grand_total,
-        "invtrust_sell_pending": inv.sell_order_pending if inv else None,
+        "invtrust_sell_pending": sell_pending,
+        "sources": sources,
         "note": "grand_total = invested holdings + 証券 cash balance, matching the "
                 "app's 保有資産 total. CFD (separate login) is not included.",
     }
@@ -576,13 +1028,19 @@ def cmd_assets(client: PayPayClient, args) -> int:
         print(f"  総資産合計: {_yen(p['grand_total'])}")
         print(f"\n  投信 売却申込中 (settling): {_yen(p['invtrust_sell_pending'])}")
         print("  注: CFD(別ログイン)は未集計。")
+        fl = []
+        _freshness_block(p, fl)
+        if fl:
+            print()
+            for line in fl:
+                print(line)
 
     _emit(payload, args.json, render)
     return 0
 
 
 def cmd_trades(client: PayPayClient, args) -> int:
-    recs = client.settlement_records(max_pages=getattr(args, "pages", 2))
+    recs = client.settlement_records(max_pages=_pages(args, 2))
     txns = parsers.parse_transactions(recs)
     payload = {"current_cash": parsers.current_cash(recs), "transactions": txns}
 
@@ -619,7 +1077,7 @@ def cmd_history(client: PayPayClient, args) -> int:
 def cmd_invtrust_history(client: PayPayClient, args) -> int:
     """投信 (mutual-fund) transaction ledger — the MARKET_ID=99 settlements feed
     that the 証券 ajax ledger never shows: 買付/売却/入金/譲渡益税/送金手数料."""
-    recs = client.invtrust_settlement_records(max_pages=getattr(args, "pages", 20))
+    recs = client.invtrust_settlement_records(max_pages=_pages(args, 20))
     txns = parsers.parse_invtrust_transactions(recs)
     agg = report.aggregate_invtrust(txns)
 
@@ -824,6 +1282,12 @@ def build_parser() -> argparse.ArgumentParser:
     common.add_argument("-a", "--account", default=None,
                         help="account profile: reads ~/.paypay-sec/<name>.env "
                              "(default account uses ~/.paypay-sec/.env)")
+    common.add_argument("--lang", choices=("ja", "zh"), default="ja",
+                        help="language for table/lark labels: ja (default) | zh (中文). "
+                             "JSON output keys stay English.")
+    common.add_argument("--all", dest="fetch_all", action="store_true",
+                        help="fetch the FULL ledger history (page until NEXT_FLG=false) "
+                             "instead of the default page cap — for complete realized P&L")
 
     p = argparse.ArgumentParser(prog="paypay", description="Read-only PayPay証券 client (Phase 1)")
     sub = p.add_subparsers(dest="command", required=True)
@@ -833,8 +1297,9 @@ def build_parser() -> argparse.ArgumentParser:
                      ("total", cmd_total), ("assets", cmd_assets), ("trades", cmd_trades),
                      ("invtrust-history", cmd_invtrust_history),
                      ("fees", cmd_fees), ("review", cmd_review),
-                     ("trades-summary", cmd_trades_summary),
-                     ("accounts", cmd_accounts), ("cache-clear", cmd_cache_clear)):
+                     ("trades-summary", cmd_trades_summary), ("risk", cmd_risk),
+                     ("accounts", cmd_accounts), ("doctor", cmd_doctor),
+                     ("cache-clear", cmd_cache_clear)):
         sp = sub.add_parser(name, parents=[common])
         sp.set_defaults(func=fn)
         if name == "trades":
@@ -852,6 +1317,18 @@ def build_parser() -> argparse.ArgumentParser:
             sp.add_argument("--detail", action="store_true", help="show per-trade FX spread")
             sp.add_argument("--price-spread-pct", type=float, default=0.0,
                             help="add an estimated price-spread cost at this %% of US turnover")
+
+    snap = sub.add_parser("snapshot", parents=[common]); snap.set_defaults(func=cmd_snapshot)
+    snap.add_argument("snap_cmd", nargs="?", choices=("save", "list"), default="save",
+                      help="save (default) a snapshot of the account, or list saved snapshots")
+    snap.add_argument("--pages", type=int, default=8, help="ledger pages to scan for the snapshot")
+
+    dff = sub.add_parser("diff", parents=[common]); dff.set_defaults(func=cmd_diff)
+    dff.add_argument("--days", type=int, default=None,
+                     help="compare a live read against the snapshot ~N days old (default: the latest snapshot)")
+    dff.add_argument("--since", default=None,
+                     help="baseline selector; 'last' = latest snapshot (the default)")
+    dff.add_argument("--pages", type=int, default=8, help="ledger pages to scan for the live read")
 
     buy = sub.add_parser("buy", parents=[common]); buy.set_defaults(func=cmd_buy)
     sell = sub.add_parser("sell", parents=[common]); sell.set_defaults(func=cmd_sell)
@@ -876,9 +1353,13 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
-    # `accounts` only lists profiles — it needs no credentials / network.
+    global _LANG
+    _LANG = getattr(args, "lang", "ja")
+    # `accounts` / `doctor` only inspect local config — no credentials / network.
     if args.func is cmd_accounts:
         return cmd_accounts(None, args)
+    if args.func is cmd_doctor:
+        return cmd_doctor(None, args)
     try:
         settings = Settings.from_env(getattr(args, "account", None))
         client = PayPayClient(settings,

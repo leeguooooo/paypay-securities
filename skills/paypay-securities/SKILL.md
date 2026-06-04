@@ -81,14 +81,34 @@ uv run paypay trades [--pages N]    # 証券 transaction ledger (買付/売却/�
 uv run paypay fees [--detail]       # cost analysis: explicit fees + measured FX spread (+ optional price spread)
 uv run paypay review                # 复盘: 2 blocks — 持仓盈亏(評価損益=App頭条) + 账户盈亏(通算=総資産−純入金); + realized/costs
 uv run paypay trades-summary        # per-brand buy/sell/net-invested/net-shares/realized P&L
+uv run paypay risk                  # 持仓结构 / exposure: weights, concentration, FX & category split (FACTS ONLY)
+uv run paypay snapshot save         # save a dated account snapshot (the CLI's own time series)
+uv run paypay snapshot list         # list saved snapshots
+uv run paypay diff [--days N]       # diff a live read vs the latest (or ~N-days-old) snapshot
+uv run paypay doctor                # diagnose setup/login readiness (offline: env, cookie token, session, cache)
 uv run paypay accounts              # list configured account profiles
 uv run paypay cache-clear           # clear the local response cache
 ```
 
+**`risk` is facts-only.** It reports portfolio *structure* — total, cash %, largest
+position %, top-1/3/5 concentration, USD (米国株) %, and 種類/口座 splits — and gives
+**no risk verdict and no buy/sell advice**, same boundary as every other command.
+
+**`snapshot` / `diff`** give the account its own long-term series:
+`snapshot save` writes `<state_dir>/snapshots/<ts>.json` (assets, cash, holdings,
+realized, deposits); `diff` compares a live read against the latest snapshot (or
+`--days N` ago) so you get "this week's change" — asset/holdings/deposit/realized deltas.
+
 Any command takes `-a <name>` to target a non-default account, and
 `--format table|lark|json`. **`--format lark`** emits Feishu/Lark-friendly
 bullets (bold numbers, `+¥`/`-¥`, no wide tables) — use it for `review` /
-`trades-summary` when posting to Lark.
+`trades-summary` / `risk` / `diff` when posting to Lark.
+
+**`--lang ja|zh`** localizes the table/lark labels (`zh` = 中文: 総資産→总资产,
+評価損益→持仓盈亏, 実現→已实现, …); JSON output keys stay English. **`--all`** pages
+the full ledger history (until `NEXT_FLG=false`) for complete realized P&L instead of
+the default page cap. Reports also stamp **查询时间 (as_of)** + per-source freshness
+(live/cache/stale) and loudly flag any feed that failed — never silently ¥0.
 
 **Scope of the read commands: data display only.** The commands above just show
 your account's data (or factual calculations on it — totals, realized P&L by
