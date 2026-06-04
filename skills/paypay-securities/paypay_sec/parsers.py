@@ -118,6 +118,7 @@ class InvTrustSummary:
     sell_order_pending: Optional[int]  # SELL_ORDER_AMOUNT_TOTAL (売却申込中)
     buyable_cash: Optional[int]     # BUYABLE_CASH
     holdings: list = field(default_factory=list)
+    reserve_brand_ids: list = field(default_factory=list)  # brand_ids with an active 定投/つみたて
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -136,11 +137,17 @@ def parse_invtrust(top: dict) -> InvTrustSummary:
     """Parse the /v2/invest/brand/pc_invest_top JSON payload."""
     arr = top.get("INVEST_BRAND_ARRAY") or {}
     rows = arr.values() if isinstance(arr, dict) else arr
+    # 定投/つみたて: INVEST_BRAND_RESERVE_STATUS_ARRAY is keyed by brand_id, each
+    # value carrying RESERVE_ORDER_STATUS (1 = an active recurring-buy plan).
+    res = top.get("INVEST_BRAND_RESERVE_STATUS_ARRAY") or {}
+    reserve_on = {str(k) for k, v in res.items()
+                  if str((v or {}).get("RESERVE_ORDER_STATUS") or "0") == "1"}
     holdings = [{
         "brand_id": h.get("BRAND_ID"),
         "valuation": _to_int(h.get("SECURITIES_VALUE")),
         "unrealized_pl": _to_int(h.get("SUM_GROSS_PROFIT")),
         "sell_order_pending": _to_int(h.get("SELL_ORDER_AMOUNT")),
+        "reserve_plan": str(h.get("BRAND_ID")) in reserve_on,   # 定投/つみたて active
     } for h in rows]
     return InvTrustSummary(
         valuation=_to_int(top.get("SECURITIES_VALUE_TOTAL")),
@@ -149,6 +156,7 @@ def parse_invtrust(top: dict) -> InvTrustSummary:
         sell_order_pending=_to_int(top.get("SELL_ORDER_AMOUNT_TOTAL")),
         buyable_cash=_to_int(top.get("BUYABLE_CASH")),
         holdings=holdings,
+        reserve_brand_ids=sorted(reserve_on),
     )
 
 

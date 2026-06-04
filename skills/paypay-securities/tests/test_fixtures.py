@@ -99,6 +99,20 @@ def test_parse_invtrust_empty_is_graceful():
     assert inv.valuation is None and inv.holdings == []
 
 
+def test_parse_invtrust_reserve_plan_flag():
+    # INVEST_BRAND_RESERVE_STATUS_ARRAY (keyed by brand_id) flags active 定投/つみたて
+    top = {**_INV_TOP,
+           "INVEST_BRAND_ARRAY": {"0": {"BRAND_ID": "6", "SECURITIES_VALUE": "100000"},
+                                  "1": {"BRAND_ID": "9", "SECURITIES_VALUE": "50000"}},
+           "INVEST_BRAND_RESERVE_STATUS_ARRAY": {"6": {"RESERVE_ORDER_STATUS": 1},
+                                                 "9": {"RESERVE_ORDER_STATUS": 0}}}
+    inv = parsers.parse_invtrust(top)
+    by = {h["brand_id"]: h for h in inv.holdings}
+    assert by["6"]["reserve_plan"] is True      # active 定投
+    assert by["9"]["reserve_plan"] is False     # held but no plan
+    assert inv.reserve_brand_ids == ["6"]
+
+
 # --------------------------------------------------- parse_invtrust_transactions
 _INV_LEDGER = [
     {"SUMMARY_TYPE": "1", "AMOUNT": "-30000", "CASH_BALANCE": "0", "BASE_D": "2026.02.01",

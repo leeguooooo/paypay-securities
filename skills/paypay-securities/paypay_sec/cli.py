@@ -825,6 +825,9 @@ def cmd_invtrust(client: PayPayClient, args) -> int:
     d = inv.to_dict()
     for h in d["holdings"]:
         h["name"] = names.get(str(h["brand_id"]))
+    # 定投/つみたて: funds with an active recurring-buy plan (even if not yet held)
+    d["reserve_plans"] = [{"brand_id": b, "name": names.get(str(b)) or f"brand#{b}"}
+                          for b in d.get("reserve_brand_ids", [])]
 
     def render(d):
         print("投信 (mutual funds)")
@@ -837,8 +840,15 @@ def cmd_invtrust(client: PayPayClient, args) -> int:
             print("  holdings:")
             for h in d["holdings"]:
                 label = h.get("name") or f"brand#{h['brand_id']}"
+                tag = "  📅定投" if h.get("reserve_plan") else ""
                 print("    " + _lj(label, 34) + _rj(_yen(h["valuation"]), 12)
-                      + "  P&L " + _yen(h["unrealized_pl"]))
+                      + "  P&L " + _yen(h["unrealized_pl"]) + tag)
+        if d.get("reserve_plans"):
+            print("\n  定投/つみたて 設定中の銘柄 (active recurring-buy plans):")
+            for r in d["reserve_plans"]:
+                print(f"    📅 {r['name']}")
+            print("    注: 設定金額・頻度は web API 非公開。実際の積立額は "
+                  "`invtrust-history` の NISAつみたて 買付行で確認できます。")
 
     _emit(d, args.json, render)
     return 0
