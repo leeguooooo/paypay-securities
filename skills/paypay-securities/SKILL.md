@@ -3,12 +3,15 @@ name: paypay-securities
 description: >-
   CLI & agent skill for a PayPay証券 (PayPay Securities, ペイペイ証券) account:
   check portfolio, holdings, balance, 投資信託, 米国株, 取引履歴 (transaction
-  history), fees & FX-spread, generate a 復盘/review with realized & unrealized
-  P&L, AND place 米国株 orders (buy/sell/cancel). Use when the user wants to view,
-  review, report, or trade a PayPay証券 / PayPay investment account. Orders
-  dry-run by default; a live order requires an explicit human `--execute` with a
-  typed confirmation + the account TRADE_PASSWORD (the agent never auto-submits).
-  Never gives investment advice or buy/sell judgments.
+  history), fees & FX-spread; generate a 復盘/review with realized & unrealized P&L
+  and money-weighted return (XIRR); 持仓结构/exposure (risk), 定投/つみたて recurring-buy
+  plans (plans), per-year tax view (tax), account snapshots & diff (snapshot/diff),
+  multi-account consolidation (-a all), Chinese output (--lang zh); AND place 米国株
+  orders (buy/sell/cancel). Use when the user wants to view, review, analyze, report,
+  or trade a PayPay証券 / PayPay investment account. Orders dry-run by default; a live
+  order requires an explicit human `--execute` with a typed confirmation + the account
+  TRADE_PASSWORD (the agent never auto-submits). Facts only — never investment advice
+  or buy/sell judgments.
 ---
 
 # paypay-securities — read-only PayPay証券 client
