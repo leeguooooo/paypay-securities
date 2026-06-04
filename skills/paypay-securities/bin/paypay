@@ -9,4 +9,8 @@ SKILL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # "VIRTUAL_ENV does not match the project environment" warning that pollutes
 # output (uv manages this project's own .venv via --project).
 unset VIRTUAL_ENV
-exec uv run --project "$SKILL_DIR" paypay "$@"
+# Run the module (NOT the `paypay` console-script name): once this launcher is
+# symlinked onto PATH as `paypay`, `uv run paypay` would resolve back to this
+# launcher and loop ("uv run recursively invoked"). `python -m paypay_sec` is
+# unambiguous and can't recurse.
+exec uv run --project "$SKILL_DIR" python -m paypay_sec "$@"
