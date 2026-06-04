@@ -17,6 +17,7 @@ import getpass
 import io
 import json
 import os
+import re
 import sys
 import unicodedata
 
@@ -976,8 +977,12 @@ def _kind_of(row: dict) -> str:
     if row.get("category") == "投信":
         return "投信"
     name = (row.get("name") or "").upper()
-    if "ETF" in name or any(t == tok for tok in name.replace("/", " ").split() for t in _ETF_TICKERS) \
-            or name in _ETF_TICKERS:
+    if "ETF" in name:
+        return "ETF"
+    # Pull the ASCII ticker run(s) out of a mixed name (e.g. インベスコQQQ → QQQ,
+    # "SPDR S&P500" → S, P500…) so a fund whose ticker is embedded still classifies.
+    runs = re.findall(r"[A-Z0-9]{2,}", name)
+    if any(r in _ETF_TICKERS for r in runs):
         return "ETF"
     return "個股"
 
@@ -1019,15 +1024,20 @@ def _risk_payload(rows: list, cash, sell_pending, sources: dict) -> dict:
     usd_assets = sum(r.get("valuation") or 0 for r in rows if r.get("category") == "証券")  # US-listed (JPY→USD quote)
     us_underlying = sum(r.get("valuation") or 0 for r in rows if _us_underlying(r))  # incl. S&P500等 投信
     largest = positions[0] if positions else None
+
+    def topn_pct(n):
+        # sum RAW valuations then round once (summing pre-rounded weights overshoots
+        # 100%); clamp so it never reads e.g. 100.1%.
+        return min(100.0, pct(sum(p["valuation"] for p in positions[:n])))
     return {
         "as_of": _now_jst_str(),
         "grand_total": total, "invested_total": invested,
         "cash": cash, "cash_pct": pct(cash or 0),
         "largest_position": ({"name": largest["name"], "weight_pct": largest["weight_pct"]}
                              if largest else None),
-        "top1_pct": positions[0]["weight_pct"] if positions else 0.0,
-        "top3_pct": round(sum(p["weight_pct"] for p in positions[:3]), 1),
-        "top5_pct": round(sum(p["weight_pct"] for p in positions[:5]), 1),
+        "top1_pct": topn_pct(1),
+        "top3_pct": topn_pct(3),
+        "top5_pct": topn_pct(5),
         "usd_asset_pct": pct(usd_assets),
         "us_underlying_pct": pct(us_underlying),
         "by_kind_pct": {k: round(100.0 * v / total, 1) for k, v in by_kind.items()} if total else {},

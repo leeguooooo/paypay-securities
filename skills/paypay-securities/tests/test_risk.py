@@ -18,6 +18,25 @@ def test_kind_classification():
     assert cli._kind_of({"category": "投信", "name": "whatever"}) == "投信"
 
 
+def test_invesco_qqq_is_etf():
+    # the real holding name is インベスコQQQ / インベスコ・QQQ, not a bare QQQ ticker
+    assert cli._kind_of({"category": "証券", "name": "インベスコQQQ"}) == "ETF"
+    assert cli._kind_of({"category": "証券", "name": "インベスコ・QQQ"}) == "ETF"
+    assert cli._kind_of({"category": "証券", "name": "TESLA"}) == "個股"
+    assert cli._kind_of({"category": "証券", "name": "テスラ"}) == "個股"
+
+
+def test_topn_concentration_clamped_and_from_raw():
+    rows = [{"category": "証券", "name": "A", "valuation": 51449, "unrealized_pl": 0},
+            {"category": "証券", "name": "B", "valuation": 30370, "unrealized_pl": 0},
+            {"category": "証券", "name": "C", "valuation": 18181, "unrealized_pl": 0}]
+    p = cli._risk_payload(rows, cash=0, sell_pending=None, sources={})  # total 100,000
+    # all three = the whole portfolio → exactly 100.0 (not 100.1 from summing rounded weights)
+    assert p["top3_pct"] == 100.0 and p["top5_pct"] == 100.0
+    assert p["top1_pct"] <= 100.0 and p["top3_pct"] <= 100.0 and p["top5_pct"] <= 100.0
+    assert p["top1_pct"] == round(100.0 * 51449 / 100000, 1)   # from raw valuations
+
+
 def test_us_underlying_classification():
     # US-listed 証券 are always US underlying
     assert cli._us_underlying({"category": "証券", "name": "TSLA"}) is True
@@ -116,6 +135,30 @@ def test_cmd_risk_json_smoke():
         assert k in out, k
     assert out["invtrust_sell_pending"] == 1234
     assert out["cash"] == 50_000
+
+
+def test_assets_lark_is_bullets_not_wide_table():
+    """Regression: `assets --format lark` used to fall back to the wide table
+    (CATEGORY/NAME/WEIGHT header). It must emit Lark bullets instead."""
+    import contextlib
+    import io
+    from types import SimpleNamespace
+
+    orig = cli._consolidated_holdings
+    cli._consolidated_holdings = lambda client: (
+        [{"category": "証券", "name": "TSLA", "valuation": 100, "unrealized_pl": 1, "account_types": []}],
+        50, True, None, {"securities": "ok"})
+    try:
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            cli.cmd_assets(None, SimpleNamespace(json=False, fmt="lark", lang="ja",
+                                                 accounts=False, pages=30))
+        out = buf.getvalue()
+    finally:
+        cli._consolidated_holdings = orig
+    assert out.lstrip().startswith("**PayPay")        # Lark header
+    assert "- [証券] TSLA" in out                       # bullet form
+    assert "CATEGORY" not in out and "WEIGHT" not in out   # NOT the wide-table header
 
 
 if __name__ == "__main__":

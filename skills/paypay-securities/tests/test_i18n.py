@@ -31,12 +31,21 @@ def test_no_named_residuals():
         "実現益から 譲渡益税 ¥1,102・送金手数料 ¥440・為替等を差引いた後の値",
         "P&L +¥5  buyable cash  settling",
         "測定コスト 合計  現金側手数料/税  推定為替コスト",
+        "eMAXIS Slim 米国株式(S&P500)",
+        "App「実現損益合計」が正  この間  増分  個股 種類",
+        "CFD は別ログインのため未集計 / CFD(別ログイン)は未集計",
+        "米国株 底層暴露 100.0% (S&P500等の投信も実質米株)  投信履歴",
     ]
     for s in samples:
         z = i18n.zh(s)
         for bad in ("投資", "App頭条", "から", "P&L", "buyable", "settling",
-                    "測定", "現金側", "コスト"):
+                    "測定", "現金側", "コスト", "米国株式", "この間", "増分",
+                    "が正", "個股", "実現益から", "別ログイン", "未集計",
+                    "実質米株", "履歴"):
             assert bad not in z, (bad, z)
+    # spot-check a couple of intended translations
+    assert "美国股票" in i18n.zh("米国株式")
+    assert "个股" in i18n.zh("個股")
 
 
 def test_empty_and_unknown_safe():
