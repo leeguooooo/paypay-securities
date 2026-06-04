@@ -48,10 +48,10 @@ trusted-device token, whether a session is cached, etc.) — no network needed.
 ## Common commands
 
 ```bash
-paypay doctor                      # diagnose setup / login readiness (offline)
-paypay assets                      # 証券 + 投信 holdings + cash + grand total
+paypay doctor [--online]           # diagnose setup / login readiness (--online probes the live session)
+paypay assets [--accounts]         # 証券 + 投信 holdings + cash + grand total (+口座区分 with --accounts)
 paypay review                      # 復盘: 持仓盈亏 / 累計実現 / 整体盈亏 + costs
-paypay risk                        # 持仓结构: weights, concentration, FX/category split (facts only)
+paypay risk [--accounts]           # 持仓结构: weights, concentration, FX/category/口座 split (facts only)
 paypay total                       # aggregate invested assets
 paypay trades [--pages N | --all]  # transaction ledger + running cash
 paypay invtrust-history            # 投信 ledger + moving-average realized P&L
@@ -75,7 +75,8 @@ bin/snapshot-cron.sh install       # schedule a daily read-only snapshot + Monda
 | `--no-cache` | bypass the local response cache. |
 
 Reports stamp a **查询时间 (as_of)** and per-source **freshness** (live/cache/stale);
-a feed that drops out is flagged loudly, never silently treated as ¥0.
+a feed that drops out is flagged loudly, never silently treated as ¥0. Every `--json`
+payload carries a `schema_version` so cron jobs / dashboards can parse it stably.
 
 ## Ordering (米国株 buy / sell / cancel)
 

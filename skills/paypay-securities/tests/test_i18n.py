@@ -24,6 +24,21 @@ def test_localize_ja_is_noop():
     assert i18n.localize(s, "zh") == "总资产 ¥1"
 
 
+def test_no_named_residuals():
+    # the specific JA the user flagged must be gone after zh()
+    samples = [
+        "投資 ¥500,000  評価損益(=App頭条)",
+        "実現益から 譲渡益税 ¥1,102・送金手数料 ¥440・為替等を差引いた後の値",
+        "P&L +¥5  buyable cash  settling",
+        "測定コスト 合計  現金側手数料/税  推定為替コスト",
+    ]
+    for s in samples:
+        z = i18n.zh(s)
+        for bad in ("投資", "App頭条", "から", "P&L", "buyable", "settling",
+                    "測定", "現金側", "コスト"):
+            assert bad not in z, (bad, z)
+
+
 def test_empty_and_unknown_safe():
     assert i18n.zh("") == ""
     assert i18n.zh("hello world 123") == "hello world 123"

@@ -81,11 +81,11 @@ uv run paypay trades [--pages N]    # 証券 transaction ledger (買付/売却/�
 uv run paypay fees [--detail]       # cost analysis: explicit fees + measured FX spread (+ optional price spread)
 uv run paypay review                # 复盘: 2 blocks — 持仓盈亏(評価損益=App頭条) + 账户盈亏(通算=総資産−純入金); + realized/costs
 uv run paypay trades-summary        # per-brand buy/sell/net-invested/net-shares/realized P&L
-uv run paypay risk                  # 持仓结构 / exposure: weights, concentration, FX & category split (FACTS ONLY)
+uv run paypay risk [--accounts]     # 持仓结构 / exposure: weights, concentration, FX/category split (+口座区分 with --accounts; FACTS ONLY)
 uv run paypay snapshot save         # save a dated account snapshot (the CLI's own time series)
 uv run paypay snapshot list         # list saved snapshots
 uv run paypay diff [--days N]       # diff a live read vs the latest (or ~N-days-old) snapshot
-uv run paypay doctor                # diagnose setup/login readiness (offline: env, cookie token, session, cache)
+uv run paypay doctor [--online]     # diagnose setup/login readiness (offline by default; --online probes login + 証券/投信 to confirm the session is live)
 uv run paypay accounts              # list configured account profiles
 uv run paypay cache-clear           # clear the local response cache
 ```
@@ -114,6 +114,9 @@ bullets (bold numbers, `+¥`/`-¥`, no wide tables) — use it for `review` /
 the full ledger history (until `NEXT_FLG=false`) for complete realized P&L instead of
 the default page cap. Reports also stamp **查询时间 (as_of)** + per-source freshness
 (live/cache/stale) and loudly flag any feed that failed — never silently ¥0.
+
+**JSON is versioned:** every `--json` dict payload carries `schema_version` (currently
+`"1.0"`) so cron jobs / dashboards / the daily snapshot can parse it stably.
 
 **Scope of the read commands: data display only.** The commands above just show
 your account's data (or factual calculations on it — totals, realized P&L by

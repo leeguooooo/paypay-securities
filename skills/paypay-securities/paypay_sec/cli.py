@@ -118,6 +118,17 @@ def _fmt(args) -> str:
     return getattr(args, "fmt", None) or "table"
 
 
+SCHEMA_VERSION = "1.0"
+
+
+def _json_dump(obj) -> str:
+    """JSON for machine consumers. Dict payloads get a stable schema_version stamped
+    first (so cron/dashboards/daily-reports can version their parsing)."""
+    if isinstance(obj, dict) and "schema_version" not in obj:
+        obj = {"schema_version": SCHEMA_VERSION, **obj}
+    return json.dumps(obj, ensure_ascii=False, indent=2)
+
+
 def _run_localized(render, payload) -> None:
     """Run a render fn (which prints) and localize its output per _LANG.
     JSON never reaches here, so machine output is unaffected."""
@@ -161,7 +172,7 @@ def _freshness_block(p: dict, lines) -> None:
 
 def _emit_fmt(payload, fmt, table_fn, lark_fn) -> None:
     if fmt == "json":
-        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        print(_json_dump(payload))
     elif fmt == "lark":
         _run_localized(lark_fn, payload)
     else:
@@ -170,7 +181,7 @@ def _emit_fmt(payload, fmt, table_fn, lark_fn) -> None:
 
 def _emit(obj, as_json: bool, render):
     if as_json:
-        print(json.dumps(obj, ensure_ascii=False, indent=2))
+        print(_json_dump(obj))
     else:
         _run_localized(render, obj)
 
@@ -566,6 +577,37 @@ def cmd_doctor(client, args) -> int:
          "detail": "cookie carries _SMS_AUTH_STRING (SMS skipped)" if has_device_token
                    else "cookie LACKS _SMS_AUTH_STRING → login will demand an SMS code"},
     ]
+    # --online: actually hit the API to confirm the cached session is LIVE (not just
+    # that the local files look right). Off by default — it touches the network.
+    online = getattr(args, "online", False)
+    online_checks = []
+    if online:
+        if not (member_id and password_set):
+            online_checks.append({"ok": False, "name": "online probe",
+                                  "detail": "credentials missing — can't probe"})
+        else:
+            from .client import SessionExpired
+            try:
+                c = PayPayClient(Settings.from_env(account))
+                info = c.login()
+                online_checks.append({
+                    "ok": bool(info.get("STATUS")) and not info.get("IF_NEED_SMS_FLG"),
+                    "name": "login (web)",
+                    "detail": f"STATUS={bool(info.get('STATUS'))} sms_required={bool(info.get('IF_NEED_SMS_FLG'))}"})
+                for label, probe in (("証券 page", lambda: c.portfolio_html("usa")),
+                                     ("投信 API", c.invtrust_top)):
+                    try:
+                        probe()
+                        online_checks.append({"ok": True, "name": label, "detail": "reachable / session valid"})
+                    except SessionExpired:
+                        online_checks.append({"ok": False, "name": label, "detail": "redirected to login (session expired)"})
+                    except Exception as e:  # noqa: BLE001
+                        online_checks.append({"ok": False, "name": label, "detail": type(e).__name__})
+            except Exception as e:  # noqa: BLE001
+                online_checks.append({"ok": False, "name": "login (web)", "detail": f"{type(e).__name__}: {e}"})
+
+    offline_ready = all(c["ok"] for c in checks)
+    online_ready = (not online) or all(c["ok"] for c in online_checks)
     payload = {
         "account": account, "env_file": str(env_path) if env_path else None,
         "member_id_set": bool(member_id), "password_set": password_set,
@@ -576,13 +618,18 @@ def cmd_doctor(client, args) -> int:
         "cache_dir": str(cache_dir), "cache_files": cache_count,
         "accounts": config.list_accounts(),
         "checks": checks,
-        "ready": all(c["ok"] for c in checks),
+        "online": online, "online_checks": online_checks,
+        "ready": offline_ready and online_ready,
     }
 
     def render(p):
         print(f"paypay doctor — account '{p['account']}'\n")
         for c in p["checks"]:
             print(f"  [{'OK' if c['ok'] else '!!'}] {_lj(c['name'], 22)} {c['detail']}")
+        if p["online"]:
+            print("\n  online probe:")
+            for c in p["online_checks"]:
+                print(f"  [{'OK' if c['ok'] else '!!'}] {_lj(c['name'], 22)} {c['detail']}")
         sess = (f"yes (token={'yes' if p['session_token_cached'] else 'no'}, "
                 f"last {p['last_session_refresh'] or '?'})" if p["session_cached"]
                 else "none yet — the first command will log in")
@@ -591,7 +638,9 @@ def cmd_doctor(client, args) -> int:
               f"{'YES — cookie missing trusted-device token' if p['sms_would_be_required'] else 'no'}")
         print(f"  response cache             : {p['cache_files']} files in {p['cache_dir']}")
         print(f"  configured accounts        : {', '.join(p['accounts']) or '(none)'}")
-        print(f"\n  → {'READY' if p['ready'] else 'NOT READY — resolve the !! items above, then `paypay login`'}")
+        if not p["online"]:
+            print("  (run `paypay doctor --online` to verify the session is actually live)")
+        print(f"\n  → {'READY' if p['ready'] else 'NOT READY — resolve the !! items above'}")
 
     _emit(payload, args.json, render)
     return 0 if payload["ready"] else 1
@@ -898,12 +947,14 @@ def _consolidated_holdings(client: PayPayClient):
     if inv:
         for h in inv.holdings:
             rows.append({"category": "投信", "name": names.get(str(h["brand_id"])) or f"#{h['brand_id']}",
-                         "valuation": h["valuation"], "unrealized_pl": h["unrealized_pl"]})
+                         "valuation": h["valuation"], "unrealized_pl": h["unrealized_pl"],
+                         "account_types": []})   # 投信 口座別 needs the ledger (see _invtrust_lots)
     for h in (out.get("sec_usa") or []):
         if h.is_cash:
             continue
         rows.append({"category": "証券", "name": h.name,
-                     "valuation": h.valuation, "unrealized_pl": h.unrealized_pl})
+                     "valuation": h.valuation, "unrealized_pl": h.unrealized_pl,
+                     "account_types": list(h.account_types or [])})
     sources = {
         "securities": "ok" if out.get("sec_usa") is not None else "failed",
         "invtrust": "ok" if out.get("inv_top") is not None else "failed",
@@ -988,11 +1039,38 @@ def _risk_payload(rows: list, cash, sell_pending, sources: dict) -> dict:
     }
 
 
+def _account_split(rows, invtrust_lots, cash, total) -> dict:
+    """口座区分 (特定 / NISA成長 / つみたて / 現金) breakdown by valuation %. 証券 from
+    each holding's account_types; 投信 from the ledger lots; cash → 特定(現金)."""
+    by: dict = {}
+
+    def add(acct, val):
+        by[acct] = by.get(acct, 0) + (val or 0)
+
+    for r in rows:
+        if r.get("category") == "証券":
+            accts = r.get("account_types") or ["特定"]
+            add(accts[0], r.get("valuation"))   # usually a single 口座; attribute to it
+    for lot in (invtrust_lots or []):
+        add(lot.get("acct") or "特定", lot.get("valuation"))
+    if cash:
+        add("特定(現金)", cash)
+    return {k: round(100.0 * v / total, 1) for k, v in by.items()} if total else {}
+
+
 def cmd_risk(client: PayPayClient, args) -> int:
     """Structural exposure of the account — FACTS ONLY (weights, concentration,
     category/currency split). No risk verdicts, no buy/sell advice."""
     rows, cash, cash_fresh, sell_pending, sources = _consolidated_holdings(client)
     payload = _risk_payload(rows, cash, sell_pending, sources)
+    # --accounts: add the 特定/NISA 口座 breakdown (needs the heavier 投信 ledger).
+    if getattr(args, "accounts", False):
+        try:
+            lots, _, _ = _invtrust_lots(client, _pages(args, 30))
+        except Exception:  # noqa: BLE001 — degrade: 証券 split only
+            lots = []
+            payload["sources"] = {**(payload.get("sources") or {}), "invledger": "failed"}
+        payload["by_account_pct"] = _account_split(rows, lots, cash, payload["grand_total"])
 
     def table(p):
         print(f"PayPay証券 — 持仓结构 / exposure (事実のみ)\n")
@@ -1004,6 +1082,8 @@ def cmd_risk(client: PayPayClient, args) -> int:
         print(f"  米国株 底層暴露 : {p['us_underlying_pct']}%   (S&P500等の投信も含む実質米株)")
         print(f"  种类构成     : " + " / ".join(f"{k} {v}%" for k, v in p["by_kind_pct"].items()))
         print(f"  账户构成     : " + " / ".join(f"{k} {v}%" for k, v in p["by_category_pct"].items()))
+        if p.get("by_account_pct"):
+            print(f"  口座区分     : " + " / ".join(f"{k} {v}%" for k, v in p["by_account_pct"].items()))
         print("\n  持仓ウェイト:")
         print("    " + _lj("NAME", 28) + _lj("种类", 8) + _rj("市值", 12) + _rj("占比", 8))
         for pos in p["positions"]:
@@ -1028,8 +1108,10 @@ def cmd_risk(client: PayPayClient, args) -> int:
              f"- 集中度: top1 {p['top1_pct']}% / top3 {p['top3_pct']}% / top5 {p['top5_pct']}%",
              f"- 米国 計価(証券): {p['usd_asset_pct']}% / 米国株 底層暴露: **{p['us_underlying_pct']}%** (S&P500等の投信も実質米株)",
              f"- 种类构成: " + " / ".join(f"{k} {v}%" for k, v in p["by_kind_pct"].items()),
-             f"- 账户构成: " + " / ".join(f"{k} {v}%" for k, v in p["by_category_pct"].items()),
-             "- 持仓ウェイト:"]
+             f"- 账户构成: " + " / ".join(f"{k} {v}%" for k, v in p["by_category_pct"].items())]
+        if p.get("by_account_pct"):
+            L.append("- 口座区分: " + " / ".join(f"{k} {v}%" for k, v in p["by_account_pct"].items()))
+        L += ["- 持仓ウェイト:"]
         for pos in p["positions"]:
             L.append(f"  - {pos['name']} ({pos['kind']}): {_yen(pos['valuation'])} / {pos['weight_pct']}%")
         if p["cash"]:
@@ -1059,6 +1141,13 @@ def cmd_assets(client: PayPayClient, args) -> int:
         "note": "grand_total = invested holdings + 証券 cash balance, matching the "
                 "app's 保有資産 total. CFD (separate login) is not included.",
     }
+    if getattr(args, "accounts", False):
+        try:
+            lots, _, _ = _invtrust_lots(client, _pages(args, 30))
+        except Exception:  # noqa: BLE001
+            lots = []
+            payload["sources"] = {**payload["sources"], "invledger": "failed"}
+        payload["by_account_pct"] = _account_split(rows, lots, cash, payload["grand_total"])
 
     def render(p):
         # Weights are over the GRAND TOTAL (incl. cash) to match the app's 資産割合
@@ -1081,6 +1170,8 @@ def cmd_assets(client: PayPayClient, args) -> int:
         print(f"  投資資産 : {_yen(p['invested_total'])}")
         print(f"  現金     : {_yen(p['cash'])}{cstale}")
         print(f"  総資産合計: {_yen(p['grand_total'])}")
+        if p.get("by_account_pct"):
+            print("  口座区分 : " + " / ".join(f"{k} {v}%" for k, v in p["by_account_pct"].items()))
         print(f"\n  投信 売却申込中 (settling): {_yen(p['invtrust_sell_pending'])}")
         print("  注: CFD(別ログイン)は未集計。")
         fl = []
@@ -1100,6 +1191,8 @@ def cmd_assets(client: PayPayClient, args) -> int:
         if p["cash"]:
             cw = f"{100 * p['cash'] / denom:.1f}%" if denom else "—"
             L.append(f"  - [現金] buyable: {_yen(p['cash'])} ({cw})")
+        if p.get("by_account_pct"):
+            L.append("- 口座区分: " + " / ".join(f"{k} {v}%" for k, v in p["by_account_pct"].items()))
         L.append(f"- 投信 売却申込中: {_yen(p['invtrust_sell_pending'])}")
         _freshness_block(p, L)
         L.append("\n> CFD(別ログイン)は未集計")
@@ -1144,16 +1237,13 @@ def cmd_history(client: PayPayClient, args) -> int:
     return 0
 
 
-def cmd_invtrust_history(client: PayPayClient, args) -> int:
-    """投信 (mutual-fund) transaction ledger — the MARKET_ID=99 settlements feed
-    that the 証券 ajax ledger never shows: 買付/売却/入金/譲渡益税/送金手数料."""
-    recs = client.invtrust_settlement_records(max_pages=_pages(args, 20))
+def _invtrust_lots(client: PayPayClient, pages: int = 30):
+    """投信 current holdings split by 口座区分 (特定 / NISA成長 / つみたて) via the
+    MARKET_ID=99 ledger lots, each lot's valuation apportioned by its net 口数 (all
+    口 of a fund share one 基準価額, so the split is exact). Returns (holdings, agg, txns)."""
+    recs = client.invtrust_settlement_records(max_pages=pages)
     txns = parsers.parse_invtrust_transactions(recs)
     agg = report.aggregate_invtrust(txns)
-
-    # current holdings split by 口座区分 (NISA成長 / つみたて / 特定), matching the
-    # app's NISA badges. All 口 of one fund share a single 基準価額, so splitting the
-    # fund's valuation by each lot's net 口数 is exact.
     inv = parsers.parse_invtrust(client.invtrust_top())
     names = client.invtrust_brands()
     fund_val = {names.get(str(h["brand_id"])): (h["valuation"] or 0)
@@ -1170,6 +1260,13 @@ def cmd_invtrust_history(client: PayPayClient, args) -> int:
                          "cost": b["net_invested"], "valuation": val,
                          "unrealized_pl": val - b["net_invested"]})
     holdings.sort(key=lambda x: -x["valuation"])
+    return holdings, agg, txns
+
+
+def cmd_invtrust_history(client: PayPayClient, args) -> int:
+    """投信 (mutual-fund) transaction ledger — the MARKET_ID=99 settlements feed
+    that the 証券 ajax ledger never shows: 買付/売却/入金/譲渡益税/送金手数料."""
+    holdings, agg, txns = _invtrust_lots(client, _pages(args, 20))
 
     payload = {"transactions": txns, "holdings_by_lot": holdings,
                "summary": {k: agg[k] for k in ("realized_pl", "reconciles",
@@ -1381,6 +1478,14 @@ def build_parser() -> argparse.ArgumentParser:
         if name == "invtrust-history":
             sp.add_argument("--pages", type=int, default=20,
                             help="how many pages of 投信 ledger to fetch (20 rows each)")
+        if name == "doctor":
+            sp.add_argument("--online", action="store_true",
+                            help="also probe the API (login + 証券/投信 fetch) to confirm the session is live")
+        if name in ("risk", "assets"):
+            sp.add_argument("--accounts", action="store_true",
+                            help="add the 口座区分 (特定/NISA成長/つみたて) split — fetches the 投信 ledger")
+            sp.add_argument("--pages", type=int, default=30,
+                            help="投信 ledger pages for the 口座 split (with --accounts)")
         if name == "fees":
             sp.add_argument("--pages", type=int, default=4,
                             help="how many pages of ledger history to scan")

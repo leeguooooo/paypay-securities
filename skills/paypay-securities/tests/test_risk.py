@@ -66,6 +66,26 @@ def test_risk_facts_only_note():
     assert "助言" in p["note"] and "リスク評価" in p["note"]
 
 
+def test_account_split():
+    rows = [
+        {"category": "証券", "name": "TSLA", "valuation": 180_000, "account_types": ["特定"]},
+        {"category": "証券", "name": "QQQ", "valuation": 120_000, "account_types": ["NISA成長"]},
+        {"category": "投信", "name": "S&P500", "valuation": 200_000, "account_types": []},
+    ]
+    lots = [{"acct": "NISA成長", "valuation": 150_000}, {"acct": "つみたて", "valuation": 50_000}]
+    sp = cli._account_split(rows, lots, cash=0, total=500_000)
+    assert sp["特定"] == 36.0                         # TSLA 180k
+    assert sp["NISA成長"] == 54.0                     # QQQ 120k (証券) + 150k (投信 lot)
+    assert sp["つみたて"] == 10.0                      # 50k lot
+    assert abs(sum(sp.values()) - 100.0) < 0.2       # reconciles to ~100%
+
+
+def test_account_split_defaults_securities_to_tokutei():
+    rows = [{"category": "証券", "name": "X", "valuation": 100, "account_types": []}]
+    sp = cli._account_split(rows, [], cash=0, total=100)
+    assert sp["特定"] == 100.0   # no account_types → 特定
+
+
 def test_risk_empty_account():
     p = cli._risk_payload([], 0, None, {})
     assert p["grand_total"] == 0
