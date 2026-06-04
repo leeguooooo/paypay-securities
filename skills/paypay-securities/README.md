@@ -19,10 +19,12 @@ npx skills add leeguooooo/paypay-securities --skill paypay-securities -g   # use
 Requires [`uv`](https://docs.astral.sh/uv/) on your PATH. The CLI (the bundled
 `paypay_sec/` package + `pyproject.toml`) installs alongside `SKILL.md`.
 
-**Run from anywhere** — symlink the launcher onto your PATH:
+**Run from anywhere** — symlink the launcher onto your PATH. The skill dir depends on
+your runner (`~/.claude/skills`, `~/.hermes/skills`, `~/.agents/skills`, …), so adjust
+the path to where it's installed:
 
 ```bash
-ln -s "$HOME/.claude/skills/paypay-securities/bin/paypay" ~/.local/bin/paypay
+ln -s ~/.claude/skills/paypay-securities/bin/paypay ~/.local/bin/paypay   # ← adjust to your install
 paypay review --format lark --lang zh
 ```
 

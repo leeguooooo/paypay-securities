@@ -31,7 +31,13 @@ case "${1:-}" in
   <key>ProgramArguments</key>
   <array><string>/bin/bash</string><string>${WRAPPER}</string></array>
   <key>StartCalendarInterval</key>
-  <dict><key>Hour</key><integer>${HOUR}</integer><key>Minute</key><integer>${MINUTE}</integer></dict>
+  <array>
+    <dict><key>Weekday</key><integer>1</integer><key>Hour</key><integer>${HOUR}</integer><key>Minute</key><integer>${MINUTE}</integer></dict>
+    <dict><key>Weekday</key><integer>2</integer><key>Hour</key><integer>${HOUR}</integer><key>Minute</key><integer>${MINUTE}</integer></dict>
+    <dict><key>Weekday</key><integer>3</integer><key>Hour</key><integer>${HOUR}</integer><key>Minute</key><integer>${MINUTE}</integer></dict>
+    <dict><key>Weekday</key><integer>4</integer><key>Hour</key><integer>${HOUR}</integer><key>Minute</key><integer>${MINUTE}</integer></dict>
+    <dict><key>Weekday</key><integer>5</integer><key>Hour</key><integer>${HOUR}</integer><key>Minute</key><integer>${MINUTE}</integer></dict>
+  </array>
   <key>RunAtLoad</key><false/>
   <key>StandardOutPath</key><string>${LOG}</string>
   <key>StandardErrorPath</key><string>${LOG}</string>
@@ -40,7 +46,7 @@ case "${1:-}" in
 PLIST
     launchctl unload "$PLIST" 2>/dev/null || true
     launchctl load -w "$PLIST"
-    echo "installed: ${LABEL} → daily ${HOUR}:$(printf '%02d' "$MINUTE") (local time)"
+    echo "installed: ${LABEL} → Mon-Fri ${HOUR}:$(printf '%02d' "$MINUTE") (local time)"
     echo "  wrapper: $WRAPPER"
     echo "  log    : $LOG"
     echo "  (override time: PAYPAY_SNAPSHOT_HOUR / PAYPAY_SNAPSHOT_MINUTE before install)"

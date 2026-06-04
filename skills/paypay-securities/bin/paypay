@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Location-independent launcher — run `paypay` from any directory.
-# Symlink onto your PATH, e.g.:
-#   ln -s "$HOME/.claude/skills/paypay-securities/bin/paypay" ~/.local/bin/paypay
-# then: paypay review --format lark
+# Symlink onto your PATH. The skill dir depends on your runner — it may be under
+# ~/.claude/skills, ~/.hermes/skills, ~/.agents/skills, … — so point at THIS file:
+#   ln -s "<skill-dir>/bin/paypay" ~/.local/bin/paypay   # adjust to your install
+# then: paypay review --format lark   (this launcher resolves the symlink itself)
 set -euo pipefail
 # Resolve symlinks so SKILL_DIR is the REAL skill dir even when this launcher is
 # invoked through a PATH symlink (e.g. ~/.local/bin/paypay). Without this,

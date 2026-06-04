@@ -99,6 +99,9 @@ _ZH_TERMS: dict[str, str] = {
     "投信": "基金(投信)",
     "基金": "基金",
     # full disclaimer notes (whole-sentence — precede component terms)
+    "設定金額・頻度は web API 非公開。実際の積立額は invtrust-history で確認。":
+        "设定金额·频率未在 web API 公开。实际定投额见 invtrust-history。",
+    "買付可能現金": "可买入现金",
     "定投額は実際のNISAつみたて買付からの推計(設定値はAPI非公開)。事実のみ、助言ではありません。":
         "定投额=按实际 NISAつみたて 买入推算(配置值 API 未公开)。仅事实,非建议。",
     "全口座合算。定投額は実際のNISAつみたて買付からの推計。事実のみ。":

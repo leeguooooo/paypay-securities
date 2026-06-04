@@ -172,9 +172,10 @@ uv run paypay cancel <ORDER_ID>               # cancel a pending order
   placed against that cash. Bank-card buying is mobile-app/passkey-only and out of scope.
 
 **Run from anywhere (no `cd`):** symlink the bundled launcher onto your PATH —
-`ln -s "$HOME/.claude/skills/paypay-securities/bin/paypay" ~/.local/bin/paypay` —
-then `paypay review --format lark` works in any directory (it resolves the skill
-dir and runs `uv run` there).
+`ln -s <skill-dir>/bin/paypay ~/.local/bin/paypay` (skill-dir varies by runner:
+`~/.claude/skills`, `~/.hermes/skills`, `~/.agents/skills`, …) — then
+`paypay review --format lark` works in any directory (the launcher resolves the
+symlink + skill dir and runs `uv run` there).
 
 **`total` / `assets` scope:** 証券 (株+ETF) + 投信 holdings + the account cash
 balance, giving the full grand total that matches the app's 保有資産 figure. The

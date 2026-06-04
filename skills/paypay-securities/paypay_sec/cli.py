@@ -845,24 +845,23 @@ def cmd_invtrust(client: PayPayClient, args) -> int:
 
     def render(d):
         print("投信 (mutual funds)")
-        print(f"  valuation      : {_yen(d['valuation'])}")
-        print(f"  principal      : {_yen(d['principal'])}")
-        print(f"  unrealized P&L : {_yen(d['unrealized_pl'])}")
-        print(f"  sell pending   : {_yen(d['sell_order_pending'])}")
-        print(f"  buyable cash   : {_yen(d['buyable_cash'])}")
+        print(f"  評価額       : {_yen(d['valuation'])}")
+        print(f"  投資元本     : {_yen(d['principal'])}")
+        print(f"  含み損益     : {_yen(d['unrealized_pl'])}")
+        print(f"  売却申込中   : {_yen(d['sell_order_pending'])}")
+        print(f"  買付可能現金 : {_yen(d['buyable_cash'])}")
         if d["holdings"]:
-            print("  holdings:")
+            print("  保有:")
             for h in d["holdings"]:
                 label = h.get("name") or f"brand#{h['brand_id']}"
                 tag = "  📅定投" if h.get("reserve_plan") else ""
                 print("    " + _lj(label, 34) + _rj(_yen(h["valuation"]), 12)
-                      + "  P&L " + _yen(h["unrealized_pl"]) + tag)
+                      + "  含み損益 " + _yen(h["unrealized_pl"]) + tag)
         if d.get("reserve_plans"):
-            print("\n  定投/つみたて 設定中の銘柄 (active recurring-buy plans):")
+            print("\n  定投/つみたて 設定中の銘柄:")
             for r in d["reserve_plans"]:
                 print(f"    📅 {r['name']}")
-            print("    注: 設定金額・頻度は web API 非公開。実際の積立額は "
-                  "`invtrust-history` の NISAつみたて 買付行で確認できます。")
+            print("    注: 設定金額・頻度は web API 非公開。実際の積立額は invtrust-history で確認。")
 
     _emit(d, args.json, render)
     return 0
