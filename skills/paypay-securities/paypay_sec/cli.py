@@ -379,6 +379,14 @@ def cmd_review(client: PayPayClient, args) -> int:
     net_deposit = agg["deposits"] - agg["withdrawals"]
     total_return = total - net_deposit
     residual = total_return - (unreal + realized_total)
+    # XIRR (money-weighted annualized return): dated external cashflows — 入金 is money
+    # IN (negative), 出金 is money OUT (positive); both = -(ledger amount). The current
+    # total value today is the closing positive cashflow. Needs the FULL deposit history
+    # (use --all) to be accurate; flagged below when not fetched_all.
+    _cf = [(t["date"], -(t["amount"] or 0)) for t in g["txns"]
+           if t["type"] in ("入金", "出金") and t["date"]]
+    _cf.append((_now_jst_str()[:10], total))
+    xirr = report.xirr(_cf)
     # 評価損益率 (App頭条と同じ "含み損益 ÷ 取得原価") for the 持仓盈亏 block
     holdings_value = total - cash
     cost_basis = holdings_value - unreal
@@ -396,6 +404,7 @@ def cmd_review(client: PayPayClient, args) -> int:
         "inv_capital_gains_tax": inv_tax, "inv_transfer_fees": inv_transfer,
         "total_cost": total_cost, "securities_fee_residual": sec_fee_residual,
         "cost_reconciles": cost_reconciles,
+        "xirr": xirr,
         "deposits": agg["deposits"], "withdrawals": agg["withdrawals"],
         "net_deposit": net_deposit, "total_return": total_return,
         "ledger_residual": residual,
@@ -428,6 +437,9 @@ def cmd_review(client: PayPayClient, args) -> int:
         print(f"\n③ 整体盈亏  通算 = 総資産 − 純入金 ★最終  : {_signed_yen(p['total_return'])}")
         print(f"     総資産 {_yen(p['total_assets'])}(現金 {_yen(p['cash'])}{cstale}) − 純入金 {_yen(p['net_deposit'])}")
         print(f"     = 実現益から 譲渡益税 {_yen(p['inv_capital_gains_tax'])}・送金手数料 {_yen(p['inv_transfer_fees'])}・為替等を差引いた後の値")
+        if p.get("xirr") is not None:
+            an = "" if p.get("fetched_all") else "  ※--allで全入金取得すると正確"
+            print(f"     資金加重収益率 (XIRR 年率): {p['xirr'] * 100:+.1f}%{an}")
 
         cmark = "" if p.get("cost_reconciles", True) else "  ⚠現金ledger不足(--allで再取得)"
         print(f"\n  測定コスト 合計 {_yen(p['total_cost'])}{cmark}")
@@ -460,6 +472,8 @@ def cmd_review(client: PayPayClient, args) -> int:
               f"**③ 整体盈亏** 通算 = 総資産 − 純入金 ★最終: **{_signed_yen(p['total_return'])}**",
               f"  - 総資産 {_yen(p['total_assets'])}(現金 {_yen(p['cash'])}{cstale}) − 純入金 {_yen(p['net_deposit'])}",
               f"  - 実現益から 譲渡益税 {_yen(p['inv_capital_gains_tax'])}・送金手数料 {_yen(p['inv_transfer_fees'])}・為替等を差引いた後",
+              *([f"  - 資金加重収益率 (XIRR 年率): **{p['xirr'] * 100:+.1f}%**"
+                 + ("" if p.get("fetched_all") else " (※--allで正確)")] if p.get("xirr") is not None else []),
               f"- 測定コスト合計 **{_yen(p['total_cost'])}**: 現金側手数料/税 {_yen(p['explicit_fees'])}"
               f"(うち 投信譲渡益税 {_yen(p['inv_capital_gains_tax'])}/送金手数料 {_yen(p['inv_transfer_fees'])}"
               f"/証券手数料 {_yen(p['securities_fee_residual'])}) + 推定為替 {_yen(p['fx_spread_cost'])}"]
@@ -854,11 +868,177 @@ def cmd_invtrust(client: PayPayClient, args) -> int:
     return 0
 
 
-def cmd_total(client: PayPayClient, args) -> int:
-    # securities (stocks + ETF) total = sum across markets that hold positions.
-    # Tolerate a transient per-market failure (e.g. 502) instead of aborting.
-    sec_by_market = {}
-    errors = []
+def _plans_payload(client: PayPayClient, args) -> dict:
+    """定投/つみたて plans for one account: active-plan flag (pc_invest_top) +
+    run-rate inferred from executed つみたて buys (invtrust-history)."""
+    inv = parsers.parse_invtrust(client.invtrust_top())
+    try:
+        names = client.invtrust_brands()
+    except (requests.RequestException, ValueError):
+        names = {}
+    txns = parsers.parse_invtrust_transactions(client.invtrust_settlement_records(max_pages=_pages(args, 30)))
+    rr_by = {r["brand"]: r for r in report.tsumitate_runrate(txns)}
+    active = {names.get(str(b)) or f"brand#{b}" for b in inv.reserve_brand_ids}
+    plans = []
+    for nm in sorted(active | set(rr_by)):
+        rr = rr_by.get(nm)
+        plans.append({"name": nm, "active": nm in active,
+                      "monthly_estimate": rr["monthly_estimate"] if rr else None,
+                      "annualized": rr["annualized"] if rr else None,
+                      "months": rr["months"] if rr else 0,
+                      "total_invested": rr["total_invested"] if rr else None,
+                      "last_date": rr["last_date"] if rr else None})
+    monthly = sum(p["monthly_estimate"] or 0 for p in plans)
+    return {"plans": plans, "monthly_total_estimate": monthly,
+            "annualized_total_estimate": monthly * 12}
+
+
+def cmd_plans(client: PayPayClient, args) -> int:
+    """定投/つみたて plans — active recurring-buy funds + inferred monthly run-rate
+    (from real executions; the configured amount/cycle isn't in the web API).
+    FACTS only — no advice."""
+    if getattr(args, "account", None) == "all":
+        return _all_accounts(args, _render_plans, _plans_payload, merge=_merge_plans)
+    payload = {"as_of": _now_jst_str(), **_plans_payload(client, args),
+               "note": "定投額は実際のNISAつみたて買付からの推計(設定値はAPI非公開)。事実のみ、助言ではありません。"}
+    _emit_fmt(payload, _fmt(args), lambda p: _render_plans(p, "table"),
+              lambda p: _render_plans(p, "lark"))
+    return 0
+
+
+def _render_plans(p: dict, fmt: str) -> None:
+    head = f"PayPay証券 — 定投/つみたて 計画 (推計, 事実のみ)"
+    if fmt == "lark":
+        L = [f"**{head}**", "",
+             f"- 月定投 合計(推計): **{_yen(p['monthly_total_estimate'])}** / 年化 {_yen(p['annualized_total_estimate'])}"]
+        for pl in p["plans"]:
+            tag = "📅" if pl["active"] else "·"
+            me = _yen(pl["monthly_estimate"]) if pl["monthly_estimate"] is not None else "—"
+            L.append(f"  - {tag} {pl['name']}: 月額(推) {me}"
+                     + (f" / 累計 {_yen(pl['total_invested'])} / {pl['months']}ヶ月" if pl["months"] else "")
+                     + ("" if pl["active"] else " (設定なし/停止?)"))
+        if p.get("accounts"):
+            L.append("- 口座別: " + " / ".join(f"{a}:{_yen(v)}/月" for a, v in p["accounts"].items()))
+        L.append(f"\n> {p.get('note','')}")
+        print("\n".join(L))
+        return
+    print(f"{head}\n")
+    print(f"  月定投 合計(推計): {_yen(p['monthly_total_estimate'])}   (年化 {_yen(p['annualized_total_estimate'])})")
+    if p.get("accounts"):
+        print("  口座別/月: " + " / ".join(f"{a} {_yen(v)}" for a, v in p["accounts"].items()))
+    print("\n  " + _lj("銘柄", 32) + _lj("定投", 6) + _rj("月額(推)", 11)
+          + _rj("年化", 12) + _rj("月数", 6) + _rj("累計投入", 12))
+    for pl in p["plans"]:
+        me = _yen(pl["monthly_estimate"]) if pl["monthly_estimate"] is not None else "—"
+        print("  " + _lj(pl["name"] or "", 32) + _lj("📅" if pl["active"] else "—", 6)
+              + _rj(me, 11) + _rj(_yen(pl["annualized"]) if pl["annualized"] else "—", 12)
+              + _rj(str(pl["months"]), 6) + _rj(_yen(pl["total_invested"]), 12))
+    print(f"\n  注: {p.get('note','')}")
+
+
+def cmd_tax(client: PayPayClient, args) -> int:
+    """Per calendar-year tax view: 売却 proceeds, 譲渡益税 withheld, 分配金 — the
+    figures the 年間取引報告書 shows. FACTS only (NISA is tax-free; 特定 is withheld)."""
+    if getattr(args, "account", None) == "all":
+        return _all_accounts(args, _render_tax, _tax_payload, merge=_merge_tax)
+    payload = {"as_of": _now_jst_str(), **_tax_payload(client, args),
+               "note": "事実のみ。年間取引報告書の参考値。NISA口座は非課税、特定口座は源泉徴収。"}
+    _emit_fmt(payload, _fmt(args), lambda p: _render_tax(p, "table"),
+              lambda p: _render_tax(p, "lark"))
+    return 0
+
+
+def _tax_payload(client: PayPayClient, args) -> dict:
+    sec = parsers.parse_transactions(client.settlement_records(max_pages=_pages(args, 8)))
+    inv = parsers.parse_invtrust_transactions(client.invtrust_settlement_records(max_pages=_pages(args, 30)))
+    return {"tax_years": report.tax_summary(sec, inv)}
+
+
+def _render_tax(p: dict, fmt: str) -> None:
+    head = "PayPay証券 — 税務サマリー (年別, 事実のみ)"
+    rows = p["tax_years"]
+    if fmt == "lark":
+        L = [f"**{head}**", ""]
+        for r in rows:
+            L.append(f"- **{r['year']}**: 売却 証券{_yen(r['sec_sell'])}/投信{_yen(r['inv_sell'])} "
+                     f"・譲渡益税 {_yen(r['capital_gains_tax'])}・分配金 {_yen(r['distributions'])}")
+        L.append(f"\n> {p.get('note','')}")
+        print("\n".join(L))
+        return
+    print(f"{head}\n")
+    print("  " + _lj("年", 8) + _rj("証券売却", 12) + _rj("投信売却", 12)
+          + _rj("譲渡益税", 11) + _rj("分配金", 10))
+    for r in rows:
+        print("  " + _lj(r["year"], 8) + _rj(_yen(r["sec_sell"]), 12) + _rj(_yen(r["inv_sell"]), 12)
+              + _rj(_yen(r["capital_gains_tax"]), 11) + _rj(_yen(r["distributions"]), 10))
+    if not rows:
+        print("  (売却/課税の記録なし)")
+    print(f"\n  注: {p.get('note','')}")
+
+
+def _account_clients(args):
+    """Yield (account_name, client) for every configured profile (for -a all)."""
+    for a in config.list_accounts():
+        try:
+            yield a, PayPayClient(Settings.from_env(a),
+                                  cache_ttl=0 if getattr(args, "no_cache", False) else None)
+        except Exception:  # noqa: BLE001 — skip a profile that won't load
+            yield a, None
+
+
+def _all_accounts(args, render, payload_fn, merge) -> int:
+    """Run payload_fn per account, merge, and emit. Shared by -a all commands."""
+    per = {}
+    for name, client in _account_clients(args):
+        if client is None:
+            continue
+        try:
+            per[name] = payload_fn(client, args)
+        except Exception as e:  # noqa: BLE001
+            per[name] = {"_error": type(e).__name__}
+    merged = merge(per)
+    merged["as_of"] = _now_jst_str()
+    _emit_fmt(merged, _fmt(args), lambda p: render(p, "table"), lambda p: render(p, "lark"))
+    return 0
+
+
+def _merge_plans(per: dict) -> dict:
+    by_name = {}
+    acct_monthly = {}
+    for acct, pl in per.items():
+        if pl.get("_error"):
+            continue
+        acct_monthly[acct] = pl.get("monthly_total_estimate", 0)
+        for r in pl.get("plans", []):
+            cur = by_name.setdefault(r["name"], {"name": r["name"], "active": False,
+                                                 "monthly_estimate": 0, "annualized": 0,
+                                                 "months": 0, "total_invested": 0, "last_date": None})
+            cur["active"] = cur["active"] or r["active"]
+            cur["monthly_estimate"] += r.get("monthly_estimate") or 0
+            cur["annualized"] += r.get("annualized") or 0
+            cur["months"] = max(cur["months"], r.get("months") or 0)
+            cur["total_invested"] += r.get("total_invested") or 0
+    plans = sorted(by_name.values(), key=lambda x: -(x["total_invested"] or 0))
+    monthly = sum(p["monthly_estimate"] or 0 for p in plans)
+    return {"plans": plans, "monthly_total_estimate": monthly,
+            "annualized_total_estimate": monthly * 12, "accounts": acct_monthly,
+            "note": "全口座合算。定投額は実際のNISAつみたて買付からの推計。事実のみ。"}
+
+
+def _merge_tax(per: dict) -> dict:
+    years = {}
+    for pl in per.values():
+        for r in pl.get("tax_years", []) if not pl.get("_error") else []:
+            y = years.setdefault(r["year"], {"year": r["year"], "sec_sell": 0, "inv_sell": 0,
+                                             "capital_gains_tax": 0, "distributions": 0})
+            for k in ("sec_sell", "inv_sell", "capital_gains_tax", "distributions"):
+                y[k] += r.get(k, 0)
+    return {"tax_years": [years[y] for y in sorted(years)],
+            "note": "全口座合算。年間取引報告書の参考値。事実のみ。"}
+
+
+def _total_payload(client: PayPayClient, args) -> dict:
+    sec_by_market, errors = {}, []
     for mkt in ("usa", "japan"):
         try:
             s = parsers.parse_summary(client.portfolio_html(mkt))
@@ -868,66 +1048,84 @@ def cmd_total(client: PayPayClient, args) -> int:
             errors.append(f"{mkt}: {type(e).__name__}")
     sec_total = sum(v for v in sec_by_market.values() if v)
     inv = parsers.parse_invtrust(client.invtrust_top())
-    inv_val = inv.valuation or 0
-    invested = sec_total + inv_val
+    invested = sec_total + (inv.valuation or 0)
     cash, cash_fresh = _persist_cash(client, parsers.current_cash(client.settlement_records(max_pages=1)))
-    grand_total = invested + (cash or 0)
     if not cash_fresh:
         errors.append("cash: throttled→stale")
-    sources = {
-        "securities": "ok" if any(v for v in sec_by_market.values()) else "failed",
-        "invtrust": "ok" if inv.valuation is not None else "failed",
-        "cash": "live" if cash_fresh else ("stale" if cash is not None else "failed"),
-    }
-    payload = {
-        "as_of": _now_jst_str(),
-        "securities_by_market": sec_by_market,
-        "securities_total": sec_total,
-        "invtrust_valuation": inv.valuation,
-        "invested_total": invested,
-        "cash": cash, "cash_fresh": cash_fresh,
-        "grand_total": grand_total,
-        "invtrust_sell_pending": inv.sell_order_pending,
-        "errors": errors,
-        "sources": sources,
+    return {
+        "securities_by_market": sec_by_market, "securities_total": sec_total,
+        "invtrust_valuation": inv.valuation, "invested_total": invested,
+        "cash": cash, "cash_fresh": cash_fresh, "grand_total": invested + (cash or 0),
+        "invtrust_sell_pending": inv.sell_order_pending, "errors": errors,
+        "sources": {
+            "securities": "ok" if any(v for v in sec_by_market.values()) else "failed",
+            "invtrust": "ok" if inv.valuation is not None else "failed",
+            "cash": "live" if cash_fresh else ("stale" if cash is not None else "failed")},
         "note": ("grand_total = 証券 + 投信 holdings + 証券 cash balance, matching the "
                  "app's 保有資産 total. CFD (separate login) is not included."),
     }
 
-    def render(p):
-        cstale = "" if p.get("cash_fresh", True) else "  ⚠stale(取得失敗)"
-        print("PayPay証券 — total assets (read-only)\n")
-        print(f"  証券 (株+ETF)   : {_yen(p['securities_total'])}")
-        print(f"  投信 (基金)      : {_yen(p['invtrust_valuation'])}")
-        print(f"  現金            : {_yen(p['cash'])}{cstale}")
-        print(f"  {'─' * 30}")
-        print(f"  総資産 合計      : {_yen(p['grand_total'])}")
-        print(f"\n  (うち投資資産 {_yen(p['invested_total'])} / 投信 売却申込中 {_yen(p['invtrust_sell_pending'])} settling)")
-        if p["errors"]:
-            print(f"\n  ⚠ 一部市場の取得に失敗(集計から除外): {', '.join(p['errors'])}")
-        print("\n  注: CFD は別ログインのため未集計。")
-        fl = []
-        _freshness_block(p, fl)
-        if fl:
-            print()
-            for line in fl:
-                print(line)
 
-    def lark(p):
+def _render_total(p: dict, fmt: str) -> None:
+    if fmt == "lark":
         cstale = "" if p.get("cash_fresh", True) else " ⚠stale"
-        L = ["**PayPay証券 総資産**", "",
+        L = ["**PayPay証券 総資産" + ("(全口座)" if p.get("accounts") else "") + "**", "",
              f"- 証券(株+ETF): {_yen(p['securities_total'])}",
              f"- 投信(基金): {_yen(p['invtrust_valuation'])}",
              f"- 現金: {_yen(p['cash'])}{cstale}",
              f"- **総資産 合計: {_yen(p['grand_total'])}**",
              f"  (投資資産 {_yen(p['invested_total'])} / 投信 売却申込中 {_yen(p['invtrust_sell_pending'])})"]
+        if p.get("accounts"):
+            L.append("- 口座別: " + " / ".join(f"{a} {_yen(v)}" for a, v in p["accounts"].items()))
         if p["errors"]:
-            L.append(f"- ⚠ 一部市場の取得に失敗: {', '.join(p['errors'])}")
+            L.append(f"- ⚠ {', '.join(p['errors'])}")
         _freshness_block(p, L)
         L.append("\n> CFD(別ログイン)は未集計")
         print("\n".join(L))
+        return
+    cstale = "" if p.get("cash_fresh", True) else "  ⚠stale(取得失敗)"
+    print("PayPay証券 — total assets" + ("(全口座)" if p.get("accounts") else "") + " (read-only)\n")
+    print(f"  証券 (株+ETF)   : {_yen(p['securities_total'])}")
+    print(f"  投信 (基金)      : {_yen(p['invtrust_valuation'])}")
+    print(f"  現金            : {_yen(p['cash'])}{cstale}")
+    print(f"  {'─' * 30}")
+    print(f"  総資産 合計      : {_yen(p['grand_total'])}")
+    print(f"\n  (うち投資資産 {_yen(p['invested_total'])} / 投信 売却申込中 {_yen(p['invtrust_sell_pending'])} settling)")
+    if p.get("accounts"):
+        print("  口座別: " + " / ".join(f"{a} {_yen(v)}" for a, v in p["accounts"].items()))
+    if p["errors"]:
+        print(f"\n  ⚠ 取得に失敗(集計から除外): {', '.join(p['errors'])}")
+    print("\n  注: CFD は別ログインのため未集計。")
+    fl = []
+    _freshness_block(p, fl)
+    if fl:
+        print()
+        for line in fl:
+            print(line)
 
-    _emit_fmt(payload, _fmt(args), render, lark)
+
+def _merge_total(per: dict) -> dict:
+    keys = ("securities_total", "invtrust_valuation", "invested_total", "cash",
+            "grand_total", "invtrust_sell_pending")
+    out = {k: 0 for k in keys}
+    accounts, errors = {}, []
+    for acct, p in per.items():
+        if p.get("_error"):
+            errors.append(f"{acct}: {p['_error']}"); continue
+        for k in keys:
+            out[k] += p.get(k) or 0
+        accounts[acct] = p.get("grand_total") or 0
+    out.update({"accounts": accounts, "errors": errors, "cash_fresh": True,
+                "sources": {}, "note": "全口座合算。CFD は別ログイン未集計。"})
+    return out
+
+
+def cmd_total(client: PayPayClient, args) -> int:
+    if getattr(args, "account", None) == "all":
+        return _all_accounts(args, _render_total, _total_payload, merge=_merge_total)
+    payload = {"as_of": _now_jst_str(), **_total_payload(client, args)}
+    _emit_fmt(payload, _fmt(args), lambda p: _render_total(p, "table"),
+              lambda p: _render_total(p, "lark"))
     return 0
 
 
@@ -1491,6 +1689,7 @@ def build_parser() -> argparse.ArgumentParser:
                      ("invtrust-history", cmd_invtrust_history),
                      ("fees", cmd_fees), ("review", cmd_review),
                      ("trades-summary", cmd_trades_summary), ("risk", cmd_risk),
+                     ("plans", cmd_plans), ("tax", cmd_tax),
                      ("accounts", cmd_accounts), ("doctor", cmd_doctor),
                      ("cache-clear", cmd_cache_clear)):
         sp = sub.add_parser(name, parents=[common])
@@ -1504,6 +1703,9 @@ def build_parser() -> argparse.ArgumentParser:
         if name == "invtrust-history":
             sp.add_argument("--pages", type=int, default=20,
                             help="how many pages of 投信 ledger to fetch (20 rows each)")
+        if name in ("plans", "tax"):
+            sp.add_argument("--pages", type=int, default=30,
+                            help="投信 ledger pages to scan (20 rows each)")
         if name == "doctor":
             sp.add_argument("--online", action="store_true",
                             help="also probe the API (login + 証券/投信 fetch) to confirm the session is live")
@@ -1572,6 +1774,12 @@ def main(argv=None) -> int:
         return cmd_accounts(None, args)
     if args.func is cmd_doctor:
         return cmd_doctor(None, args)
+    # -a all: consolidate across every configured profile (handled inside the cmd).
+    if getattr(args, "account", None) == "all":
+        if args.func not in (cmd_total, cmd_plans, cmd_tax):
+            print("error: -a all is supported only for total / plans / tax", file=sys.stderr)
+            return 2
+        return args.func(None, args)
     try:
         settings = Settings.from_env(getattr(args, "account", None))  # also loads .env
         if args.func in _TRADING_CMDS and not _trading_enabled():

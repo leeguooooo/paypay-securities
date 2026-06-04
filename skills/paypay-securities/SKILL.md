@@ -82,6 +82,8 @@ uv run paypay fees [--detail]       # cost analysis: explicit fees + measured FX
 uv run paypay review                # 复盘: 2 blocks — 持仓盈亏(評価損益=App頭条) + 账户盈亏(通算=総資産−純入金); + realized/costs
 uv run paypay trades-summary        # per-brand buy/sell/net-invested/net-shares/realized P&L
 uv run paypay risk [--accounts]     # 持仓结构 / exposure: weights, concentration, FX/category split (+口座区分 with --accounts; FACTS ONLY)
+uv run paypay plans                 # 定投/つみたて: active recurring-buy funds + monthly run-rate inferred from executed buys
+uv run paypay tax                   # per-year tax view: 売却 proceeds / 譲渡益税 / 分配金 (年間取引報告書 参考; FACTS ONLY)
 uv run paypay snapshot save         # save a dated account snapshot (the CLI's own time series)
 uv run paypay snapshot list         # list saved snapshots
 uv run paypay diff [--days N]       # diff a live read vs the latest (or ~N-days-old) snapshot
@@ -117,6 +119,11 @@ the default page cap. Reports also stamp **查询时间 (as_of)** + per-source f
 
 **JSON is versioned:** every `--json` dict payload carries `schema_version` (currently
 `"1.0"`) so cron jobs / dashboards / the daily snapshot can parse it stably.
+
+**`-a all`** consolidates across every configured account profile (supported for
+`total` / `plans` / `tax`): combined totals + per-account breakdown. **`review`** also
+reports a **money-weighted return (XIRR, 資金加重収益率)** — the proper annualized
+performance when 定投/deposits are ongoing (use `--all` for the full deposit history).
 
 **Scope of the read commands: data display only.** The commands above just show
 your account's data (or factual calculations on it — totals, realized P&L by

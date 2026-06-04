@@ -5,9 +5,22 @@ judgments, or buy/sell advice — just the numbers.
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 
 _FEE_TYPES = ("手数料/税", "手数料")
+
+
+def _year(date: str) -> str | None:
+    """Calendar year from a ledger date ('2026.05.27' or '2026-05-27')."""
+    m = re.match(r"(\d{4})", date or "")
+    return m.group(1) if m else None
+
+
+def _ym(date: str) -> str | None:
+    """Year-month bucket ('2026.05' or '2026-05') from a ledger date."""
+    m = re.match(r"(\d{4})[.\-/](\d{2})", date or "")
+    return f"{m.group(1)}-{m.group(2)}" if m else None
 
 
 def _realized_moving_avg(events) -> tuple[int, bool]:
@@ -149,3 +162,110 @@ def aggregate_invtrust(transactions: list[dict]) -> dict:
         "date_from": min(dates) if dates else None,
         "date_to": max(dates) if dates else None,
     }
+
+
+def tsumitate_runrate(invtrust_txns: list[dict]) -> list[dict]:
+    """Infer the 定投/つみたて run-rate per fund from EXECUTED buys (the configured
+    amount/cycle is not exposed by the web API). Looks at 買付 rows whose 口座 is a
+    つみたて 枠. monthly_estimate = total ÷ distinct year-months seen (つみたて is
+    monthly). FACTS from real executions — low confidence when months is small."""
+    by: dict[str, list] = {}
+    for t in invtrust_txns:
+        if t.get("type") == "買付" and "つみたて" in (t.get("account_type") or "") and t.get("brand"):
+            by.setdefault(t["brand"], []).append((t.get("date") or "", abs(t.get("amount") or 0)))
+    out = []
+    for brand, rows in by.items():
+        rows = sorted(r for r in rows if r[0])
+        if not rows:
+            continue
+        months = {_ym(d) for d, _ in rows if _ym(d)}
+        total = sum(a for _, a in rows)
+        monthly = round(total / len(months)) if months else 0
+        out.append({
+            "brand": brand, "buys": len(rows), "months": len(months),
+            "total_invested": total, "monthly_estimate": monthly,
+            "annualized": monthly * 12,
+            "last_date": rows[-1][0], "last_amount": rows[-1][1],
+        })
+    return sorted(out, key=lambda x: -x["total_invested"])
+
+
+def xirr(cashflows: list[tuple], guess: float = 0.1):
+    """Money-weighted annualized return (XIRR) for [(date_str, amount)]. Sign: money
+    INTO the portfolio (deposits) NEGATIVE, money OUT (withdrawals) + final current
+    value POSITIVE. Returns the annual rate as a fraction (0.12 = +12%/yr) or None
+    if unsolvable / too little data. Newton's method + bisection fallback."""
+    from datetime import date as _date
+
+    def parse(d):
+        m = re.match(r"(\d{4})[.\-/](\d{2})[.\-/](\d{2})", d or "")
+        return _date(int(m.group(1)), int(m.group(2)), int(m.group(3))) if m else None
+
+    flows = [(parse(d), float(a)) for d, a in cashflows if parse(d) and a]
+    if len(flows) < 2:
+        return None
+    t0 = min(d for d, _ in flows)
+    yrs = [((d - t0).days / 365.0, a) for d, a in flows]
+    if not (any(a < 0 for _, a in yrs) and any(a > 0 for _, a in yrs)):
+        return None
+
+    def npv(r):
+        return sum(a / (1.0 + r) ** t for t, a in yrs)
+
+    r = guess
+    for _ in range(100):
+        f = npv(r)
+        d = sum(-t * a / (1.0 + r) ** (t + 1) for t, a in yrs)
+        if abs(d) < 1e-9:
+            break
+        nr = r - f / d
+        if nr <= -0.999999:
+            nr = (r - 0.999999) / 2
+        if abs(nr - r) < 1e-7:
+            return round(nr, 4)
+        r = nr
+    lo, hi = -0.9999, 10.0
+    flo, fhi = npv(lo), npv(hi)
+    if flo * fhi > 0:
+        return None
+    for _ in range(200):
+        mid = (lo + hi) / 2
+        fm = npv(mid)
+        if abs(fm) < 1e-6:
+            return round(mid, 4)
+        if flo * fm < 0:
+            hi = mid
+        else:
+            lo, flo = mid, fm
+    return round((lo + hi) / 2, 4)
+
+
+def tax_summary(sec_txns: list[dict], inv_txns: list[dict]) -> list[dict]:
+    """Per calendar-year tax view (FACTS): 売却 proceeds, 譲渡益税 withheld, 分配金.
+    Tax year = calendar year of the ledger date. No advice — just the figures the
+    年間取引報告書 would show."""
+    years: dict[str, dict] = {}
+
+    def row(y):
+        return years.setdefault(y, {"year": y, "sec_sell": 0, "inv_sell": 0,
+                                    "capital_gains_tax": 0, "distributions": 0})
+
+    for t in inv_txns:
+        y = _year(t.get("date"))
+        if not y:
+            continue
+        if t["type"] == "譲渡益税" and t.get("amount"):
+            row(y)["capital_gains_tax"] += -t["amount"]
+        elif t["type"] == "分配金" and t.get("amount"):
+            row(y)["distributions"] += t["amount"]
+        elif t["type"] == "売却" and t.get("amount"):
+            row(y)["inv_sell"] += abs(t["amount"])
+    for t in sec_txns:
+        y = _year(t.get("date"))
+        if not y:
+            continue
+        if t["type"] == "売却" and t.get("amount"):
+            row(y)["sec_sell"] += abs(t["amount"])
+        elif t["type"] == "譲渡益税" and t.get("amount"):
+            row(y)["capital_gains_tax"] += -t["amount"]
+    return [years[y] for y in sorted(years)]
