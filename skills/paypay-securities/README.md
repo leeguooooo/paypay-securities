@@ -54,8 +54,8 @@ paypay doctor [--online]           # diagnose setup / login readiness (--online 
 paypay assets [--accounts]         # 証券 + 投信 holdings + cash + grand total (+口座区分 with --accounts)
 paypay review                      # 復盘: 持仓盈亏 / 累計実現 / 整体盈亏 + costs
 paypay risk [--accounts]           # 持仓结构: weights, concentration, FX/category/口座 split (facts only)
-paypay plans                       # 定投/つみたて: active recurring-buy funds + monthly run-rate (inferred)
-paypay tax                         # per-year tax view: 売却 / 譲渡益税 / 分配金 (年間取引報告書 参考)
+paypay plans                       # 定投/つみたて: active recurring-buy funds + monthly run-rate (scans full history; --fast = quick)
+paypay tax                         # per-year tax view: 売却 / 譲渡益税 / 分配金 (full history by default; --fast = quick)
 paypay total -a all                # consolidate every account profile (also: plans -a all, tax -a all)
 paypay total                       # aggregate invested assets
 paypay trades [--pages N | --all]  # transaction ledger + running cash

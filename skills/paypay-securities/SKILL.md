@@ -85,8 +85,8 @@ uv run paypay fees [--detail]       # cost analysis: explicit fees + measured FX
 uv run paypay review                # 复盘: 2 blocks — 持仓盈亏(評価損益=App頭条) + 账户盈亏(通算=総資産−純入金); + realized/costs
 uv run paypay trades-summary        # per-brand buy/sell/net-invested/net-shares/realized P&L
 uv run paypay risk [--accounts]     # 持仓结构 / exposure: weights, concentration, FX/category split (+口座区分 with --accounts; FACTS ONLY)
-uv run paypay plans                 # 定投/つみたて: active recurring-buy funds + monthly run-rate inferred from executed buys
-uv run paypay tax                   # per-year tax view: 売却 proceeds / 譲渡益税 / 分配金 (年間取引報告書 参考; FACTS ONLY)
+uv run paypay plans                 # 定投/つみたて: active recurring-buy funds + monthly run-rate (scans FULL history by default; --fast = quick)
+uv run paypay tax                   # per-year tax view: 売却 / 譲渡益税 / 分配金 (FULL history by default; --fast = quick; 年間取引報告書 参考, FACTS ONLY)
 uv run paypay snapshot save         # save a dated account snapshot (the CLI's own time series)
 uv run paypay snapshot list         # list saved snapshots
 uv run paypay diff [--days N]       # diff a live read vs the latest (or ~N-days-old) snapshot

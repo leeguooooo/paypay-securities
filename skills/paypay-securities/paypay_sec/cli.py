@@ -64,6 +64,14 @@ def _measured_cost(explicit_fees, fx_cost, inv_tax, inv_transfer) -> dict:
             "cost_reconciles": residual >= 0}
 
 
+def _hist_pages(args) -> int:
+    """Page count for the history-analysis commands (plans/tax): FULL history by
+    default — they have no 'incomplete' warning, so a short fetch would silently
+    under-report (e.g. ¥0 月定投 / ¥0 税). `--fast` caps it for a quick look.
+    The ledger stops at NEXT_FLG anyway, so 'full' is cheap for a small account."""
+    return 8 if getattr(args, "fast", False) else _ALL_PAGES_CAP
+
+
 def _basis_hint(reconciles: bool, fetched_all: bool) -> str:
     """Warn (don't hide) when realized P&L rests on an incomplete cost basis —
     i.e. a sell with no matching buy in the fetched window. Points at --all."""
@@ -878,7 +886,7 @@ def _plans_payload(client: PayPayClient, args) -> dict:
         names = client.invtrust_brands()
     except (requests.RequestException, ValueError):
         names = {}
-    txns = parsers.parse_invtrust_transactions(client.invtrust_settlement_records(max_pages=_pages(args, 30)))
+    txns = parsers.parse_invtrust_transactions(client.invtrust_settlement_records(max_pages=_hist_pages(args)))
     rr_by = {r["brand"]: r for r in report.tsumitate_runrate(txns)}
     active = {names.get(str(b)) or f"brand#{b}" for b in inv.reserve_brand_ids}
     plans = []
@@ -957,8 +965,8 @@ def cmd_tax(client: PayPayClient, args) -> int:
 
 
 def _tax_payload(client: PayPayClient, args) -> dict:
-    sec = parsers.parse_transactions(client.settlement_records(max_pages=_pages(args, 8)))
-    inv = parsers.parse_invtrust_transactions(client.invtrust_settlement_records(max_pages=_pages(args, 30)))
+    sec = parsers.parse_transactions(client.settlement_records(max_pages=_hist_pages(args)))
+    inv = parsers.parse_invtrust_transactions(client.invtrust_settlement_records(max_pages=_hist_pages(args)))
     return {"tax_years": report.tax_summary(sec, inv)}
 
 
@@ -1715,8 +1723,8 @@ def build_parser() -> argparse.ArgumentParser:
             sp.add_argument("--pages", type=int, default=20,
                             help="how many pages of 投信 ledger to fetch (20 rows each)")
         if name in ("plans", "tax"):
-            sp.add_argument("--pages", type=int, default=30,
-                            help="投信 ledger pages to scan (20 rows each)")
+            sp.add_argument("--fast", action="store_true",
+                            help="quick look (default scans the FULL ledger history for accuracy)")
         if name == "doctor":
             sp.add_argument("--online", action="store_true",
                             help="also probe the API (login + 証券/投信 fetch) to confirm the session is live")
