@@ -1403,14 +1403,20 @@ def cmd_orders(client, args) -> int:
     except NotImplementedError as e:
         print(f"[pending Phase 0] {e}", file=sys.stderr); return 3
     payload = {"open_orders": rows}
+
     def render(p):
-        print("未約定注文 (open orders)\n")
-        print(_lj("ORDER_ID", 18) + _lj("SIDE", 6) + _lj("SYMBOL", 10)
-              + _rj("QTY", 10) + _rj("LIMIT", 10) + "  STATUS")
+        print("予約注文 (open orders)\n")
+        if not p["open_orders"]:
+            print("  (なし)")
+            return
+        print(_lj("ID", 14) + _lj("受付日時", 18) + _lj("銘柄", 12) + _lj("売買", 6)
+              + _lj("口座", 10) + _rj("金額・株数", 14) + "  ステータス")
         for r in p["open_orders"]:
-            print(_lj(str(r.get("order_id","")), 18) + _lj(r.get("side",""), 6)
-                  + _lj(r.get("symbol",""), 10) + _rj(str(r.get("qty","")), 10)
-                  + _rj(str(r.get("limit","")), 10) + "  " + str(r.get("status","")))
+            print(_lj(str(r.get("order_id", "") or "—"), 14) + _lj(r.get("datetime", ""), 18)
+                  + _lj(r.get("symbol", ""), 12) + _lj(r.get("side", ""), 6)
+                  + _lj(r.get("account_type", ""), 10) + _rj(r.get("size", ""), 14)
+                  + "  " + str(r.get("status", "")) + (f"  {r['note']}" if r.get("note") else ""))
+
     _emit(payload, getattr(args, "json", False), render)
     return 0
 

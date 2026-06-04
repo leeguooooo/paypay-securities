@@ -514,9 +514,13 @@ class PayPayClient:
     #       inputs + a TRADE_PASSWORD field.
     #   submit/真下単: POST /trade/brand/ajax_(buy|sell)_complete with those hidden
     #     fields + ORDER_CONFIRM_NO + TRADE_PASSWORD + CSRF_TOKEN (= fuel_csrf_token cookie).
-    # NOTE: confirm/submit response *field names* are finalized against a live capture
-    # when the US market is open (closed → buyable=0 → confirm STATUS=false). The hidden-
-    # field extraction below is format-agnostic so it survives that finalization.
+    # Field names VERIFIED 2026-06-04 from the live #buy_form / #sell_form on
+    # /trade/brand/(buy|sell)/<id> (no market open needed): ORDER_CONFIRM_NO,
+    # ORDER_AMOUNT, ORDER_PRICE, ORDER_EXCHANGE_RATE, ORDER_QTY, AMOUNT_TYP, ACCOUNT_TYPE,
+    # PLAN_TYPE, PREORDER, CSRF_TOKEN, IS_NON_INSIDER_TRADING_CONFIRMED, TRADE_PASSWORD.
+    # Still needs ONE live capture for: the confirm popup wrapping these as populated
+    # hidden inputs (market open), and the submit RESPONSE order_id (a real --execute,
+    # human-only). open_orders columns were finalized against the live /trade/preorder/.
     @staticmethod
     def _hidden_fields(html: str) -> dict:
         return dict(re.findall(

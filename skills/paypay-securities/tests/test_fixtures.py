@@ -115,17 +115,24 @@ def test_parse_invtrust_transactions():
 
 
 # ------------------------------------------------------------- parse_open_orders
+# real /trade/preorder/ columns (headers verified 2026-06-04)
 _PREORDER_HTML = """
 <table class="d_table">
-  <tr><th>注文番号</th><th>銘柄</th><th>状態</th></tr>
-  <tr><td>ORDER_NO:123456</td><td>TSLA</td><td>受付中</td></tr>
+  <tr><th>受付日時 (執行日)</th><th>銘柄</th><th>売買</th><th>口座区分</th><th>金額・株数</th><th>ステータス</th><th>備考</th></tr>
+  <tr><td>2026/06/05 09:00</td><td>TSLA</td><td>買付</td><td>特定</td><td>¥10,000</td><td>受付中 ORDER_NO:123456</td><td>—</td></tr>
 </table>
 """
 
 
-def test_parse_open_orders():
+def test_parse_open_orders_canonical_columns():
     orders = parsers.parse_open_orders(_PREORDER_HTML)
-    assert len(orders) == 1 and orders[0]["order_id"] == "123456"
+    assert len(orders) == 1
+    o = orders[0]
+    assert o["symbol"] == "TSLA" and o["side"] == "買付"
+    assert o["account_type"] == "特定" and o["size"] == "¥10,000"
+    assert o["status"].startswith("受付中")
+    assert o["datetime"].startswith("2026/06/05")
+    assert o["order_id"] == "123456"
 
 
 def test_parse_open_orders_header_only_is_empty():

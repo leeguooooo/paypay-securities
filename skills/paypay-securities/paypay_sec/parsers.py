@@ -316,13 +316,31 @@ def parse_history_series(html: str) -> dict:
     }
 
 
-def parse_open_orders(html: str) -> list[dict]:
-    """未約定 / 予約注文 rows from /trade/preorder/ (table.d_table).
+# /trade/preorder/ table columns (headers verified 2026-06-04):
+#   受付日時 (執行日) | 銘柄 | 売買 | 口座区分 | 金額・株数 | ステータス | 備考
+# A header substring → canonical key (substring match survives the parenthetical
+# in "受付日時 (執行日)" and minor wording tweaks).
+_OPEN_ORDER_COLS = (
+    ("受付日時", "datetime"), ("銘柄", "symbol"), ("売買", "side"),
+    ("口座区分", "account_type"), ("金額", "size"), ("株数", "size"),
+    ("ステータス", "status"), ("状態", "status"), ("備考", "note"),
+)
 
-    Returns [] when there are no pending orders. Each row is a dict keyed by the
-    table header text, plus a best-effort canonical ``order_id`` pulled from a
-    cancel link / data-attr / hidden input. The exact column→field mapping is
-    finalized against a live pending order (none existed at capture time)."""
+
+def _open_order_key(header: str, idx: int) -> str:
+    for needle, key in _OPEN_ORDER_COLS:
+        if needle in header:
+            return key
+    return header or f"col{idx}"
+
+
+def parse_open_orders(html: str) -> list[dict]:
+    """予約注文 rows from /trade/preorder/ (table.d_table).
+
+    Returns [] when there are no pending orders. Each row is keyed by canonical
+    field (symbol/side/account_type/size/status/datetime/note) mapped from the
+    Japanese column headers, plus a best-effort ``order_id`` pulled from a cancel
+    link / data-attr / hidden input (finalized against a live pending order)."""
     soup = BeautifulSoup(html, "lxml")
     table = soup.select_one("table.d_table")
     if not table:
@@ -330,14 +348,16 @@ def parse_open_orders(html: str) -> list[dict]:
     rows = table.select("tr")
     if len(rows) <= 1:
         return []
-    headers = [c.get_text(strip=True) for c in rows[0].select("th, td")]
+    headers = [c.get_text(" ", strip=True) for c in rows[0].select("th, td")]
     out: list[dict] = []
     for tr in rows[1:]:
         cells = tr.select("td")
         if not cells:
             continue
-        rec = {(headers[i] if i < len(headers) and headers[i] else f"col{i}"):
-               td.get_text(strip=True) for i, td in enumerate(cells)}
+        rec = {}
+        for i, td in enumerate(cells):
+            header = headers[i] if i < len(headers) else ""
+            rec[_open_order_key(header, i)] = td.get_text(" ", strip=True)
         m = re.search(r"(?:ORDER_NO|order_no|orderNo)[\"'=:\s]+(\d+)", str(tr))
         if not m:
             a = tr.find("a", href=re.compile(r"\d"))
