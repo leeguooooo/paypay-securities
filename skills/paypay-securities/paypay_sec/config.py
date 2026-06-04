@@ -72,6 +72,32 @@ class Settings:
         return "SMS_AUTH_STRING" in self.cookie
 
     @classmethod
+    def from_account_file(cls, account: str | None) -> "Settings":
+        """Load an account STRICTLY from its own .env file (not os.environ). Used for
+        `-a <name>` and `-a all` so one account's creds can't bleed into another via
+        the process-wide os.environ (load_dotenv uses setdefault, which would otherwise
+        let account #1's PAYPAY_* values stick for account #2 in the same process)."""
+        path = env_file_for(account)
+        if not path:
+            where = (f"~/.paypay-sec/{account}.env" if account not in (None, DEFAULT_ACCOUNT)
+                     else "~/.paypay-sec/.env")
+            raise RuntimeError(f"no credential file for account '{account}' ({where})")
+        d = {}
+        for raw in path.read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, _, v = line.partition("=")
+            d[k.strip()] = v.strip().strip('"').strip("'")
+        member_id, password = d.get("PAYPAY_MEMBER_ID", "").strip(), d.get("PAYPAY_PASSWORD", "").strip()
+        if not member_id or not password:
+            raise RuntimeError(f"account '{account}' {path} is missing PAYPAY_MEMBER_ID / PAYPAY_PASSWORD")
+        return cls(member_id=member_id, password=password,
+                   cookie=d.get("PAYPAY_COOKIE", "").strip(),
+                   uuid=d.get("PAYPAY_UUID", "uuid_pc").strip() or "uuid_pc",
+                   account=account or DEFAULT_ACCOUNT)
+
+    @classmethod
     def from_env(cls, account: str | None = None) -> "Settings":
         account = account or os.environ.get("PAYPAY_ACCOUNT") or DEFAULT_ACCOUNT
         load_dotenv(account)

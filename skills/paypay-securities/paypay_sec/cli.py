@@ -440,6 +440,7 @@ def cmd_review(client: PayPayClient, args) -> int:
         if p.get("xirr") is not None:
             an = "" if p.get("fetched_all") else "  ※--allで全入金取得すると正確"
             print(f"     資金加重収益率 (XIRR 年率): {p['xirr'] * 100:+.1f}%{an}")
+            print("       ※年率換算。様本期間が短い間は変動が大きく出ます(長期収益力ではない)")
 
         cmark = "" if p.get("cost_reconciles", True) else "  ⚠現金ledger不足(--allで再取得)"
         print(f"\n  測定コスト 合計 {_yen(p['total_cost'])}{cmark}")
@@ -473,7 +474,8 @@ def cmd_review(client: PayPayClient, args) -> int:
               f"  - 総資産 {_yen(p['total_assets'])}(現金 {_yen(p['cash'])}{cstale}) − 純入金 {_yen(p['net_deposit'])}",
               f"  - 実現益から 譲渡益税 {_yen(p['inv_capital_gains_tax'])}・送金手数料 {_yen(p['inv_transfer_fees'])}・為替等を差引いた後",
               *([f"  - 資金加重収益率 (XIRR 年率): **{p['xirr'] * 100:+.1f}%**"
-                 + ("" if p.get("fetched_all") else " (※--allで正確)")] if p.get("xirr") is not None else []),
+                 + ("" if p.get("fetched_all") else " (※--allで正確)")
+                 + " ※年率換算·様本期短だと変動大"] if p.get("xirr") is not None else []),
               f"- 測定コスト合計 **{_yen(p['total_cost'])}**: 現金側手数料/税 {_yen(p['explicit_fees'])}"
               f"(うち 投信譲渡益税 {_yen(p['inv_capital_gains_tax'])}/送金手数料 {_yen(p['inv_transfer_fees'])}"
               f"/証券手数料 {_yen(p['securities_fee_residual'])}) + 推定為替 {_yen(p['fx_spread_cost'])}"]
@@ -542,7 +544,8 @@ def cmd_accounts(client, args) -> int:
         print("configured accounts (* = active for this invocation):")
         for a in p["accounts"]:
             print(f"  {'*' if a == p['active'] else ' '} {a}")
-        print("\nuse:  paypay -a <name> <command>   (or set PAYPAY_ACCOUNT)")
+        print("\nuse:  paypay <command> -a <name>   (or set PAYPAY_ACCOUNT)   "
+              "—  -a all consolidates (total/plans/tax)")
 
     _emit(payload, args.json, render)
     return 0
@@ -912,10 +915,12 @@ def _render_plans(p: dict, fmt: str) -> None:
              f"- 月定投 合計(推計): **{_yen(p['monthly_total_estimate'])}** / 年化 {_yen(p['annualized_total_estimate'])}"]
         for pl in p["plans"]:
             tag = "📅" if pl["active"] else "·"
-            me = _yen(pl["monthly_estimate"]) if pl["monthly_estimate"] is not None else "—"
-            L.append(f"  - {tag} {pl['name']}: 月額(推) {me}"
-                     + (f" / 累計 {_yen(pl['total_invested'])} / {pl['months']}ヶ月" if pl["months"] else "")
-                     + ("" if pl["active"] else " (設定なし/停止?)"))
+            if pl["months"]:
+                body = (f"月額(推) {_yen(pl['monthly_estimate'])} "
+                        f"(推算依据: 累計 {_yen(pl['total_invested'])} / {pl['months']}ヶ月)")
+            else:
+                body = "月額(推) 未推算(尚無買付記録)" + ("" if pl["active"] else " · 設定なし/停止?")
+            L.append(f"  - {tag} {pl['name']}: {body}")
         if p.get("accounts"):
             L.append("- 口座別: " + " / ".join(f"{a}:{_yen(v)}/月" for a, v in p["accounts"].items()))
         L.append(f"\n> {p.get('note','')}")
@@ -925,14 +930,18 @@ def _render_plans(p: dict, fmt: str) -> None:
     print(f"  月定投 合計(推計): {_yen(p['monthly_total_estimate'])}   (年化 {_yen(p['annualized_total_estimate'])})")
     if p.get("accounts"):
         print("  口座別/月: " + " / ".join(f"{a} {_yen(v)}" for a, v in p["accounts"].items()))
-    print("\n  " + _lj("銘柄", 32) + _lj("定投", 6) + _rj("月額(推)", 11)
+    print("\n  " + _lj("銘柄", 32) + _lj("定投", 6) + _rj("月額(推)", 12)
           + _rj("年化", 12) + _rj("月数", 6) + _rj("累計投入", 12))
     for pl in p["plans"]:
-        me = _yen(pl["monthly_estimate"]) if pl["monthly_estimate"] is not None else "—"
+        if pl["months"]:
+            me, an, mo, ti = (_yen(pl["monthly_estimate"]), _yen(pl["annualized"]),
+                              str(pl["months"]), _yen(pl["total_invested"]))
+        else:
+            me, an, mo, ti = "未推算", "—", "0", "—"
         print("  " + _lj(pl["name"] or "", 32) + _lj("📅" if pl["active"] else "—", 6)
-              + _rj(me, 11) + _rj(_yen(pl["annualized"]) if pl["annualized"] else "—", 12)
-              + _rj(str(pl["months"]), 6) + _rj(_yen(pl["total_invested"]), 12))
-    print(f"\n  注: {p.get('note','')}")
+              + _rj(me, 12) + _rj(an, 12) + _rj(mo, 6) + _rj(ti, 12))
+    print("\n  「未推算」= まだ買付記録がなく月額を推算できない(active だが初回約定待ち)")
+    print(f"  注: {p.get('note','')}")
 
 
 def cmd_tax(client: PayPayClient, args) -> int:
@@ -941,7 +950,7 @@ def cmd_tax(client: PayPayClient, args) -> int:
     if getattr(args, "account", None) == "all":
         return _all_accounts(args, _render_tax, _tax_payload, merge=_merge_tax)
     payload = {"as_of": _now_jst_str(), **_tax_payload(client, args),
-               "note": "事実のみ。年間取引報告書の参考値。NISA口座は非課税、特定口座は源泉徴収。"}
+               "note": "参考値のみ・非正式。確定申告は PayPay 証券交付の年間取引報告書で確認。NISA非課税/特定源泉徴収。"}
     _emit_fmt(payload, _fmt(args), lambda p: _render_tax(p, "table"),
               lambda p: _render_tax(p, "lark"))
     return 0
@@ -976,10 +985,12 @@ def _render_tax(p: dict, fmt: str) -> None:
 
 
 def _account_clients(args):
-    """Yield (account_name, client) for every configured profile (for -a all)."""
+    """Yield (account_name, client) for every configured profile (for -a all).
+    Each account is loaded STRICTLY from its own .env (from_account_file) so creds
+    can't cross-contaminate via os.environ within this single process."""
     for a in config.list_accounts():
         try:
-            yield a, PayPayClient(Settings.from_env(a),
+            yield a, PayPayClient(Settings.from_account_file(a),
                                   cache_ttl=0 if getattr(args, "no_cache", False) else None)
         except Exception:  # noqa: BLE001 — skip a profile that won't load
             yield a, None
@@ -1010,11 +1021,12 @@ def _merge_plans(per: dict) -> dict:
         acct_monthly[acct] = pl.get("monthly_total_estimate", 0)
         for r in pl.get("plans", []):
             cur = by_name.setdefault(r["name"], {"name": r["name"], "active": False,
-                                                 "monthly_estimate": 0, "annualized": 0,
+                                                 "monthly_estimate": None, "annualized": None,
                                                  "months": 0, "total_invested": 0, "last_date": None})
             cur["active"] = cur["active"] or r["active"]
-            cur["monthly_estimate"] += r.get("monthly_estimate") or 0
-            cur["annualized"] += r.get("annualized") or 0
+            if r.get("months"):  # only funds with real buys contribute a run-rate
+                cur["monthly_estimate"] = (cur["monthly_estimate"] or 0) + (r.get("monthly_estimate") or 0)
+                cur["annualized"] = (cur["annualized"] or 0) + (r.get("annualized") or 0)
             cur["months"] = max(cur["months"], r.get("months") or 0)
             cur["total_invested"] += r.get("total_invested") or 0
     plans = sorted(by_name.values(), key=lambda x: -(x["total_invested"] or 0))
@@ -1033,7 +1045,7 @@ def _merge_tax(per: dict) -> dict:
             for k in ("sec_sell", "inv_sell", "capital_gains_tax", "distributions"):
                 y[k] += r.get(k, 0)
     return {"tax_years": [years[y] for y in sorted(years)],
-            "note": "全口座合算。年間取引報告書の参考値。事実のみ。"}
+            "note": "全口座合算・参考値のみ・非正式。確定申告は PayPay 証券交付の年間取引報告書で確認。"}
 
 
 def _total_payload(client: PayPayClient, args) -> dict:
@@ -1780,7 +1792,13 @@ def main(argv=None) -> int:
             return 2
         return args.func(None, args)
     try:
-        settings = Settings.from_env(getattr(args, "account", None))  # also loads .env
+        acct = getattr(args, "account", None)
+        # A named account (-a <name>) is loaded from ITS file so a shell-exported or
+        # previously-loaded default PAYPAY_* can't bleed in; the default account keeps
+        # the os.environ path (dev-friendly: PAYPAY_ENV / ./.env overrides).
+        settings = (Settings.from_account_file(acct)
+                    if acct and acct != config.DEFAULT_ACCOUNT
+                    else Settings.from_env(acct))
         if args.func in _TRADING_CMDS and not _trading_enabled():
             print("error: trading commands (buy/sell/orders/cancel) are DISABLED.\n"
                   "       Set PAYPAY_TRADING_ENABLED=1 in ~/.paypay-sec/.env (or export it) "

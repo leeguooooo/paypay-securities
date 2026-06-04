@@ -32,6 +32,9 @@ _UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
        "(KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36")
 _DOMAIN = "www.paypay-sec.co.jp"
 SESSION_FILE = HOME / "session.json"   # default account (back-compat)
+# Bump when cached response SHAPE changes (or to force-invalidate stale caches on a
+# skill update). Mixed into every cache key alongside the account name.
+CACHE_VERSION = "2"
 _BRAND_HREF_RE = re.compile(r"/trade/brand/(\d+)/0")
 _BRAND_LOGO_RE = re.compile(r"304x304_([a-z0-9._-]+)\.(?:png|jpe?g)", re.I)
 
@@ -89,7 +92,11 @@ class PayPayClient:
         used to avoid caching empty/throttled responses."""
         if self._cache_ttl <= 0:
             return producer()
-        fp = self._cache_dir / (hashlib.sha1(key.encode("utf-8")).hexdigest() + ".json")
+        # Namespace the cache key by CACHE_VERSION + account, so (a) a skill update
+        # bumping CACHE_VERSION invalidates stale-shaped entries, and (b) one account's
+        # cache can never satisfy another's lookup even if dirs were ever shared.
+        full_key = f"{CACHE_VERSION}|{self.settings.account}|{key}"
+        fp = self._cache_dir / (hashlib.sha1(full_key.encode("utf-8")).hexdigest() + ".json")
         try:
             blob = json.loads(fp.read_text(encoding="utf-8"))
             if time.time() - blob["ts"] <= self._cache_ttl:
