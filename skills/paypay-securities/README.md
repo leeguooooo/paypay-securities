@@ -60,6 +60,7 @@ paypay trades-summary              # per-brand buy/sell/net/realized P&L
 paypay snapshot save               # save a dated account snapshot (your own time series)
 paypay snapshot list               # list saved snapshots
 paypay diff [--days 7]             # diff a live read vs the latest (or N-days-old) snapshot
+bin/snapshot-cron.sh install       # schedule a daily read-only snapshot + Monday weekly diff (macOS launchd)
 ```
 
 ### Useful flags (place after the subcommand)
@@ -78,11 +79,13 @@ a feed that drops out is flagged loudly, never silently treated as ¥0.
 
 ## Ordering (米国株 buy / sell / cancel)
 
-Orders are **dry-run by default** (they run the real 見積/preview and place nothing).
-A live order needs an explicit human `--execute`, which then prompts for a typed
-confirmation **and** the account TRADE_PASSWORD. See [Safety](#safety) and `SKILL.md`.
+**Trading is OFF by default** — `buy`/`sell`/`orders`/`cancel` refuse to run unless you
+set `PAYPAY_TRADING_ENABLED=1` (in `~/.paypay-sec/.env` or the shell). Even then orders
+are **dry-run by default**; a live order needs an explicit human `--execute`, which then
+prompts for a typed confirmation **and** the account TRADE_PASSWORD. See [Safety](#safety).
 
 ```bash
+export PAYPAY_TRADING_ENABLED=1              # enable the trading commands first
 paypay buy TSLA --amount 10000               # DRY-RUN (preview only)
 paypay buy TSLA --amount 10000 --execute     # LIVE — human only; prompts for TRADE_PASSWORD
 paypay orders                                # list pending orders
@@ -95,12 +98,13 @@ paypay cancel <ORDER_ID> --execute           # cancel (human only)
   (totals, realized P&L by moving-average cost). **No buy/sell advice, no risk
   verdicts, no judgments** — `paypay risk` reports *structure* (weights,
   concentration), not opinions.
-- **Order placement is human-gated:** dry-run by default; `--execute` is the only
-  path to a live order and requires a typed confirmation **and** the TRADE_PASSWORD
-  at an interactive prompt. The agent never enters that password and is not built
-  to submit a live order unattended. Per-order yen caps, an allow-listed market,
-  and a daily order-count cap are enforced (`guards.py`); every attempt is logged
-  (`audit.py`); confirm tokens are single-use and writes never auto-retry.
+- **Order placement is human-gated:** disabled unless `PAYPAY_TRADING_ENABLED=1`;
+  dry-run by default; `--execute` is the only path to a live order and requires a
+  typed confirmation **and** the TRADE_PASSWORD at an interactive prompt. The agent
+  never enters that password and is not built to submit a live order unattended.
+  Per-order yen caps, an allow-listed market, and a daily order-count cap are
+  enforced (`guards.py`); every attempt is logged (`audit.py`); confirm tokens are
+  single-use and writes never auto-retry.
 
 Automated access to a brokerage may conflict with PayPay証券's terms of service —
 use on your own account at your own risk.

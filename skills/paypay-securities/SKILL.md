@@ -91,13 +91,18 @@ uv run paypay cache-clear           # clear the local response cache
 ```
 
 **`risk` is facts-only.** It reports portfolio *structure* — total, cash %, largest
-position %, top-1/3/5 concentration, USD (米国株) %, and 種類/口座 splits — and gives
-**no risk verdict and no buy/sell advice**, same boundary as every other command.
+position %, top-1/3/5 concentration, 種類/口座 splits, and **two distinct currency/region
+measures**: 米国 *計価*(証券, USD-quoted) vs 米国株 *底層暴露* (US-underlying, which also
+counts JPY-priced S&P500/NASDAQ etc. 投信). It gives **no risk verdict and no buy/sell
+advice**, same boundary as every other command.
 
 **`snapshot` / `diff`** give the account its own long-term series:
 `snapshot save` writes `<state_dir>/snapshots/<ts>.json` (assets, cash, holdings,
 realized, deposits); `diff` compares a live read against the latest snapshot (or
 `--days N` ago) so you get "this week's change" — asset/holdings/deposit/realized deltas.
+Automate it: `bin/snapshot-cron.sh install` schedules a daily (07:30 local, trading
+days) read-only snapshot + a Monday `diff --days 7`, logged to
+`~/.paypay-sec/snapshot-cron.log` (`uninstall` / `status` too).
 
 Any command takes `-a <name>` to target a non-default account, and
 `--format table|lark|json`. **`--format lark`** emits Feishu/Lark-friendly
@@ -117,6 +122,11 @@ rules, NO buy/sell advice. Order placement is a separate, explicit flow ↓ — 
 it too gives no advice: it places exactly the order *you* specify, nothing more.
 
 ## Ordering (下单 — 米国株 buy/sell/cancel)
+
+**Trading is OFF by default.** `buy`/`sell`/`orders`/`cancel` refuse to run unless
+the human sets **`PAYPAY_TRADING_ENABLED=1`** (in `~/.paypay-sec/.env` or the shell).
+A read-only / 复盘 invocation can't place an order even by accident — this capability
+gate sits on top of the dry-run + confirm + TRADE_PASSWORD wall below.
 
 PayPay証券 has no order API; this drives the same un-pinned web order endpoints
 the site uses (`/trade/brand/ajax_*_popup` → `ajax_*_complete`). **The agent never
@@ -248,8 +258,11 @@ redesign breaks parsing — fix only `parsers.py` (all selectors live there).
 
 The read commands are read-only. The order commands place trades, behind a
 human-in-the-loop wall:
-- **Dry-run is the default.** A bare `buy`/`sell` only runs the 見積/preview; it
-  places nothing. A live order requires an explicit `--execute`.
+- **Trading is disabled by default.** `buy`/`sell`/`orders`/`cancel` refuse to run
+  unless `PAYPAY_TRADING_ENABLED=1` is set — a read-only/复盘 session has no order
+  capability at all.
+- **Dry-run is the default.** Even when enabled, a bare `buy`/`sell` only runs the
+  見積/preview; it places nothing. A live order requires an explicit `--execute`.
 - **`--execute` is human-only.** It demands a typed confirmation phrase *and* the
   account TRADE_PASSWORD at an interactive prompt. The agent never enters that
   password and is not built to run a live submit unattended.

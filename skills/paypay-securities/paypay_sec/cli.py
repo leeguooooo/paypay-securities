@@ -52,6 +52,17 @@ def _pages(args, default: int) -> int:
     return getattr(args, "pages", default)
 
 
+def _measured_cost(explicit_fees, fx_cost, inv_tax, inv_transfer) -> dict:
+    """Measured trading cost. 投信譲渡益税 + 送金手数料 already settle in the 証券 cash
+    ledger (so they're inside explicit_fees) — they are a BREAKDOWN, not extra cost.
+    The only cost outside the ledger is the reconstructed FX spread. residual<0 means
+    the cash-ledger window missed some 投信 rows (→ --all)."""
+    ef, fx = explicit_fees or 0, fx_cost or 0
+    residual = ef - (inv_tax or 0) - (inv_transfer or 0)
+    return {"total_cost": ef + fx, "securities_fee_residual": residual,
+            "cost_reconciles": residual >= 0}
+
+
 def _basis_hint(reconciles: bool, fetched_all: bool) -> str:
     """Warn (don't hide) when realized P&L rests on an incomplete cost basis —
     i.e. a sell with no matching buy in the fetched window. Points at --all."""
@@ -341,7 +352,14 @@ def cmd_review(client: PayPayClient, args) -> int:
     realized_sec, realized_inv = agg["realized_pl"], inv["realized_pl"]
     realized_total = realized_sec + realized_inv
     inv_tax, inv_transfer = inv["capital_gains_tax"], inv["transfer_fees"]
-    total_cost = agg["explicit_fees"] + fx_cost + inv_tax + inv_transfer
+    # 投信譲渡益税 + 送金手数料 settle to the 証券 CASH ledger (特定口座 withholding /
+    # account-wide fees), so they are ALREADY inside explicit_fees — adding them
+    # again double-counts (verified on live data: explicit_fees == inv_tax+inv_transfer
+    # for a 0-commission account). Treat them as a BREAKDOWN of the cash-ledger cost,
+    # not extra cost. The only cost NOT in the ledger is the reconstructed FX spread.
+    _mc = _measured_cost(agg["explicit_fees"], fx_cost, inv_tax, inv_transfer)
+    total_cost, sec_fee_residual, cost_reconciles = (
+        _mc["total_cost"], _mc["securities_fee_residual"], _mc["cost_reconciles"])
 
     # Bottom-line total return = total assets − net deposits (mark-to-market, after
     # all costs, since inception). Folding in 投信 realized shrinks the residual to
@@ -364,7 +382,8 @@ def cmd_review(client: PayPayClient, args) -> int:
         "sec_reconciles": agg["reconciles"], "fetched_all": getattr(args, "fetch_all", False),
         "explicit_fees": agg["explicit_fees"], "fx_spread_cost": fx_cost,
         "inv_capital_gains_tax": inv_tax, "inv_transfer_fees": inv_transfer,
-        "total_cost": total_cost,
+        "total_cost": total_cost, "securities_fee_residual": sec_fee_residual,
+        "cost_reconciles": cost_reconciles,
         "deposits": agg["deposits"], "withdrawals": agg["withdrawals"],
         "net_deposit": net_deposit, "total_return": total_return,
         "ledger_residual": residual,
@@ -398,8 +417,12 @@ def cmd_review(client: PayPayClient, args) -> int:
         print(f"     総資産 {_yen(p['total_assets'])}(現金 {_yen(p['cash'])}{cstale}) − 純入金 {_yen(p['net_deposit'])}")
         print(f"     = 実現益から 譲渡益税 {_yen(p['inv_capital_gains_tax'])}・送金手数料 {_yen(p['inv_transfer_fees'])}・為替等を差引いた後の値")
 
-        print(f"\n  取引コスト {_yen(p['total_cost'])}  (証券手数料 {_yen(p['explicit_fees'])} + 為替 {_yen(p['fx_spread_cost'])}"
-              f" + 投信譲渡益税 {_yen(p['inv_capital_gains_tax'])} + 送金手数料 {_yen(p['inv_transfer_fees'])})")
+        cmark = "" if p.get("cost_reconciles", True) else "  ⚠現金ledger不足(--allで再取得)"
+        print(f"\n  測定コスト 合計 {_yen(p['total_cost'])}{cmark}")
+        print(f"     現金側手数料/税 {_yen(p['explicit_fees'])}"
+              f"  (うち 投信譲渡益税 {_yen(p['inv_capital_gains_tax'])} / 送金手数料 {_yen(p['inv_transfer_fees'])}"
+              f" / 証券手数料 {_yen(p['securities_fee_residual'])})")
+        print(f"     推定為替コスト  {_yen(p['fx_spread_cost'])}  (約定価格・為替レートに内包)")
         fl = []
         _freshness_block(p, fl)
         if fl:
@@ -425,8 +448,9 @@ def cmd_review(client: PayPayClient, args) -> int:
               f"**③ 整体盈亏** 通算 = 総資産 − 純入金 ★最終: **{_signed_yen(p['total_return'])}**",
               f"  - 総資産 {_yen(p['total_assets'])}(現金 {_yen(p['cash'])}{cstale}) − 純入金 {_yen(p['net_deposit'])}",
               f"  - 実現益から 譲渡益税 {_yen(p['inv_capital_gains_tax'])}・送金手数料 {_yen(p['inv_transfer_fees'])}・為替等を差引いた後",
-              f"- 取引コスト {_yen(p['total_cost'])}(証券手数料 {_yen(p['explicit_fees'])}+為替 {_yen(p['fx_spread_cost'])}"
-              f"+投信譲渡益税 {_yen(p['inv_capital_gains_tax'])}+送金手数料 {_yen(p['inv_transfer_fees'])})"]
+              f"- 測定コスト合計 **{_yen(p['total_cost'])}**: 現金側手数料/税 {_yen(p['explicit_fees'])}"
+              f"(うち 投信譲渡益税 {_yen(p['inv_capital_gains_tax'])}/送金手数料 {_yen(p['inv_transfer_fees'])}"
+              f"/証券手数料 {_yen(p['securities_fee_residual'])}) + 推定為替 {_yen(p['fx_spread_cost'])}"]
         _freshness_block(p, L)
         L.append(f"\n> {p['note']}")
         print("\n".join(L))
@@ -829,7 +853,21 @@ def cmd_total(client: PayPayClient, args) -> int:
             for line in fl:
                 print(line)
 
-    _emit(payload, args.json, render)
+    def lark(p):
+        cstale = "" if p.get("cash_fresh", True) else " ⚠stale"
+        L = ["**PayPay証券 総資産**", "",
+             f"- 証券(株+ETF): {_yen(p['securities_total'])}",
+             f"- 投信(基金): {_yen(p['invtrust_valuation'])}",
+             f"- 現金: {_yen(p['cash'])}{cstale}",
+             f"- **総資産 合計: {_yen(p['grand_total'])}**",
+             f"  (投資資産 {_yen(p['invested_total'])} / 投信 売却申込中 {_yen(p['invtrust_sell_pending'])})"]
+        if p["errors"]:
+            L.append(f"- ⚠ 一部市場の取得に失敗: {', '.join(p['errors'])}")
+        _freshness_block(p, L)
+        L.append("\n> CFD(別ログイン)は未集計")
+        print("\n".join(L))
+
+    _emit_fmt(payload, _fmt(args), render, lark)
     return 0
 
 
@@ -893,6 +931,20 @@ def _kind_of(row: dict) -> str:
     return "個股"
 
 
+# Fund-name hints that a JPY-priced 投信 actually holds US equity underneath, so its
+# *underlying* exposure is American even though its *quotation currency* is JPY.
+_US_FUND_HINTS = ("S&P", "SP500", "NASDAQ", "ナスダック", "米国", "全米", "アメリカ", "ダウ", "DOW")
+
+
+def _us_underlying(row: dict) -> bool:
+    """True when the holding's UNDERLYING is US equity (vs its quotation currency).
+    PayPay 米国株 (証券) are US-listed; a 投信 is judged by name (best-effort)."""
+    if row.get("category") == "証券":
+        return True
+    name = (row.get("name") or "").upper()
+    return any(h.upper() in name for h in _US_FUND_HINTS)
+
+
 def _risk_payload(rows: list, cash, sell_pending, sources: dict) -> dict:
     """Pure structural-exposure math over consolidated holdings (FACTS ONLY).
     Separated from cmd_risk so it's unit-testable without network."""
@@ -913,7 +965,8 @@ def _risk_payload(rows: list, cash, sell_pending, sources: dict) -> dict:
     if cash:
         by_kind["現金"] = by_kind.get("現金", 0) + cash
         by_cat["現金"] = by_cat.get("現金", 0) + cash
-    usd_assets = sum(p["valuation"] for p in positions if p["category"] == "証券")  # US-listed
+    usd_assets = sum(r.get("valuation") or 0 for r in rows if r.get("category") == "証券")  # US-listed (JPY→USD quote)
+    us_underlying = sum(r.get("valuation") or 0 for r in rows if _us_underlying(r))  # incl. S&P500等 投信
     largest = positions[0] if positions else None
     return {
         "as_of": _now_jst_str(),
@@ -925,6 +978,7 @@ def _risk_payload(rows: list, cash, sell_pending, sources: dict) -> dict:
         "top3_pct": round(sum(p["weight_pct"] for p in positions[:3]), 1),
         "top5_pct": round(sum(p["weight_pct"] for p in positions[:5]), 1),
         "usd_asset_pct": pct(usd_assets),
+        "us_underlying_pct": pct(us_underlying),
         "by_kind_pct": {k: round(100.0 * v / total, 1) for k, v in by_kind.items()} if total else {},
         "by_category_pct": {k: round(100.0 * v / total, 1) for k, v in by_cat.items()} if total else {},
         "positions": positions,
@@ -946,7 +1000,8 @@ def cmd_risk(client: PayPayClient, args) -> int:
         lg = p["largest_position"]
         print(f"  最大单一持仓 : {lg['name'] if lg else '—'} {lg['weight_pct'] if lg else 0}%")
         print(f"  集中度       : top1 {p['top1_pct']}% / top3 {p['top3_pct']}% / top5 {p['top5_pct']}%")
-        print(f"  米国株(USD建) : {p['usd_asset_pct']}%")
+        print(f"  米国 計価(証券) : {p['usd_asset_pct']}%   (USD建で値付け)")
+        print(f"  米国株 底層暴露 : {p['us_underlying_pct']}%   (S&P500等の投信も含む実質米株)")
         print(f"  种类构成     : " + " / ".join(f"{k} {v}%" for k, v in p["by_kind_pct"].items()))
         print(f"  账户构成     : " + " / ".join(f"{k} {v}%" for k, v in p["by_category_pct"].items()))
         print("\n  持仓ウェイト:")
@@ -971,7 +1026,7 @@ def cmd_risk(client: PayPayClient, args) -> int:
              f"- 総資産 **{_yen(p['grand_total'])}** (投資 {_yen(p['invested_total'])} + 現金 {_yen(p['cash'])} = {p['cash_pct']}%)",
              f"- 最大单一持仓: **{lg['name'] if lg else '—'} {lg['weight_pct'] if lg else 0}%**",
              f"- 集中度: top1 {p['top1_pct']}% / top3 {p['top3_pct']}% / top5 {p['top5_pct']}%",
-             f"- 米国株(USD建): {p['usd_asset_pct']}%",
+             f"- 米国 計価(証券): {p['usd_asset_pct']}% / 米国株 底層暴露: **{p['us_underlying_pct']}%** (S&P500等の投信も実質米株)",
              f"- 种类构成: " + " / ".join(f"{k} {v}%" for k, v in p["by_kind_pct"].items()),
              f"- 账户构成: " + " / ".join(f"{k} {v}%" for k, v in p["by_category_pct"].items()),
              "- 持仓ウェイト:"]
@@ -1035,7 +1090,22 @@ def cmd_assets(client: PayPayClient, args) -> int:
             for line in fl:
                 print(line)
 
-    _emit(payload, args.json, render)
+    def lark(p):
+        denom = p["grand_total"] or 0
+        L = ["**PayPay証券 资产总览**", "",
+             f"- 総資産: **{_yen(p['grand_total'])}** (投資 {_yen(p['invested_total'])} + 現金 {_yen(p['cash'])})"]
+        for r in sorted(p["holdings"], key=lambda x: -(x["valuation"] or 0)):
+            wt = f"{100 * (r['valuation'] or 0) / denom:.1f}%" if denom else "—"
+            L.append(f"  - [{r['category']}] {r['name']}: {_yen(r['valuation'])} ({wt}) {_signed_yen(r['unrealized_pl'])}")
+        if p["cash"]:
+            cw = f"{100 * p['cash'] / denom:.1f}%" if denom else "—"
+            L.append(f"  - [現金] buyable: {_yen(p['cash'])} ({cw})")
+        L.append(f"- 投信 売却申込中: {_yen(p['invtrust_sell_pending'])}")
+        _freshness_block(p, L)
+        L.append("\n> CFD(別ログイン)は未集計")
+        print("\n".join(L))
+
+    _emit_fmt(payload, _fmt(args), render, lark)
     return 0
 
 
@@ -1351,6 +1421,17 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+# Trading commands are OFF by default — a read-only/复盘 invocation should not even
+# be able to place an order. They run only when the human sets PAYPAY_TRADING_ENABLED=1
+# (in ~/.paypay-sec/.env or the shell). This is a capability gate on top of the
+# existing dry-run-default + typed-confirm + TRADE_PASSWORD wall.
+_TRADING_CMDS = {cmd_buy, cmd_sell, cmd_orders, cmd_cancel}
+
+
+def _trading_enabled() -> bool:
+    return os.environ.get("PAYPAY_TRADING_ENABLED", "").strip() == "1"
+
+
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
     global _LANG
@@ -1361,7 +1442,12 @@ def main(argv=None) -> int:
     if args.func is cmd_doctor:
         return cmd_doctor(None, args)
     try:
-        settings = Settings.from_env(getattr(args, "account", None))
+        settings = Settings.from_env(getattr(args, "account", None))  # also loads .env
+        if args.func in _TRADING_CMDS and not _trading_enabled():
+            print("error: trading commands (buy/sell/orders/cancel) are DISABLED.\n"
+                  "       Set PAYPAY_TRADING_ENABLED=1 in ~/.paypay-sec/.env (or export it) "
+                  "to enable.\n       Read-only / 复盘 commands need nothing.", file=sys.stderr)
+            return 2
         client = PayPayClient(settings,
                               cache_ttl=0 if getattr(args, "no_cache", False) else None)
         return args.func(client, args)

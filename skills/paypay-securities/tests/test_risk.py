@@ -18,6 +18,16 @@ def test_kind_classification():
     assert cli._kind_of({"category": "投信", "name": "whatever"}) == "投信"
 
 
+def test_us_underlying_classification():
+    # US-listed 証券 are always US underlying
+    assert cli._us_underlying({"category": "証券", "name": "TSLA"}) is True
+    # a JPY-priced 投信 with S&P500 in the name is US underlying despite JPY quotation
+    assert cli._us_underlying({"category": "投信", "name": "eMAXIS Slim 米国株式(S&P500)"}) is True
+    assert cli._us_underlying({"category": "投信", "name": "ナスダック100"}) is True
+    # a JP-equity fund is NOT US underlying
+    assert cli._us_underlying({"category": "投信", "name": "eMAXIS Slim 国内株式(TOPIX)"}) is False
+
+
 def test_risk_weights_and_concentration():
     cash = 0
     p = cli._risk_payload(_rows(), cash, sell_pending=None, sources={"securities": "ok"})
@@ -28,8 +38,10 @@ def test_risk_weights_and_concentration():
     assert p["largest_position"]["weight_pct"] == 40.0
     assert p["top1_pct"] == 40.0
     assert p["top3_pct"] == 100.0
-    # 証券 (USD-listed) = 300k / 500k = 60%
+    # 証券 (USD-listed, quotation) = 300k / 500k = 60%
     assert p["usd_asset_pct"] == 60.0
+    # US underlying = 証券 300k + S&P500 fund 200k = 500k → 100% (the point of #5)
+    assert p["us_underlying_pct"] == 100.0
     # category split
     assert p["by_category_pct"]["証券"] == 60.0
     assert p["by_category_pct"]["投信"] == 40.0
