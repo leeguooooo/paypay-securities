@@ -56,7 +56,8 @@ paypay review                      # 復盘: 持仓盈亏 / 累計実現 / 整�
 paypay risk [--accounts]           # 持仓结构: weights, concentration, FX/category/口座 split (facts only)
 paypay plans                       # 定投/つみたて: active recurring-buy funds + monthly run-rate (scans full history; --fast = quick)
 paypay tax                         # per-year tax view: 売却 / 譲渡益税 / 分配金 (full history by default; --fast = quick)
-paypay total -a all                # consolidate every account profile (also: plans -a all, tax -a all)
+paypay total -a all                # consolidate every account profile (also: assets / risk / plans / tax -a all)
+paypay risk -a all                 # whole-household concentration & US-underlying exposure (both accounts)
 paypay total                       # aggregate invested assets
 paypay trades [--pages N | --all]  # transaction ledger + running cash
 paypay invtrust-history            # 投信 ledger + moving-average realized P&L

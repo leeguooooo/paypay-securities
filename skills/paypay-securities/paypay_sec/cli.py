@@ -1295,51 +1295,62 @@ def _account_split(rows, invtrust_lots, cash, total) -> dict:
     return {k: round(100.0 * v / total, 1) for k, v in by.items()} if total else {}
 
 
-def cmd_risk(client: PayPayClient, args) -> int:
-    """Structural exposure of the account — FACTS ONLY (weights, concentration,
-    category/currency split). No risk verdicts, no buy/sell advice."""
+def _risk_account_raw(client: PayPayClient, args) -> dict:
+    """Per-account materials for risk (used by -a all merge)."""
     rows, cash, cash_fresh, sell_pending, sources = _consolidated_holdings(client)
-    payload = _risk_payload(rows, cash, sell_pending, sources)
-    # --accounts: add the 特定/NISA 口座 breakdown (needs the heavier 投信 ledger).
+    raw = {"rows": rows, "cash": cash, "sell_pending": sell_pending, "sources": sources}
     if getattr(args, "accounts", False):
         try:
             lots, _, _ = _invtrust_lots(client, _pages(args, 30))
-        except Exception:  # noqa: BLE001 — degrade: 証券 split only
-            lots = []
-            payload["sources"] = {**(payload.get("sources") or {}), "invledger": "failed"}
-        payload["by_account_pct"] = _account_split(rows, lots, cash, payload["grand_total"])
+        except Exception:  # noqa: BLE001
+            lots = None
+        raw["lots"] = lots if lots is not None else []
+    return raw
 
-    def table(p):
-        print(f"PayPay証券 — 持仓结构 / exposure (事実のみ)\n")
-        print(f"  総資産 {_yen(p['grand_total'])}  (投資 {_yen(p['invested_total'])} + 現金 {_yen(p['cash'])} = {p['cash_pct']}%)")
-        lg = p["largest_position"]
-        print(f"  最大单一持仓 : {lg['name'] if lg else '—'} {lg['weight_pct'] if lg else 0}%")
-        print(f"  集中度       : top1 {p['top1_pct']}% / top3 {p['top3_pct']}% / top5 {p['top5_pct']}%")
-        print(f"  米国 計価(証券) : {p['usd_asset_pct']}%   (USD建で値付け)")
-        print(f"  米国株 底層暴露 : {p['us_underlying_pct']}%   (S&P500等の投信も含む実質米株)")
-        print(f"  种类构成     : " + " / ".join(f"{k} {v}%" for k, v in p["by_kind_pct"].items()))
-        print(f"  账户构成     : " + " / ".join(f"{k} {v}%" for k, v in p["by_category_pct"].items()))
-        if p.get("by_account_pct"):
-            print(f"  口座区分     : " + " / ".join(f"{k} {v}%" for k, v in p["by_account_pct"].items()))
-        print("\n  持仓ウェイト:")
-        print("    " + _lj("NAME", 28) + _lj("种类", 8) + _rj("市值", 12) + _rj("占比", 8))
-        for pos in p["positions"]:
-            print("    " + _lj(pos["name"] or "", 28) + _lj(pos["kind"], 8)
-                  + _rj(_yen(pos["valuation"]), 12) + _rj(f"{pos['weight_pct']}%", 8))
-        if p["cash"]:
-            print("    " + _lj("現金", 28) + _lj("現金", 8)
-                  + _rj(_yen(p["cash"]), 12) + _rj(f"{p['cash_pct']}%", 8))
-        fl = []
-        _freshness_block(p, fl)
-        if fl:
-            print()
-            for line in fl:
-                print(line)
-        print(f"\n  注: {p['note']}")
 
-    def lark(p):
-        lg = p["largest_position"]
-        L = [f"**PayPay証券 持仓结构 (事実のみ)**", "",
+def _build_risk(rows, cash, sell_pending, sources, lots, want_accounts) -> dict:
+    payload = _risk_payload(rows, cash, sell_pending, sources)
+    if want_accounts:
+        payload["by_account_pct"] = _account_split(rows, lots or [], cash, payload["grand_total"])
+    return payload
+
+
+def _merge_risk(per: dict) -> dict:
+    """Combine holdings across accounts (same fund summed) → household concentration."""
+    combined, lots, accts = {}, [], {}
+    cash = sell = 0
+    sources = {}
+    want_accounts = False
+    for acct, raw in per.items():
+        if raw.get("_error"):
+            continue
+        cash += raw.get("cash") or 0
+        sell += raw.get("sell_pending") or 0
+        sources.update(raw.get("sources") or {})
+        if "lots" in raw:
+            want_accounts = True
+            lots += raw.get("lots") or []
+        acct_total = (raw.get("cash") or 0)
+        for r in raw.get("rows", []):
+            acct_total += r.get("valuation") or 0
+            key = (r["name"], r["category"])
+            cur = combined.setdefault(key, {"name": r["name"], "category": r["category"],
+                                            "valuation": 0, "unrealized_pl": 0, "account_types": []})
+            cur["valuation"] += r.get("valuation") or 0
+            cur["unrealized_pl"] = (cur["unrealized_pl"] or 0) + (r.get("unrealized_pl") or 0)
+            cur["account_types"] = sorted(set(cur["account_types"]) | set(r.get("account_types") or []))
+        accts[acct] = acct_total
+    p = _build_risk(list(combined.values()), cash, sell or None, sources, lots, want_accounts)
+    p["accounts"] = accts
+    p["note"] = "全口座合算。" + p["note"]
+    return p
+
+
+def _render_risk(p: dict, fmt: str) -> None:
+    lg = p["largest_position"]
+    allp = "(全口座)" if p.get("accounts") else ""
+    if fmt == "lark":
+        L = [f"**PayPay証券 持仓结构{allp} (事実のみ)**", "",
              f"- 総資産 **{_yen(p['grand_total'])}** (投資 {_yen(p['invested_total'])} + 現金 {_yen(p['cash'])} = {p['cash_pct']}%)",
              f"- 最大单一持仓: **{lg['name'] if lg else '—'} {lg['weight_pct'] if lg else 0}%**",
              f"- 集中度: top1 {p['top1_pct']}% / top3 {p['top3_pct']}% / top5 {p['top5_pct']}%",
@@ -1348,6 +1359,8 @@ def cmd_risk(client: PayPayClient, args) -> int:
              f"- 账户构成: " + " / ".join(f"{k} {v}%" for k, v in p["by_category_pct"].items())]
         if p.get("by_account_pct"):
             L.append("- 口座区分: " + " / ".join(f"{k} {v}%" for k, v in p["by_account_pct"].items()))
+        if p.get("accounts"):
+            L.append("- 口座別総額: " + " / ".join(f"{a} {_yen(v)}" for a, v in p["accounts"].items()))
         L += ["- 持仓ウェイト:"]
         for pos in p["positions"]:
             L.append(f"  - {pos['name']} ({pos['kind']}): {_yen(pos['valuation'])} / {pos['weight_pct']}%")
@@ -1356,71 +1369,114 @@ def cmd_risk(client: PayPayClient, args) -> int:
         _freshness_block(p, L)
         L.append(f"\n> {p['note']}")
         print("\n".join(L))
+        return
+    print(f"PayPay証券 — 持仓结构 / exposure{allp} (事実のみ)\n")
+    print(f"  総資産 {_yen(p['grand_total'])}  (投資 {_yen(p['invested_total'])} + 現金 {_yen(p['cash'])} = {p['cash_pct']}%)")
+    print(f"  最大单一持仓 : {lg['name'] if lg else '—'} {lg['weight_pct'] if lg else 0}%")
+    print(f"  集中度       : top1 {p['top1_pct']}% / top3 {p['top3_pct']}% / top5 {p['top5_pct']}%")
+    print(f"  米国 計価(証券) : {p['usd_asset_pct']}%   (USD建で値付け)")
+    print(f"  米国株 底層暴露 : {p['us_underlying_pct']}%   (S&P500等の投信も含む実質米株)")
+    print(f"  种类构成     : " + " / ".join(f"{k} {v}%" for k, v in p["by_kind_pct"].items()))
+    print(f"  账户构成     : " + " / ".join(f"{k} {v}%" for k, v in p["by_category_pct"].items()))
+    if p.get("by_account_pct"):
+        print(f"  口座区分     : " + " / ".join(f"{k} {v}%" for k, v in p["by_account_pct"].items()))
+    if p.get("accounts"):
+        print(f"  口座別総額   : " + " / ".join(f"{a} {_yen(v)}" for a, v in p["accounts"].items()))
+    print("\n  持仓ウェイト:")
+    print("    " + _lj("NAME", 28) + _lj("种类", 8) + _rj("市值", 12) + _rj("占比", 8))
+    for pos in p["positions"]:
+        print("    " + _lj(pos["name"] or "", 28) + _lj(pos["kind"], 8)
+              + _rj(_yen(pos["valuation"]), 12) + _rj(f"{pos['weight_pct']}%", 8))
+    if p["cash"]:
+        print("    " + _lj("現金", 28) + _lj("現金", 8)
+              + _rj(_yen(p["cash"]), 12) + _rj(f"{p['cash_pct']}%", 8))
+    fl = []
+    _freshness_block(p, fl)
+    if fl:
+        print()
+        for line in fl:
+            print(line)
+    print(f"\n  注: {p['note']}")
 
-    _emit_fmt(payload, _fmt(args), table, lark)
+
+def cmd_risk(client: PayPayClient, args) -> int:
+    """Structural exposure of the account — FACTS ONLY (weights, concentration,
+    category/currency split). No risk verdicts, no buy/sell advice."""
+    if getattr(args, "account", None) == "all":
+        return _all_accounts(args, _render_risk, _risk_account_raw, merge=_merge_risk)
+    raw = _risk_account_raw(client, args)
+    payload = {"as_of": _now_jst_str(),
+               **_build_risk(raw["rows"], raw["cash"], raw["sell_pending"], raw["sources"],
+                             raw.get("lots"), getattr(args, "accounts", False))}
+    _emit_fmt(payload, _fmt(args), lambda p: _render_risk(p, "table"),
+              lambda p: _render_risk(p, "lark"))
     return 0
 
 
-def cmd_assets(client: PayPayClient, args) -> int:
-    """One-shot consolidated view: 証券 + 投信 holdings + securities cash.
-    Independent fetches run concurrently (login is established first)."""
+def _assets_account_raw(client: PayPayClient, args) -> dict:
     rows, cash, cash_fresh, sell_pending, sources = _consolidated_holdings(client)
-    invested = sum(r["valuation"] or 0 for r in rows)
-    grand_total = invested + (cash or 0)
-    payload = {
-        "as_of": _now_jst_str(),
-        "holdings": rows,
-        "invested_total": invested,
-        "cash": cash, "cash_fresh": cash_fresh,
-        "grand_total": grand_total,
-        "invtrust_sell_pending": sell_pending,
-        "sources": sources,
-        "note": "grand_total = invested holdings + 証券 cash balance, matching the "
-                "app's 保有資産 total. CFD (separate login) is not included.",
-    }
+    raw = {"rows": rows, "cash": cash, "cash_fresh": cash_fresh,
+           "sell_pending": sell_pending, "sources": sources}
     if getattr(args, "accounts", False):
         try:
             lots, _, _ = _invtrust_lots(client, _pages(args, 30))
         except Exception:  # noqa: BLE001
-            lots = []
-            payload["sources"] = {**payload["sources"], "invledger": "failed"}
-        payload["by_account_pct"] = _account_split(rows, lots, cash, payload["grand_total"])
+            lots = None
+        raw["lots"] = lots if lots is not None else []
+    return raw
 
-    def render(p):
-        # Weights are over the GRAND TOTAL (incl. cash) to match the app's 資産割合
-        # donut — the app's denominator is 総資産, not just 投資資産.
-        denom = p["grand_total"] or 0
-        print("PayPay証券 — consolidated assets (read-only)\n")
-        print(_lj("CATEGORY", 9) + _lj("NAME", 34) + _rj("VALUATION", 12)
-              + _rj("WEIGHT", 8) + _rj("P&L", 10))
-        print("-" * 73)
-        for r in sorted(p["holdings"], key=lambda x: -(x["valuation"] or 0)):
-            wt = f"{100 * (r['valuation'] or 0) / denom:.1f}%" if denom else "—"
-            print(_lj(r["category"], 9) + _lj(r["name"] or "", 34)
-                  + _rj(_yen(r["valuation"]), 12) + _rj(wt, 8) + _rj(_yen(r["unrealized_pl"]), 10))
-        if p["cash"]:
-            cash_wt = f"{100 * p['cash'] / denom:.1f}%" if denom else "—"
-            print(_lj("現金", 9) + _lj("(buyable cash)", 34)
-                  + _rj(_yen(p["cash"]), 12) + _rj(cash_wt, 8) + _rj("—", 10))
-        print("-" * 73)
-        cstale = "" if p.get("cash_fresh", True) else "  ⚠stale(取得失敗)"
-        print(f"  投資資産 : {_yen(p['invested_total'])}")
-        print(f"  現金     : {_yen(p['cash'])}{cstale}")
-        print(f"  総資産合計: {_yen(p['grand_total'])}")
-        if p.get("by_account_pct"):
-            print("  口座区分 : " + " / ".join(f"{k} {v}%" for k, v in p["by_account_pct"].items()))
-        print(f"\n  投信 売却申込中 (settling): {_yen(p['invtrust_sell_pending'])}")
-        print("  注: CFD(別ログイン)は未集計。")
-        fl = []
-        _freshness_block(p, fl)
-        if fl:
-            print()
-            for line in fl:
-                print(line)
 
-    def lark(p):
-        denom = p["grand_total"] or 0
-        L = ["**PayPay証券 资产总览**", "",
+def _build_assets(rows, cash, cash_fresh, sell_pending, sources, lots, want_accounts, accounts=None) -> dict:
+    invested = sum(r.get("valuation") or 0 for r in rows)
+    p = {"holdings": rows, "invested_total": invested, "cash": cash, "cash_fresh": cash_fresh,
+         "grand_total": invested + (cash or 0), "invtrust_sell_pending": sell_pending,
+         "sources": sources,
+         "note": "grand_total = invested holdings + 証券 cash balance, matching the "
+                 "app's 保有資産 total. CFD (separate login) is not included."}
+    if want_accounts:
+        p["by_account_pct"] = _account_split(rows, lots or [], cash, p["grand_total"])
+    if accounts is not None:
+        p["accounts"] = accounts
+        p["note"] = "全口座合算。" + p["note"]
+    return p
+
+
+def _merge_assets(per: dict) -> dict:
+    combined, lots, accts = {}, [], {}
+    cash = sell = 0
+    sources = {}
+    cash_fresh = True
+    want_accounts = False
+    for acct, raw in per.items():
+        if raw.get("_error"):
+            continue
+        cash += raw.get("cash") or 0
+        sell += raw.get("sell_pending") or 0
+        sources.update(raw.get("sources") or {})
+        cash_fresh = cash_fresh and raw.get("cash_fresh", True)
+        if "lots" in raw:
+            want_accounts = True
+            lots += raw.get("lots") or []
+        acct_total = raw.get("cash") or 0
+        for r in raw.get("rows", []):
+            acct_total += r.get("valuation") or 0
+            key = (r["name"], r["category"])
+            cur = combined.setdefault(key, {"name": r["name"], "category": r["category"],
+                                            "valuation": 0, "unrealized_pl": 0, "account_types": []})
+            cur["valuation"] += r.get("valuation") or 0
+            cur["unrealized_pl"] = (cur["unrealized_pl"] or 0) + (r.get("unrealized_pl") or 0)
+            cur["account_types"] = sorted(set(cur["account_types"]) | set(r.get("account_types") or []))
+        accts[acct] = acct_total
+    return _build_assets(list(combined.values()), cash, cash_fresh, sell or None,
+                         sources, lots, want_accounts, accounts=accts)
+
+
+def _render_assets(p: dict, fmt: str) -> None:
+    # Weights are over the GRAND TOTAL (incl. cash) to match the app's 資産割合 donut.
+    denom = p["grand_total"] or 0
+    allp = "(全口座)" if p.get("accounts") else ""
+    if fmt == "lark":
+        L = [f"**PayPay証券 资产总览{allp}**", "",
              f"- 総資産: **{_yen(p['grand_total'])}** (投資 {_yen(p['invested_total'])} + 現金 {_yen(p['cash'])})"]
         for r in sorted(p["holdings"], key=lambda x: -(x["valuation"] or 0)):
             wt = f"{100 * (r['valuation'] or 0) / denom:.1f}%" if denom else "—"
@@ -1430,12 +1486,53 @@ def cmd_assets(client: PayPayClient, args) -> int:
             L.append(f"  - [現金] buyable: {_yen(p['cash'])} ({cw})")
         if p.get("by_account_pct"):
             L.append("- 口座区分: " + " / ".join(f"{k} {v}%" for k, v in p["by_account_pct"].items()))
+        if p.get("accounts"):
+            L.append("- 口座別総額: " + " / ".join(f"{a} {_yen(v)}" for a, v in p["accounts"].items()))
         L.append(f"- 投信 売却申込中: {_yen(p['invtrust_sell_pending'])}")
         _freshness_block(p, L)
         L.append("\n> CFD(別ログイン)は未集計")
         print("\n".join(L))
+        return
+    print(f"PayPay証券 — consolidated assets{allp} (read-only)\n")
+    print(_lj("CATEGORY", 9) + _lj("NAME", 34) + _rj("VALUATION", 12) + _rj("WEIGHT", 8) + _rj("P&L", 10))
+    print("-" * 73)
+    for r in sorted(p["holdings"], key=lambda x: -(x["valuation"] or 0)):
+        wt = f"{100 * (r['valuation'] or 0) / denom:.1f}%" if denom else "—"
+        print(_lj(r["category"], 9) + _lj(r["name"] or "", 34)
+              + _rj(_yen(r["valuation"]), 12) + _rj(wt, 8) + _rj(_yen(r["unrealized_pl"]), 10))
+    if p["cash"]:
+        cw = f"{100 * p['cash'] / denom:.1f}%" if denom else "—"
+        print(_lj("現金", 9) + _lj("(buyable cash)", 34) + _rj(_yen(p["cash"]), 12) + _rj(cw, 8) + _rj("—", 10))
+    print("-" * 73)
+    cstale = "" if p.get("cash_fresh", True) else "  ⚠stale(取得失敗)"
+    print(f"  投資資産 : {_yen(p['invested_total'])}")
+    print(f"  現金     : {_yen(p['cash'])}{cstale}")
+    print(f"  総資産合計: {_yen(p['grand_total'])}")
+    if p.get("by_account_pct"):
+        print("  口座区分 : " + " / ".join(f"{k} {v}%" for k, v in p["by_account_pct"].items()))
+    if p.get("accounts"):
+        print("  口座別総額: " + " / ".join(f"{a} {_yen(v)}" for a, v in p["accounts"].items()))
+    print(f"\n  投信 売却申込中 (settling): {_yen(p['invtrust_sell_pending'])}")
+    print("  注: CFD(別ログイン)は未集計。")
+    fl = []
+    _freshness_block(p, fl)
+    if fl:
+        print()
+        for line in fl:
+            print(line)
 
-    _emit_fmt(payload, _fmt(args), render, lark)
+
+def cmd_assets(client: PayPayClient, args) -> int:
+    """Consolidated view: 証券 + 投信 holdings + securities cash. `-a all` merges
+    every account (same fund summed) into a household view + per-account totals."""
+    if getattr(args, "account", None) == "all":
+        return _all_accounts(args, _render_assets, _assets_account_raw, merge=_merge_assets)
+    raw = _assets_account_raw(client, args)
+    payload = {"as_of": _now_jst_str(),
+               **_build_assets(raw["rows"], raw["cash"], raw["cash_fresh"], raw["sell_pending"],
+                               raw["sources"], raw.get("lots"), getattr(args, "accounts", False))}
+    _emit_fmt(payload, _fmt(args), lambda p: _render_assets(p, "table"),
+              lambda p: _render_assets(p, "lark"))
     return 0
 
 
@@ -1795,8 +1892,9 @@ def main(argv=None) -> int:
         return cmd_doctor(None, args)
     # -a all: consolidate across every configured profile (handled inside the cmd).
     if getattr(args, "account", None) == "all":
-        if args.func not in (cmd_total, cmd_plans, cmd_tax):
-            print("error: -a all is supported only for total / plans / tax", file=sys.stderr)
+        if args.func not in (cmd_total, cmd_assets, cmd_risk, cmd_plans, cmd_tax):
+            print("error: -a all is supported only for total / assets / risk / plans / tax",
+                  file=sys.stderr)
             return 2
         return args.func(None, args)
     try:

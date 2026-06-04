@@ -123,8 +123,10 @@ the default page cap. Reports also stamp **查询时间 (as_of)** + per-source f
 **JSON is versioned:** every `--json` dict payload carries `schema_version` (currently
 `"1.0"`) so cron jobs / dashboards / the daily snapshot can parse it stably.
 
-**`-a all`** consolidates across every configured account profile (supported for
-`total` / `plans` / `tax`): combined totals + per-account breakdown. **`review`** also
+**`-a all`** consolidates across every configured account profile (`total` / `assets` /
+`risk` / `plans` / `tax`): combined household view (same fund summed) + per-account
+totals — e.g. `risk -a all` shows whole-household concentration & US-underlying exposure.
+**`review`** also
 reports a **money-weighted return (XIRR, 資金加重収益率)** — the proper annualized
 performance when 定投/deposits are ongoing (use `--all` for the full deposit history).
 
