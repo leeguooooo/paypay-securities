@@ -10,7 +10,7 @@
 set -uo pipefail
 
 # launchd runs with a bare environment — make uv & friends findable.
-export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:${PATH:-}"
+export PATH="$HOME/.local/bin:$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:${PATH:-}"
 unset VIRTUAL_ENV
 
 # Resolve the skill dir from this script's location (works for repo or install).
