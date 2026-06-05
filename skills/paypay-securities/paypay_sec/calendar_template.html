@@ -1,0 +1,1944 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>每日涨跌日历 · P&L Calendar</title>
+<style>
+/* =========================================================================
+   色板与设计 token —— 集中在 :root，方便后续统一调整
+   配色约定（中日习惯）：涨=红，跌=绿，0/极小=中性灰
+   ========================================================================= */
+:root{
+  /* —— 基础 UI 灰阶（除红绿外，只用 2~3 个灰）—— */
+  --bg:        #f6f6f4;     /* 页面底色 */
+  --panel:     #ffffff;     /* 卡片/面板 */
+  --border:    #e4e3df;     /* 描边 */
+  --ink:       #1d1d1f;     /* 主文字 */
+  --ink-soft:  #6b6b70;     /* 次要文字 */
+  --ink-faint: #9a9a9f;     /* 更弱文字 */
+
+  /* —— 涨（红）热力分档：l1 最浅 → l4 最深 —— */
+  --up-1: #fbe0df;
+  --up-2: #f4a8a4;
+  --up-3: #e8645c;
+  --up-4: #c92a23;
+  --up-ink:    #b21f18;     /* 浅底上的红字 */
+
+  /* —— 跌（绿）热力分档 —— */
+  --dn-1: #d8efe0;
+  --dn-2: #9bd9b1;
+  --dn-3: #4fbb7d;
+  --dn-4: #1c8f4e;
+  --dn-ink:    #167a41;     /* 浅底上的绿字 */
+
+  /* —— 中性（≈0）—— */
+  --zero-bg:   #efeeea;
+  --zero-ink:  #8a8a8f;
+
+  /* —— 缺失日 —— */
+  --missing-bg: #f4f3ef;
+
+  --radius: 10px;
+  --shadow: 0 1px 2px rgba(0,0,0,.04), 0 4px 16px rgba(0,0,0,.04);
+  --mono: ui-monospace, "SF Mono", "Roboto Mono", Menlo, Consolas, monospace;
+}
+
+*{ box-sizing: border-box; }
+html,body{ margin:0; padding:0; }
+body{
+  font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif;
+  background: var(--bg);
+  color: var(--ink);
+  font-size: 15px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+}
+.wrap{ max-width: 1080px; margin: 0 auto; padding: 28px 22px 64px; }
+
+/* ---------- 顶部 header ---------- */
+header.app{ margin-bottom: 18px; }
+.app-title{
+  display:flex; align-items:baseline; gap:12px; flex-wrap:wrap;
+  margin:0 0 6px;
+}
+.app-title h1{ font-size: 22px; font-weight: 650; letter-spacing:-.01em; margin:0; }
+.app-title .sub{ font-size: 13px; color: var(--ink-soft); }
+.gen-line{
+  font-size: 12.5px; color: var(--ink-soft);
+  display:flex; gap:14px; flex-wrap:wrap; align-items:center;
+}
+.gen-line .dot{ width:4px; height:4px; border-radius:50%; background: var(--border); }
+.gen-line b{ color: var(--ink); font-weight:600; }
+
+/* ---------- 图例 legend ---------- */
+.legend{
+  margin-top:14px; background:var(--panel); border:1px solid var(--border);
+  border-radius:var(--radius); padding:12px 14px; box-shadow:var(--shadow);
+  display:flex; gap:26px; flex-wrap:wrap; align-items:center;
+}
+.legend .grp{ display:flex; align-items:center; gap:9px; }
+.legend .grp-label{ font-size:12.5px; color:var(--ink-soft); }
+.legend .swatches{ display:flex; gap:3px; }
+.legend .sw{ width:20px; height:14px; border-radius:3px; border:1px solid rgba(0,0,0,.05); }
+.legend .scale-ends{ font-size:11px; color:var(--ink-faint); display:flex; gap:5px; align-items:center; }
+.legend .pat{
+  width:18px; height:14px; border-radius:3px; border:1px solid var(--border);
+  background-image: repeating-linear-gradient(45deg, transparent 0 3px, rgba(0,0,0,.22) 3px 4px);
+  background-color: var(--zero-bg);
+}
+
+/* ---------- 控制栏 ---------- */
+.controls{
+  display:flex; gap:14px; flex-wrap:wrap; align-items:center; justify-content:space-between;
+  margin:18px 0 14px;
+}
+.controls .left, .controls .right{ display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+.segmented{
+  display:inline-flex; background:var(--panel); border:1px solid var(--border);
+  border-radius:9px; padding:3px; gap:2px; box-shadow:var(--shadow);
+}
+.segmented button{
+  border:0; background:transparent; cursor:pointer; font:inherit; font-size:13.5px;
+  padding:6px 14px; border-radius:7px; color:var(--ink-soft); transition:.12s;
+  font-weight:500;
+}
+.segmented button[aria-pressed="true"]{ background:var(--ink); color:#fff; }
+.segmented button:hover:not([aria-pressed="true"]){ color:var(--ink); background:#f0efeb; }
+
+.pager{ display:flex; align-items:center; gap:6px; }
+.pager .period{
+  min-width:130px; text-align:center; font-weight:600; font-size:15px;
+  font-variant-numeric: tabular-nums;
+}
+.iconbtn{
+  width:34px; height:34px; border-radius:8px; border:1px solid var(--border);
+  background:var(--panel); cursor:pointer; color:var(--ink); font-size:16px;
+  display:inline-flex; align-items:center; justify-content:center; box-shadow:var(--shadow);
+  transition:.12s;
+}
+.iconbtn:hover{ background:#f0efeb; }
+.recent-btn{
+  border:1px solid var(--border); background:var(--panel); cursor:pointer;
+  font:inherit; font-size:13px; padding:7px 12px; border-radius:8px; color:var(--ink);
+  box-shadow:var(--shadow); transition:.12s;
+}
+.recent-btn:hover{ background:#f0efeb; }
+
+/* ---------- 通用卡片 ---------- */
+.card{
+  background:var(--panel); border:1px solid var(--border); border-radius:var(--radius);
+  box-shadow:var(--shadow); padding:18px;
+}
+
+/* ============================ 月视图 ============================ */
+.month-grid{ width:100%; border-collapse:separate; border-spacing:6px; table-layout:fixed; }
+.month-grid th{
+  font-size:12px; font-weight:600; color:var(--ink-soft); padding:2px 0 8px; text-align:center;
+}
+.month-grid th.we{ color:var(--ink-faint); }
+.cell{
+  position:relative; vertical-align:top; height:84px; border-radius:8px;
+  border:1px solid var(--border); padding:7px 8px; background:var(--panel);
+  cursor:default;
+}
+.cell:focus-visible{ outline:2px solid #3b82f6; outline-offset:2px; z-index:3; }
+.cell .dnum{ font-size:11.5px; color:var(--ink-faint); font-variant-numeric:tabular-nums; }
+.cell .amt{
+  margin-top:8px; font-size:15px; font-weight:650; font-variant-numeric:tabular-nums;
+  letter-spacing:-.01em; font-family:var(--mono); line-height:1.15;
+}
+.cell .pct{ margin-top:3px; font-size:11.5px; font-variant-numeric:tabular-nums; opacity:.85; }
+.cell.empty{ background:transparent; border:1px dashed transparent; cursor:default; }
+.cell.outside{ opacity:.32; }
+.cell.missing{ background:var(--missing-bg); border-style:dashed; }
+.cell.missing .amt{ color:var(--ink-faint); font-weight:500; font-size:12px; }
+/* partial：右上角标 + 斜纹底纹 */
+.cell.partial{
+  background-image: repeating-linear-gradient(45deg, transparent 0 6px, rgba(0,0,0,.05) 6px 7px);
+}
+.cell .corner{
+  position:absolute; top:5px; right:6px; font-size:10px; line-height:1; color:var(--ink-faint);
+}
+.cell .flow-tag{
+  position:absolute; bottom:6px; right:7px; font-size:10px; color:var(--ink-soft);
+  background:rgba(255,255,255,.7); border-radius:4px; padding:0 3px;
+}
+.cell .arrow{ font-size:11px; }
+
+/* 月底汇总条 */
+.month-summary{
+  margin-top:14px; display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr));
+  gap:1px; background:var(--border); border:1px solid var(--border);
+  border-radius:var(--radius); overflow:hidden;
+}
+.month-summary .stat{ background:var(--panel); padding:13px 16px; }
+.stat .k{ font-size:12px; color:var(--ink-soft); margin-bottom:4px; }
+.stat .v{ font-size:18px; font-weight:650; font-variant-numeric:tabular-nums; font-family:var(--mono); }
+.stat .vsub{ font-size:11.5px; color:var(--ink-faint); margin-top:2px; }
+
+/* ============================ 年视图 ============================ */
+.year-summary{
+  display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr));
+  gap:1px; background:var(--border); border:1px solid var(--border);
+  border-radius:var(--radius); overflow:hidden; margin-bottom:18px;
+}
+.year-summary .stat{ background:var(--panel); padding:13px 16px; }
+
+.heatmap-scroll{ overflow-x:auto; padding-bottom:6px; }
+.heatmap{ display:inline-grid; grid-auto-flow:column; grid-template-rows:auto repeat(7, 15px); gap:3px; }
+.heatmap .corner-lbl{ grid-row:1; }
+.heatmap .mon-lbl{
+  grid-row:1; font-size:10.5px; color:var(--ink-soft); align-self:end; padding-bottom:2px;
+  white-space:nowrap;
+}
+.heatmap .dow-lbl{
+  font-size:10px; color:var(--ink-faint); padding-right:5px; align-self:center; text-align:right;
+  white-space:nowrap;
+}
+.hm-cell{ width:15px; height:15px; border-radius:3px; background:var(--missing-bg); border:1px solid rgba(0,0,0,.04); }
+.hm-cell.none{ background:transparent; border:0; }
+.hm-cell.partial{ background-image: repeating-linear-gradient(45deg, transparent 0 3px, rgba(0,0,0,.22) 3px 4px); }
+.hm-cell.missing{ background:var(--missing-bg); border-style:dashed; }
+.hm-cell:focus-visible{ outline:2px solid #3b82f6; outline-offset:1px; }
+
+/* 12 迷你月历（年视图备选，已用热力图为主，这里保留 month-mini 以便扩展） */
+
+/* ---------- tooltip ---------- */
+#tip{
+  position:fixed; z-index:50; pointer-events:none; max-width:280px;
+  background:#1d1d1f; color:#fff; border-radius:9px; padding:11px 13px;
+  font-size:12.5px; line-height:1.5; box-shadow:0 8px 30px rgba(0,0,0,.28);
+  opacity:0; transform:translateY(4px); transition:opacity .1s, transform .1s; visibility:hidden;
+}
+#tip.show{ opacity:1; transform:translateY(0); visibility:visible; }
+#tip .t-date{ font-weight:650; margin-bottom:7px; font-size:13px; }
+#tip .t-row{ display:flex; justify-content:space-between; gap:18px; font-variant-numeric:tabular-nums; }
+#tip .t-row .nm{ color:#c9c9cf; }
+#tip .t-row .vl{ font-family:var(--mono); }
+#tip .t-up{ color:#ff8a82; }
+#tip .t-dn{ color:#74e09c; }
+#tip .t-zero{ color:#c9c9cf; }
+#tip hr{ border:0; border-top:1px solid rgba(255,255,255,.14); margin:8px 0; }
+#tip .t-meta{ color:#b6b6bd; font-size:11.5px; }
+#tip .t-note{ color:#ffd9a6; font-size:11.5px; margin-top:5px; }
+#tip .t-badge{
+  display:inline-block; font-size:10.5px; padding:1px 6px; border-radius:4px;
+  background:rgba(255,255,255,.16); margin-left:6px; vertical-align:middle;
+}
+
+/* ---------- 颜色语义类（金额文字色）---------- */
+.txt-up{ color:var(--up-ink); }
+.txt-dn{ color:var(--dn-ink); }
+.txt-zero{ color:var(--zero-ink); }
+
+/* ---------- 响应式 ---------- */
+@media (max-width:640px){
+  .wrap{ padding:18px 12px 48px; }
+  .month-grid{ border-spacing:4px; }
+  .cell{ height:64px; padding:5px 5px; }
+  .cell .amt{ font-size:12.5px; }
+  .cell .pct{ display:none; }
+  .app-title h1{ font-size:19px; }
+  .controls{ gap:10px; }
+  .month-table-scroll{ overflow-x:auto; }
+  .month-grid{ min-width:520px; }
+}
+
+/* ---------- 打印 ---------- */
+@media print{
+  body{ background:#fff; }
+  .controls, .recent-btn, #tip{ display:none !important; }
+  .card, .legend, .month-summary, .year-summary{ box-shadow:none; }
+  .cell{ -webkit-print-color-adjust:exact; print-color-adjust:exact; }
+  .hm-cell, .legend .sw{ -webkit-print-color-adjust:exact; print-color-adjust:exact; }
+  .wrap{ max-width:none; }
+}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header class="app">
+    <div class="app-title">
+      <h1>每日涨跌日历</h1>
+      <span class="sub">PayPay 证券 · P&amp;L Calendar</span>
+    </div>
+    <div class="gen-line">
+      <span>数据生成时间：<b id="genAt">—</b></span>
+      <span class="dot"></span>
+      <span>每日为<b>剔除现金流后</b>的市值浮动盈亏；<b style="color:var(--up-ink)">红涨</b>／<b style="color:var(--dn-ink)">绿跌</b>；斜纹=数据不完整</span>
+    </div>
+
+    <!-- 图例 -->
+    <div class="legend" id="legend">
+      <div class="grp">
+        <span class="grp-label">涨（盈利）</span>
+        <span class="scale-ends">少</span>
+        <span class="swatches">
+          <span class="sw" style="background:var(--up-1)"></span>
+          <span class="sw" style="background:var(--up-2)"></span>
+          <span class="sw" style="background:var(--up-3)"></span>
+          <span class="sw" style="background:var(--up-4)"></span>
+        </span>
+        <span class="scale-ends">多</span>
+      </div>
+      <div class="grp">
+        <span class="grp-label">跌（亏损）</span>
+        <span class="scale-ends">少</span>
+        <span class="swatches">
+          <span class="sw" style="background:var(--dn-1)"></span>
+          <span class="sw" style="background:var(--dn-2)"></span>
+          <span class="sw" style="background:var(--dn-3)"></span>
+          <span class="sw" style="background:var(--dn-4)"></span>
+        </span>
+        <span class="scale-ends">多</span>
+      </div>
+      <div class="grp">
+        <span class="grp-label">分档</span>
+        <span class="scale-ends" style="font-variant-numeric:tabular-nums">¥0 · &lt;¥500 · &lt;¥2k · &lt;¥5k · ≥¥5k</span>
+      </div>
+      <div class="grp">
+        <span class="pat" title="数据不完整"></span>
+        <span class="grp-label">斜纹 = partial（数据不完整）</span>
+      </div>
+    </div>
+  </header>
+
+  <!-- 控制栏 -->
+  <div class="controls">
+    <div class="left">
+      <!-- 账户按钮由 JS 依 DATA.accounts 动态生成（+ 合计） -->
+      <div class="segmented" id="acctSeg" role="group" aria-label="账户切换"></div>
+      <div class="segmented" id="viewSeg" role="group" aria-label="视图切换">
+        <button data-view="month" aria-pressed="true">月视图</button>
+        <button data-view="year"  aria-pressed="false">年视图</button>
+      </div>
+    </div>
+    <div class="right">
+      <div class="pager">
+        <button class="iconbtn" id="prevBtn" aria-label="上一个">‹</button>
+        <span class="period" id="periodLabel">—</span>
+        <button class="iconbtn" id="nextBtn" aria-label="下一个">›</button>
+      </div>
+      <button class="recent-btn" id="recentBtn">回到最近</button>
+    </div>
+  </div>
+
+  <!-- 主体：由 JS 渲染 -->
+  <main id="view"></main>
+
+</div>
+
+<!-- tooltip 容器 -->
+<div id="tip" role="tooltip" aria-hidden="true"></div>
+
+<script>
+/* =========================================================================
+   数据契约 —— 后续用脚本正则替换 DATA_START / DATA_END 之间的内容即可。
+   结构见需求文档：{ currency, generated_at, accounts:[...], days:[{date, accounts:{acct:{pnl,...}}}] }
+   ========================================================================= */
+const DATA = /* DATA_START */ {
+  "currency": "JPY",
+  "generated_at": "2026-06-05T09:58:00+09:00",
+  "accounts": [
+    "leo",
+    "lisa"
+  ],
+  "days": [
+    {
+      "date": "2026-04-01",
+      "accounts": {
+        "leo": {
+          "pnl": -2106,
+          "pnl_pct": -0.39,
+          "total_assets": 537894,
+          "net_flow": 0,
+          "realized": 0,
+          "data_quality": "full",
+          "note": null
+        },
+        "lisa": {
+          "pnl": 1104,
+          "pnl_pct": 0.39,
+          "total_assets": 286104,
+          "net_flow": 0,
+          "realized": -315,
+          "data_quality": "full",
+          "note": null
+        }
+      }
+    },
+    {
+      "date": "2026-04-02",
+      "accounts": {
+        "leo": {
+          "pnl": 5424,
+          "pnl_pct": 1.01,
+          "total_assets": 543318,
+          "net_flow": 0,
+          "realized": 0,
+          "data_quality": "full",
+          "note": null
+        },
+        "lisa": {
+          "pnl": 2997,
+          "pnl_pct": 1.05,
+          "total_assets": 289101,
+          "net_flow": 0,
+          "realized": 0,
+          "data_quality": "full",
+          "note": null
+        }
+      }
+    },
+    {
+      "date": "2026-04-03",
+      "accounts": {
+        "leo": {
+          "pnl": 3699,
+          "pnl_pct": 0.68,
+          "total_assets": 547017,
+          "net_flow": 0,
+          "realized": 0,
+          "data_quality": "full",
+          "note": null
+        },
+        "lisa": {
+          "pnl": 1570,
+          "pnl_pct": 0.54,
+          "total_assets": 290671,
+          "net_flow": 0,
+          "realized": 582,
+          "data_quality": "full",
+          "note": null
+        }
+      }
+    },
+    {
+      "date": "2026-04-06",
+      "accounts": {
+        "leo": {
+          "pnl": 5751,
+          "pnl_pct": 1.05,
+          "total_assets": 552768,
+          "net_flow": 0,
+          "realized": 0,
+          "data_quality": "full",
+          "note": null
+        },
+        "lisa": {
+          "pnl": -252,
+          "pnl_pct": -0.09,
+          "total_assets": 290419,
+          "net_flow": 0,
+          "realized": 12,
+          "data_quality": "full",
+          "note": null
+        }
+      }
+    },
+    {
+      "date": "2026-04-07",
+      "accounts": {
+        "leo": {
+          "pnl": 4003,
+          "pnl_pct": 0.72,
+          "total_assets": 556771,
+          "net_flow": 0,
+          "realized": 0,
+          "data_quality": "full",
+          "note": null
+        },
+        "lisa": {
+          "pnl": -2299,
+          "pnl_pct": -0.79,
+          "total_assets": 288120,
+          "net_flow": 0,
+          "realized": 0,
+          "data_quality": "full",
+          "note": null
+        }
+      }
+    },
+    {
+      "date": "2026-04-08",
+      "accounts": {
+        "leo": {
+          "pnl": -1513,
+          "pnl_pct": -0.27,
+          "total_assets": 555258,
+          "net_flow": 0,
+          "realized": 0,
+          "data_quality": "full",
+          "note": null
+        },
+        "lisa": {
+          "pnl": 6542,
+          "pnl_pct": 2.27,
+          "total_assets": 294662,
+          "net_flow": 0,
+          "realized": 0,
+          "data_quality": "full",
+          "note": null
+        }
+      }
+    },
+    {
+      "date": "2026-04-09",
+      "accounts": {
+        "leo": {
+          "pnl": 6530,
+          "pnl_pct": 1.18,
+          "total_assets": 561788,
+          "net_flow": 0,
+          "realized": 0,
+          "data_quality": "full",
+          "note": null
+        },
+        "lisa": {
+          "pnl": -2054,
+          "pnl_pct": -0.7,
+          "total_assets": 292608,
+          "net_flow": 0,
+          "realized": 0,
+          "data_quality": "full",
+          "note": null
+        }
+      }
+    },
+    {
+      "date": "2026-04-10",
+      "accounts": {
+        "leo": {
+          "pnl": 8383,
+          "pnl_pct": 1.49,
+          "total_assets": 570171,
+          "net_flow": 0,
+          "realized": -804,
+          "data_quality": "full",
+          "note": null
+        },
+        "lisa": {
+          "pnl": 2157,
+          "pnl_pct": 0.74,
+          "total_assets": 294765,
+          "net_flow": 0,
+          "realized": 0,
+          "data_quality": "full",
+          "note": null
+        }
+      }
+    },
+    {
+      "date": "2026-04-13",
+      "accounts": {
+        "leo": {
+          "pnl": -1296,
+          "pnl_pct": -0.23,
+          "total_assets": 568875,
+          "net_flow": 0,
+          "realized": -872,
+          "data_quality": "full",
+          "note": null
+        },
+        "lisa": {
+          "pnl": 447,
+          "pnl_pct": 0.15,
+          "total_assets": 295212,
+          "net_flow": 0,
+          "realized": 0,
+          "data_quality": "full",
+          "note": null
+        }
+      }
+    },
+    {
+      "date": "2026-04-14",
+      "accounts": {
+        "leo": {
+          "pnl": -3857,
+          "pnl_pct": -0.68,
+          "total_assets": 565018,
+          "net_flow": 0,
+          "realized": 0,
+          "data_quality": "full",
+          "note": null
+        },
+        "lisa": {
+          "pnl": 1219,
+          "pnl_pct": 0.41,
+          "total_assets": 296431,
+          "net_flow": 0,
+          "realized": 0,
+          "data_quality": "full",
+          "note": null
+        }
+      }
+    },
+    {
+      "date": "2026-04-15",
+      "accounts": {
+        "leo": {
+          "pnl": 9269,
+          "pnl_pct": 1.64,
+          "total_assets": 574287,
+          "net_flow": 0,
+          "realized": 0,
+          "data_quality": "full",
+          "note": null
+        },
+        "lisa": {
+          "pnl": 1930,
+          "pnl_pct": 0.56,
+          "total_assets": 348361,
+          "net_flow": 50000,
+          "realized": 0,
+          "data_quality": "full",
+          "note": "当日有入金,盈亏已剔除现金流"
+        }
+      }
+    },
+    {
+      "date": "2026-04-16",
+      "accounts": {
+        "leo": {
+          "pnl": 15036,
+          "pnl_pct": 2.62,
+          "total_assets": 589323,
+          "net_flow": 0,
+          "realized": -974,
+          "data_quality": "full",
+          "note": null
+        },
+        "lisa": {
+          "pnl": 1180,
+          "pnl_pct": 0.34,
+          "total_assets": 349541,
+          "net_flow": 0,
+          "realized": 0,
+          "data_quality": "full",
+          "note": null
+        }
+      }
+    },
+    {
+      "date": "2026-04-17",
+      "accounts": {
+        "leo": {
+          "pnl": 4013,
+          "pnl_pct": 0.68,
+          "total_assets": 593336,
+          "net_flow": 0,
+          "realized": 503,
+          "data_quality": "full",
+          "note": null
+        },
+        "lisa": {
+          "pnl": 2428,
+          "pnl_pct": 0.69,
+          "total_assets": 351969,
+          "net_flow": 0,
+          "realized": 0,
+          "data_quality": "full",
+          "note": null
+        }
+      }
+    },
+    {
+      "date": "2026-04-20",
+      "accounts": {
+        "leo": {
+          "pnl": -2286,
+          "pnl_pct": -0.39,
+          "total_assets": 591050,
+          "net_flow": 0,
+          "realized": -867,
+          "data_quality": "full",
+          "note": null
+        },
+        "lisa": {
+          "pnl": 3563,
+          "pnl_pct": 1.01,
+          "total_assets": 355532,
+          "net_flow": 0,
+          "realized": 0,
+          "data_quality": "full",
+          "note": null
+        }
+      }
+    },
+    {
+      "date": "2026-04-21",
+      "accounts": {
+        "leo": {
+          "pnl": 1082,
+          "pnl_pct": 0.18,
+          "total_assets": 592132,
+          "net_flow": 0,
+          "realized": 0,
+          "data_quality": "full",
+          "note": null
+        },
+        "lisa": {
+          "pnl": -2518,
+          "pnl_pct": -0.71,
+          "total_assets": 353014,
+          "net_flow": 0,
+          "realized": 0,
+          "data_quality": "full",
+          "note": null
+        }
+      }
+    },
+    {
+      "date": "2026-04-22",
+      "accounts": {
+        "leo": {
+          "pnl": 3951,
+          "pnl_pct": 0.67,
+          "total_assets": 596083,
+          "net_flow": 0,
+          "realized": 0,
+          "data_quality": "full",
+          "note": null
+        },
+        "lisa": {
+          "pnl": 140,
+          "pnl_pct": 0.04,
+          "total_assets": 353154,
+          "net_flow": 0,
+          "realized": 0,
+          "data_quality": "full",
+          "note": null
+        }
+      }
+    },
+    {
+      "date": "2026-04-23",
+      "accounts": {
+        "leo": {
+          "pnl": 6206,
+          "pnl_pct": 1.04,
+          "total_assets": 602289,
+          "net_flow": 0,
+          "realized": 0,
+          "data_quality": "partial",
+          "note": "投信日度估值缺失,仅含美股"
+        },
+        "lisa": {
+          "pnl": -1995,
+          "pnl_pct": -0.56,
+          "total_assets": 351159,
+          "net_flow": 0,
+          "realized": 0,
+          "data_quality": "partial",
+          "note": "投信日度估值缺失,仅含美股"
+        }
+      }
+    },
+    {
+      "date": "2026-04-24",
+      "accounts": {
+        "leo": {
+          "pnl": -1483,
+          "pnl_pct": -0.25,
+          "total_assets": 600806,
+          "net_flow": 0,
+          "realized": -408,
+          "data_quality": "full",
+          "note": null
+        },
+        "lisa": {
+          "pnl": 1205,
+          "pnl_pct": 0.34,
+          "total_assets": 352364,
+          "net_flow": 0,
+          "realized": 0,
+          "data_quality": "full",
+          "note": null
+        }
+      }
+    },
+    {
+      "date": "2026-04-27",
+      "accounts": {
+        "leo": {
+          "pnl": 3884,
+          "pnl_pct": 0.65,
+          "total_assets": 604690,
+          "net_flow": 0,
+          "realized": 0,
+          "data_quality": "full",
+          "note": null
+        },
+        "lisa": {
+          "pnl": 9346,
+          "pnl_pct": 2.65,
+          "total_assets": 361710,
+          "net_flow": 0,
+          "realized": 0,
+          "data_quality": "full",
+          "note": null
+        }
+      }
+    },
+    {
+      "date": "2026-04-28",
+      "accounts": {
+        "leo": {
+          "pnl": 3124,
+          "pnl_pct": 0.52,
+          "total_assets": 607814,
+          "net_flow": 0,
+          "realized": 0,
+          "data_quality": "full",
+          "note": null
+        },
+        "lisa": {
+          "pnl": -1089,
+          "pnl_pct": -0.3,
+          "total_assets": 360621,
+          "net_flow": 0,
+          "realized": 0,
+          "data_quality": "full",
+          "note": null
+        }
+      }
+    },
+    {
+      "date": "2026-04-29",
+      "accounts": {
+        "leo": {
+          "pnl": 2938,
+          "pnl_pct": 0.48,
+          "total_assets": 610752,
+          "net_flow": 0,
+          "realized": 0,
+          "data_quality": "full",
+          "note": null
+        },
+        "lisa": {
+          "pnl": 2902,
+          "pnl_pct": 0.8,
+          "total_assets": 363523,
+          "net_flow": 0,
+          "realized": 0,
+          "data_quality": "full",
+          "note": null
+        }
+      }
+    },
+    {
+      "date": "2026-04-30",
+      "accounts": {
+        "leo": {
+          "pnl": 4726,
+          "pnl_pct": 0.77,
+          "total_assets": 615478,
+          "net_flow": 0,
+          "realized": 0,
+          "data_quality": "full",
+          "note": null
+        },
+        "lisa": {
+          "pnl": -782,
+          "pnl_pct": -0.22,
+          "total_assets": 362741,
+          "net_flow": 0,
+          "realized": 0,
+          "data_quality": "full",
+          "note": null
+        }
+      }
+    },
+    {
+      "date": "2026-05-01",
+      "accounts": {
+        "leo": {
+          "pnl": -1353,
+          "pnl_pct": -0.19,
+          "total_assets": 714125,
+          "net_flow": 100000,
+          "realized": -781,
+          "data_quality": "full",
+          "note": "当日有入金,盈亏已剔除现金流"
+        },
+        "lisa": {
+          "pnl": -3071,
+          "pnl_pct": -0.85,
+          "total_assets": 359670,
+          "net_flow": 0,
+          "realized": 0,
+          "data_quality": "full",
+          "note": null
+        }
+      }
+    },
+    {
+      "date": "2026-05-04",
+      "accounts": {
+        "leo": {
+          "pnl": 10414,
+          "pnl_pct": 1.46,
+          "total_assets": 724539,
+          "net_flow": 0,
+          "realized": 0,
+          "data_quality": "full",
+          "note": null
+        },
+        "lisa": {
+          "pnl": -2110,
+          "pnl_pct": -0.59,
+          "total_assets": 357560,
+          "net_flow": 0,
+          "realized": 0,
+          "data_quality": "full",
+          "note": null
+        }
+      }
+    },
+    {
+      "date": "2026-05-05",
+      "accounts": {
+        "leo": {
+          "pnl": -1256,
+          "pnl_pct": -0.17,
+          "total_assets": 723283,
+          "net_flow": 0,
+          "realized": 0,
+          "data_quality": "full",
+          "note": null
+        },
+        "lisa": {
+          "pnl": 388,
+          "pnl_pct": 0.11,
+          "total_assets": 357948,
+          "net_flow": 0,
+          "realized": 0,
+          "data_quality": "full",
+          "note": null
+        }
+      }
+    },
+    {
+      "date": "2026-05-06",
+      "accounts": {
+        "leo": {
+          "pnl": 16891,
+          "pnl_pct": 2.34,
+          "total_assets": 740174,
+          "net_flow": 0,
+          "realized": 0,
+          "data_quality": "full",
+          "note": null
+        },
+        "lisa": {
+          "pnl": -2202,
+          "pnl_pct": -0.62,
+          "total_assets": 355746,
+          "net_flow": 0,
+          "realized": 0,
+          "data_quality": "full",
+          "note": null
+        }
+      }
+    },
+    {
+      "date": "2026-05-07",
+      "accounts": {
+        "leo": {
+          "pnl": -116,
+          "pnl_pct": -0.02,
+          "total_assets": 740058,
+          "net_flow": 0,
+          "realized": 0,
+          "data_quality": "full",
+          "note": null
+        },
+        "lisa": {
+          "pnl": 3159,
+          "pnl_pct": 0.89,
+          "total_assets": 358905,
+          "net_flow": 0,
+          "realized": 0,
+          "data_quality": "full",
+          "note": null
+        }
+      }
+    },
+    {
+      "date": "2026-05-08",
+      "accounts": {
+        "leo": {
+          "pnl": -145,
+          "pnl_pct": -0.02,
+          "total_assets": 739913,
+          "net_flow": 0,
+          "realized": -198,
+          "data_quality": "full",
+          "note": null
+        },
+        "lisa": {
+          "pnl": 4184,
+          "pnl_pct": 1.17,
+          "total_assets": 363089,
+          "net_flow": 0,
+          "realized": 0,
+          "data_quality": "full",
+          "note": null
+        }
+      }
+    },
+    {
+      "date": "2026-05-11",
+      "accounts": {
+        "leo": {
+          "pnl": 6615,
+          "pnl_pct": 0.89,
+          "total_assets": 746528,
+          "net_flow": 0,
+          "realized": 0,
+          "data_quality": "full",
+          "note": null
+        },
+        "lisa": {
+          "pnl": 3318,
+          "pnl_pct": 0.91,
+          "total_assets": 366407,
+          "net_flow": 0,
+          "realized": 818,
+          "data_quality": "full",
+          "note": null
+        }
+      }
+    },
+    {
+      "date": "2026-05-12",
+      "accounts": {
+        "leo": {
+          "pnl": null,
+          "pnl_pct": null,
+          "total_assets": null,
+          "net_flow": 0,
+          "realized": null,
+          "data_quality": "missing",
+          "note": "当天数据抓取失败"
+        },
+        "lisa": {
+          "pnl": null,
+          "pnl_pct": null,
+          "total_assets": null,
+          "net_flow": 0,
+          "realized": null,
+          "data_quality": "missing",
+          "note": "当天数据抓取失败"
+        }
+      }
+    },
+    {
+      "date": "2026-05-13",
+      "accounts": {
+        "leo": {
+          "pnl": -4978,
+          "pnl_pct": -0.67,
+          "total_assets": 741550,
+          "net_flow": 0,
+          "realized": 0,
+          "data_quality": "full",
+          "note": null
+        },
+        "lisa": {
+          "pnl": 4579,
+          "pnl_pct": 1.25,
+          "total_assets": 370986,
+          "net_flow": 0,
+          "realized": 0,
+          "data_quality": "full",
+          "note": null
+        }
+      }
+    },
+    {
+      "date": "2026-05-14",
+      "accounts": {
+        "leo": {
+          "pnl": 1900,
+          "pnl_pct": 0.26,
+          "total_assets": 743450,
+          "net_flow": 0,
+          "realized": -1445,
+          "data_quality": "full",
+          "note": null
+        },
+        "lisa": {
+          "pnl": 390,
+          "pnl_pct": 0.11,
+          "total_assets": 371376,
+          "net_flow": 0,
+          "realized": 0,
+          "data_quality": "full",
+          "note": null
+        }
+      }
+    },
+    {
+      "date": "2026-05-15",
+      "accounts": {
+        "leo": {
+          "pnl": -201,
+          "pnl_pct": -0.03,
+          "total_assets": 743249,
+          "net_flow": 0,
+          "realized": 0,
+          "data_quality": "full",
+          "note": null
+        },
+        "lisa": {
+          "pnl": -1126,
+          "pnl_pct": -0.3,
+          "total_assets": 370250,
+          "net_flow": 0,
+          "realized": 0,
+          "data_quality": "full",
+          "note": null
+        }
+      }
+    },
+    {
+      "date": "2026-05-18",
+      "accounts": {
+        "leo": {
+          "pnl": 2813,
+          "pnl_pct": 0.38,
+          "total_assets": 746062,
+          "net_flow": 0,
+          "realized": 0,
+          "data_quality": "full",
+          "note": null
+        },
+        "lisa": {
+          "pnl": 892,
+          "pnl_pct": 0.24,
+          "total_assets": 371142,
+          "net_flow": 0,
+          "realized": 0,
+          "data_quality": "full",
+          "note": null
+        }
+      }
+    },
+    {
+      "date": "2026-05-19",
+      "accounts": {
+        "leo": {
+          "pnl": 974,
+          "pnl_pct": 0.13,
+          "total_assets": 747036,
+          "net_flow": 0,
+          "realized": 0,
+          "data_quality": "full",
+          "note": null
+        },
+        "lisa": {
+          "pnl": 485,
+          "pnl_pct": 0.13,
+          "total_assets": 371627,
+          "net_flow": 0,
+          "realized": 0,
+          "data_quality": "full",
+          "note": null
+        }
+      }
+    },
+    {
+      "date": "2026-05-20",
+      "accounts": {
+        "leo": {
+          "pnl": -4815,
+          "pnl_pct": -0.64,
+          "total_assets": 742221,
+          "net_flow": 0,
+          "realized": 0,
+          "data_quality": "full",
+          "note": null
+        },
+        "lisa": {
+          "pnl": 1224,
+          "pnl_pct": 0.33,
+          "total_assets": 372851,
+          "net_flow": 0,
+          "realized": 1211,
+          "data_quality": "full",
+          "note": null
+        }
+      }
+    },
+    {
+      "date": "2026-05-21",
+      "accounts": {
+        "leo": {
+          "pnl": -7157,
+          "pnl_pct": -0.96,
+          "total_assets": 735064,
+          "net_flow": 0,
+          "realized": 0,
+          "data_quality": "full",
+          "note": null
+        },
+        "lisa": {
+          "pnl": -214,
+          "pnl_pct": -0.06,
+          "total_assets": 372637,
+          "net_flow": 0,
+          "realized": 0,
+          "data_quality": "full",
+          "note": null
+        }
+      }
+    },
+    {
+      "date": "2026-05-22",
+      "accounts": {
+        "leo": {
+          "pnl": 2707,
+          "pnl_pct": 0.37,
+          "total_assets": 737771,
+          "net_flow": 0,
+          "realized": 0,
+          "data_quality": "full",
+          "note": null
+        },
+        "lisa": {
+          "pnl": 536,
+          "pnl_pct": 0.14,
+          "total_assets": 373173,
+          "net_flow": 0,
+          "realized": 0,
+          "data_quality": "full",
+          "note": null
+        }
+      }
+    },
+    {
+      "date": "2026-05-25",
+      "accounts": {
+        "leo": {
+          "pnl": -2657,
+          "pnl_pct": -0.36,
+          "total_assets": 735114,
+          "net_flow": 0,
+          "realized": -103,
+          "data_quality": "full",
+          "note": null
+        },
+        "lisa": {
+          "pnl": -132,
+          "pnl_pct": -0.04,
+          "total_assets": 373041,
+          "net_flow": 0,
+          "realized": 207,
+          "data_quality": "full",
+          "note": null
+        }
+      }
+    },
+    {
+      "date": "2026-05-26",
+      "accounts": {
+        "leo": {
+          "pnl": -3794,
+          "pnl_pct": -0.52,
+          "total_assets": 731320,
+          "net_flow": 0,
+          "realized": 689,
+          "data_quality": "full",
+          "note": null
+        },
+        "lisa": {
+          "pnl": 1111,
+          "pnl_pct": 0.3,
+          "total_assets": 374152,
+          "net_flow": 0,
+          "realized": 0,
+          "data_quality": "full",
+          "note": null
+        }
+      }
+    },
+    {
+      "date": "2026-05-27",
+      "accounts": {
+        "leo": {
+          "pnl": 1976,
+          "pnl_pct": 0.27,
+          "total_assets": 733296,
+          "net_flow": 0,
+          "realized": 0,
+          "data_quality": "full",
+          "note": null
+        },
+        "lisa": {
+          "pnl": 3051,
+          "pnl_pct": 0.82,
+          "total_assets": 377203,
+          "net_flow": 0,
+          "realized": 304,
+          "data_quality": "full",
+          "note": null
+        }
+      }
+    },
+    {
+      "date": "2026-05-28",
+      "accounts": {
+        "leo": {
+          "pnl": -14933,
+          "pnl_pct": -2.04,
+          "total_assets": 718363,
+          "net_flow": 0,
+          "realized": 0,
+          "data_quality": "full",
+          "note": null
+        },
+        "lisa": {
+          "pnl": 2732,
+          "pnl_pct": 0.72,
+          "total_assets": 379935,
+          "net_flow": 0,
+          "realized": 323,
+          "data_quality": "full",
+          "note": null
+        }
+      }
+    },
+    {
+      "date": "2026-05-29",
+      "accounts": {
+        "leo": {
+          "pnl": 1323,
+          "pnl_pct": 0.18,
+          "total_assets": 719686,
+          "net_flow": 0,
+          "realized": 1384,
+          "data_quality": "full",
+          "note": null
+        },
+        "lisa": {
+          "pnl": -3200,
+          "pnl_pct": -0.84,
+          "total_assets": 376735,
+          "net_flow": 0,
+          "realized": 0,
+          "data_quality": "full",
+          "note": null
+        }
+      }
+    },
+    {
+      "date": "2026-06-01",
+      "accounts": {
+        "leo": {
+          "pnl": -843,
+          "pnl_pct": -0.12,
+          "total_assets": 718843,
+          "net_flow": 0,
+          "realized": 0,
+          "data_quality": "full",
+          "note": null
+        },
+        "lisa": {
+          "pnl": 2995,
+          "pnl_pct": 0.79,
+          "total_assets": 379730,
+          "net_flow": 0,
+          "realized": 0,
+          "data_quality": "full",
+          "note": null
+        }
+      }
+    },
+    {
+      "date": "2026-06-02",
+      "accounts": {
+        "leo": {
+          "pnl": -2913,
+          "pnl_pct": -0.41,
+          "total_assets": 715930,
+          "net_flow": 0,
+          "realized": 0,
+          "data_quality": "full",
+          "note": null
+        },
+        "lisa": {
+          "pnl": -2370,
+          "pnl_pct": -0.62,
+          "total_assets": 377360,
+          "net_flow": 0,
+          "realized": 0,
+          "data_quality": "full",
+          "note": null
+        }
+      }
+    },
+    {
+      "date": "2026-06-03",
+      "accounts": {
+        "leo": {
+          "pnl": 11230,
+          "pnl_pct": 1.57,
+          "total_assets": 727160,
+          "net_flow": 0,
+          "realized": 0,
+          "data_quality": "full",
+          "note": null
+        },
+        "lisa": {
+          "pnl": -3842,
+          "pnl_pct": -1.02,
+          "total_assets": 373518,
+          "net_flow": 0,
+          "realized": 0,
+          "data_quality": "full",
+          "note": null
+        }
+      }
+    },
+    {
+      "date": "2026-06-04",
+      "accounts": {
+        "leo": {
+          "pnl": 4821,
+          "pnl_pct": 0.66,
+          "total_assets": 731981,
+          "net_flow": 0,
+          "realized": 0,
+          "data_quality": "partial",
+          "note": "投信日度估值缺失,仅含美股"
+        },
+        "lisa": {
+          "pnl": 4122,
+          "pnl_pct": 1.1,
+          "total_assets": 377640,
+          "net_flow": 0,
+          "realized": -1446,
+          "data_quality": "partial",
+          "note": "投信日度估值缺失,仅含美股"
+        }
+      }
+    }
+  ]
+} /* DATA_END */;
+
+/* ======================= 基础工具函数 ======================= */
+
+// 日元整数 + 千分位 + 正负号（正数显式加 + ，负数用 − ）
+function fmtJPY(n, {sign=true}={}){
+  if(n===null || n===undefined || Number.isNaN(n)) return "—";
+  const abs = Math.abs(Math.round(n));
+  const s = abs.toLocaleString("ja-JP");
+  if(!sign) return "¥" + s;
+  if(n>0) return "+¥" + s;
+  if(n<0) return "−¥" + s;   // U+2212 真减号
+  return "¥0";
+}
+// 百分比格式
+function fmtPct(p){
+  if(p===null || p===undefined || Number.isNaN(p)) return "";
+  const sign = p>0 ? "+" : (p<0 ? "−" : "");
+  return sign + Math.abs(p).toFixed(2) + "%";
+}
+// 涨跌符号（颜色之外的无障碍区分）
+function arrowOf(n){ if(n>0) return "▲"; if(n<0) return "▼"; return "·"; }
+function signClass(n){ if(n>0) return "up"; if(n<0) return "dn"; return "zero"; }
+
+// data_quality 取最差： missing > partial > full
+function worstQuality(a, b){
+  const rank = { missing:3, partial:2, full:1, null:0, undefined:0 };
+  return (rank[a]||0) >= (rank[b]||0) ? a : b;
+}
+
+/* ======================= 数据索引与「合计」聚合 ======================= */
+
+// date -> day 记录
+const byDate = {};
+DATA.days.forEach(d => { byDate[d.date] = d; });
+
+// 取某账户某日的标准化记录；account 可为 'total'
+// 返回 { has, pnl, pnl_pct, total_assets, net_flow, realized, data_quality, note(map for total) }
+function getDay(dateStr, account){
+  const rec = byDate[dateStr];
+  if(!rec) return { has:false };
+
+  if(account !== "total"){
+    const a = rec.accounts[account];
+    if(!a) return { has:false };
+    return {
+      has:true,
+      pnl: a.pnl, pnl_pct: a.pnl_pct, total_assets: a.total_assets,
+      net_flow: a.net_flow||0, realized: a.realized,
+      data_quality: a.data_quality, note: a.note,
+      perAcct: { [account]: a }
+    };
+  }
+
+  // —— 合计：逐字段相加，缺失字段按可得部分相加并标 partial —— //
+  let pnl=0, ta=0, nf=0, rz=0;
+  let pnlAny=false, taAny=false, rzAny=false, anyNull=false;
+  let dq = "full";
+  const perAcct = {};
+  DATA.accounts.forEach(acct => {
+    const a = rec.accounts[acct];
+    if(!a){ anyNull=true; dq = worstQuality(dq,"missing"); return; }
+    perAcct[acct] = a;
+    dq = worstQuality(dq, a.data_quality);
+    if(a.pnl!=null){ pnl += a.pnl; pnlAny=true; } else { anyNull=true; }
+    if(a.total_assets!=null){ ta += a.total_assets; taAny=true; }
+    if(a.net_flow!=null){ nf += a.net_flow; }
+    if(a.realized!=null){ rz += a.realized; rzAny=true; }
+  });
+  // 任一账户字段为 null 而仍按可得部分相加 → 至少 partial
+  if(anyNull && dq==="full") dq = "partial";
+  return {
+    has:true,
+    pnl: pnlAny ? pnl : null,
+    pnl_pct: null,                 // 合计不提供单一收益率
+    total_assets: taAny ? ta : null,
+    net_flow: nf,
+    realized: rzAny ? rz : null,
+    data_quality: dq,
+    note: null,
+    perAcct
+  };
+}
+
+/* ======================= 热力分档 ======================= */
+// 依 |pnl| 分 0..4 档；返回背景色 var 名 + 文字色类
+function heatStyle(pnl, dq){
+  if(dq==="missing" || pnl===null || pnl===undefined){
+    return { bg:"var(--missing-bg)", txt:"txt-zero" };
+  }
+  const v = Math.abs(pnl);
+  let lvl;
+  if(v===0) lvl=0;
+  else if(v<500) lvl=1;
+  else if(v<2000) lvl=2;
+  else if(v<5000) lvl=3;
+  else lvl=4;
+
+  if(lvl===0) return { bg:"var(--zero-bg)", txt:"txt-zero", lvl };
+  const fam = pnl>0 ? "up" : "dn";
+  const bg = `var(--${fam}-${lvl})`;
+  // 深档（3、4）用白字，浅档用语义色
+  const txt = lvl>=3 ? "txt-white" : (pnl>0 ? "txt-up" : "txt-dn");
+  return { bg, txt, lvl };
+}
+
+/* ======================= 应用状态 ======================= */
+// 账户标签直接取自数据（DATA.accounts），外加 JS 计算的「合计」。
+const ACCT_LABEL = { total:"合计" };
+(DATA.accounts || []).forEach(a => { ACCT_LABEL[a] = a; });
+
+// 账户切换按钮：依数据动态生成（每个账户 + 合计），保持设计的 segmented 样式
+(function buildAcctButtons(){
+  const seg = document.getElementById("acctSeg");
+  if(!seg) return;
+  const accts = [...(DATA.accounts || []), "total"];
+  seg.innerHTML = accts.map(a =>
+    `<button data-acct="${a}" aria-pressed="false">${ACCT_LABEL[a]}</button>`).join("");
+})();
+
+// 最近有数据的日期（用于初始定位与「回到最近」）
+const allDates = DATA.days.map(d=>d.date).sort();
+const latestDate = allDates[allDates.length-1] || "2026-06-04";
+
+const state = {
+  account: (DATA.accounts && DATA.accounts[0]) || "total",
+  view: "month",
+  cursor: parseISO(latestDate)   // 月视图：当月；年视图：当年
+};
+
+function parseISO(s){ const [y,m,d]=s.split("-").map(Number); return new Date(y, m-1, d); }
+function ymd(dt){
+  const y=dt.getFullYear(), m=String(dt.getMonth()+1).padStart(2,"0"), d=String(dt.getDate()).padStart(2,"0");
+  return `${y}-${m}-${d}`;
+}
+
+/* ======================= 渲染：入口 ======================= */
+const viewEl = document.getElementById("view");
+
+function render(){
+  // 控制栏状态
+  document.querySelectorAll("#acctSeg button").forEach(b=>{
+    b.setAttribute("aria-pressed", String(b.dataset.acct===state.account));
+  });
+  document.querySelectorAll("#viewSeg button").forEach(b=>{
+    b.setAttribute("aria-pressed", String(b.dataset.view===state.view));
+  });
+
+  if(state.view==="month"){
+    document.getElementById("periodLabel").textContent =
+      `${state.cursor.getFullYear()}年${state.cursor.getMonth()+1}月`;
+    renderMonth();
+  }else{
+    document.getElementById("periodLabel").textContent = `${state.cursor.getFullYear()}年`;
+    renderYear();
+  }
+}
+
+/* ======================= 月视图 ======================= */
+const WEEK_HEAD = ["一","二","三","四","五","六","日"]; // 周一起
+
+function renderMonth(){
+  const year = state.cursor.getFullYear();
+  const month = state.cursor.getMonth(); // 0-based
+  const first = new Date(year, month, 1);
+  const daysInMonth = new Date(year, month+1, 0).getDate();
+
+  // 周一起：JS getDay 0=Sun..6=Sat → 转成 0=Mon..6=Sun
+  const startOffset = (first.getDay()+6)%7;
+
+  // 构建格子序列（前导空 + 当月 + 末尾补齐到整周）
+  const cells = [];
+  for(let i=0;i<startOffset;i++) cells.push(null);
+  for(let d=1; d<=daysInMonth; d++) cells.push(new Date(year, month, d));
+  while(cells.length % 7 !== 0) cells.push(null);
+
+  let html = '<section class="card month-table-scroll" aria-label="月视图日历">';
+  html += '<table class="month-grid"><thead><tr>';
+  WEEK_HEAD.forEach((w,i)=>{
+    html += `<th class="${i>=5?'we':''}">周${w}</th>`;
+  });
+  html += '</tr></thead><tbody>';
+
+  for(let i=0;i<cells.length;i+=7){
+    html += '<tr>';
+    for(let j=0;j<7;j++){
+      const dt = cells[i+j];
+      if(!dt){ html += '<td class="cell empty"></td>'; continue; }
+      html += monthCell(dt);
+    }
+    html += '</tr>';
+  }
+  html += '</tbody></table></section>';
+
+  // 月度汇总
+  html += monthSummary(year, month);
+
+  viewEl.innerHTML = html;
+  bindCellTooltips();
+}
+
+function monthCell(dt){
+  const ds = ymd(dt);
+  const day = getDay(ds, state.account);
+  const dnum = dt.getDate();
+
+  if(!day.has){
+    // 无数据（周末或非交易日）：浅空格子
+    return `<td class="cell empty" aria-hidden="true"><span class="dnum">${dnum}</span></td>`;
+  }
+
+  const dq = day.data_quality;
+  if(dq==="missing" || day.pnl===null){
+    return `<td class="cell missing" tabindex="0" data-date="${ds}"
+      aria-label="${ds} 数据缺失">
+      <span class="dnum">${dnum}</span>
+      <span class="corner">⚠</span>
+      <div class="amt">无数据</div></td>`;
+  }
+
+  const hs = heatStyle(day.pnl, dq);
+  const txtClass = hs.txt==="txt-white" ? "" : hs.txt;
+  const style = `background:${hs.bg};${hs.txt==='txt-white'?'color:#fff;':''}`;
+  const cls = ["cell", dq==="partial"?"partial":""].join(" ");
+  const arrow = arrowOf(day.pnl);
+  const pctStr = day.pnl_pct!=null ? fmtPct(day.pnl_pct) : "";
+
+  const flowTag = (day.net_flow && day.net_flow!==0)
+    ? `<span class="flow-tag" title="当日有现金流，盈亏已剔除">流</span>` : "";
+  const corner = dq==="partial" ? `<span class="corner">◫</span>` : "";
+
+  const aria = `${ds}，${state.account==='total'?'合计':state.account}，盈亏 ${fmtJPY(day.pnl)}${pctStr?('，'+pctStr):''}${dq==='partial'?'，数据不完整':''}`;
+
+  return `<td class="${cls}" tabindex="0" data-date="${ds}" style="${style}" aria-label="${aria}">
+    <span class="dnum">${dnum}</span>
+    ${corner}
+    <div class="amt ${txtClass}"><span class="arrow">${arrow}</span> ${fmtJPY(day.pnl)}</div>
+    ${pctStr?`<div class="pct ${txtClass}">${pctStr}</div>`:""}
+    ${flowTag}
+  </td>`;
+}
+
+function monthSummary(year, month){
+  let sum=0, best=null, worst=null, up=0, down=0, flat=0, valid=0;
+  const daysInMonth = new Date(year, month+1, 0).getDate();
+  for(let d=1; d<=daysInMonth; d++){
+    const ds = ymd(new Date(year, month, d));
+    const day = getDay(ds, state.account);
+    if(!day.has || day.pnl===null) continue;
+    valid++;
+    sum += day.pnl;
+    if(best===null || day.pnl>best.pnl) best={ds, pnl:day.pnl};
+    if(worst===null || day.pnl<worst.pnl) worst={ds, pnl:day.pnl};
+    if(day.pnl>0) up++; else if(day.pnl<0) down++; else flat++;
+  }
+  const winRate = (up+down)>0 ? Math.round(up/(up+down)*100) : 0;
+  const sumCls = "txt-"+signClass(sum);
+
+  function dlabel(o){ if(!o) return "—"; const [,,dd]=o.ds.split("-"); return `${Number(dd)}日`; }
+
+  return `<div class="month-summary" aria-label="本月汇总">
+    <div class="stat"><div class="k">本月累计盈亏</div>
+      <div class="v ${sumCls}">${fmtJPY(sum)}</div>
+      <div class="vsub">${valid} 个交易日</div></div>
+    <div class="stat"><div class="k">最佳单日</div>
+      <div class="v ${best?'txt-'+signClass(best.pnl):''}">${best?fmtJPY(best.pnl):'—'}</div>
+      <div class="vsub">${dlabel(best)}</div></div>
+    <div class="stat"><div class="k">最差单日</div>
+      <div class="v ${worst?'txt-'+signClass(worst.pnl):''}">${worst?fmtJPY(worst.pnl):'—'}</div>
+      <div class="vsub">${dlabel(worst)}</div></div>
+    <div class="stat"><div class="k">涨 / 跌 天数</div>
+      <div class="v"><span class="txt-up">${up}</span> / <span class="txt-dn">${down}</span></div>
+      <div class="vsub">胜率 ${winRate}%</div></div>
+  </div>`;
+}
+
+/* ======================= 年视图（GitHub 贡献图风格）======================= */
+function renderYear(){
+  const year = state.cursor.getFullYear();
+
+  // 汇总
+  let sum=0, best=null, worst=null, up=0, down=0, valid=0;
+  const monthSum = Array(12).fill(0);
+  const monthHas = Array(12).fill(false);
+  for(const d of DATA.days){
+    if(!d.date.startsWith(String(year)+"-")) continue;
+    const day = getDay(d.date, state.account);
+    if(!day.has || day.pnl===null) continue;
+    valid++; sum+=day.pnl;
+    const m = Number(d.date.split("-")[1])-1;
+    monthSum[m]+=day.pnl; monthHas[m]=true;
+    if(best===null||day.pnl>best.pnl) best={ds:d.date,pnl:day.pnl};
+    if(worst===null||day.pnl<worst.pnl) worst={ds:d.date,pnl:day.pnl};
+    if(day.pnl>0) up++; else if(day.pnl<0) down++;
+  }
+  // 最佳/最差月份
+  let bestM=null, worstM=null;
+  monthSum.forEach((s,m)=>{ if(!monthHas[m]) return;
+    if(bestM===null||s>monthSum[bestM]) bestM=m;
+    if(worstM===null||s<monthSum[worstM]) worstM=m;
+  });
+  const sumCls="txt-"+signClass(sum);
+
+  let html = `<div class="year-summary" aria-label="全年汇总">
+    <div class="stat"><div class="k">全年累计盈亏</div><div class="v ${sumCls}">${fmtJPY(sum)}</div><div class="vsub">${valid} 个交易日</div></div>
+    <div class="stat"><div class="k">最佳单日</div><div class="v ${best?'txt-'+signClass(best.pnl):''}">${best?fmtJPY(best.pnl):'—'}</div><div class="vsub">${best?best.ds.slice(5):'—'}</div></div>
+    <div class="stat"><div class="k">最差单日</div><div class="v ${worst?'txt-'+signClass(worst.pnl):''}">${worst?fmtJPY(worst.pnl):'—'}</div><div class="vsub">${worst?worst.ds.slice(5):'—'}</div></div>
+    <div class="stat"><div class="k">最佳 / 最差月份</div><div class="v" style="font-size:15px">${bestM!=null?(bestM+1)+'月':'—'} / ${worstM!=null?(worstM+1)+'月':'—'}</div><div class="vsub">${bestM!=null?fmtJPY(monthSum[bestM]):''}${worstM!=null?' · '+fmtJPY(monthSum[worstM]):''}</div></div>
+    <div class="stat"><div class="k">涨 / 跌 天数</div><div class="v"><span class="txt-up">${up}</span> / <span class="txt-dn">${down}</span></div><div class="vsub">胜率 ${(up+down)>0?Math.round(up/(up+down)*100):0}%</div></div>
+  </div>`;
+
+  html += `<section class="card" aria-label="年度热力图"><div class="heatmap-scroll">${buildHeatmap(year)}</div></section>`;
+  viewEl.innerHTML = html;
+  bindCellTooltips();
+}
+
+// 构建 7 行 × ~53 列的热力图（周一起）
+function buildHeatmap(year){
+  const jan1 = new Date(year,0,1);
+  const dec31 = new Date(year,11,31);
+  // 网格从该年第一周的周一开始
+  const startOffset = (jan1.getDay()+6)%7;       // 周一起
+  const gridStart = new Date(year,0,1 - startOffset);
+
+  // 收集列（按周），同时记录每列首日的月份用于月标签
+  const cols = [];
+  let cur = new Date(gridStart);
+  while(cur <= dec31 || ((cur.getDay()+6)%7)!==0){
+    const col = [];
+    for(let r=0;r<7;r++){
+      col.push(new Date(cur));
+      cur.setDate(cur.getDate()+1);
+    }
+    cols.push(col);
+    if(cur > dec31 && ((cur.getDay()+6)%7)===0) break;
+  }
+
+  const DOW = ["一","","三","","五","","日"]; // 稀疏标签
+  let html = '<div class="heatmap">';
+
+  // 第一行：月份标签（在每月第一次出现的列上方）
+  html += '<div class="corner-lbl"></div>';
+  let lastMon = -1;
+  cols.forEach((col)=>{
+    // 取该列中属于本年的首个格子的月份
+    let mon = -1;
+    for(const dt of col){ if(dt.getFullYear()===year){ mon = dt.getMonth(); break; } }
+    if(mon!==-1 && mon!==lastMon){
+      html += `<div class="mon-lbl" style="grid-row:1;">${mon+1}月</div>`;
+      lastMon = mon;
+    }else{
+      html += `<div class="mon-lbl" style="grid-row:1;"></div>`;
+    }
+  });
+
+  // 7 行 × N 列：grid-auto-flow column 已设，但月标签占了 row1，故数据从 row2 起
+  // 为简化，逐行逐列输出：先 DOW 标签列再各数据列
+  // 重新用显式 grid 定位
+  let body = '';
+  for(let r=0;r<7;r++){
+    body += `<div class="dow-lbl" style="grid-row:${r+2}; grid-column:1;">${DOW[r]}</div>`;
+  }
+  cols.forEach((col, ci)=>{
+    col.forEach((dt, r)=>{
+      const inYear = dt.getFullYear()===year;
+      const ds = ymd(dt);
+      const day = inYear ? getDay(ds, state.account) : {has:false};
+      let cls = "hm-cell", style="", aria="", tabindex="";
+      if(!inYear){
+        cls += " none";
+      }else if(!day.has){
+        // 该年内但无记录（周末/非交易日）
+        style = "background:var(--missing-bg);opacity:.5;";
+      }else if(day.data_quality==="missing" || day.pnl===null){
+        cls += " missing"; aria = `${ds} 数据缺失`; tabindex="0";
+      }else{
+        const hs = heatStyle(day.pnl, day.data_quality);
+        style = `background:${hs.bg};`;
+        if(day.data_quality==="partial") cls += " partial";
+        aria = `${ds}，盈亏 ${fmtJPY(day.pnl)}`; tabindex="0";
+      }
+      body += `<div class="${cls}" style="grid-row:${r+2}; grid-column:${ci+2}; ${style}"
+        ${inYear&&day.has?`data-date="${ds}" tabindex="0" role="img" aria-label="${aria}"`:''}></div>`;
+    });
+  });
+  html += body + '</div>';
+  return html;
+}
+
+/* ======================= tooltip ======================= */
+const tip = document.getElementById("tip");
+
+function tooltipHTML(ds){
+  const dt = parseISO(ds);
+  const wd = ["日","一","二","三","四","五","六"][dt.getDay()];
+  const day = getDay(ds, state.account);
+  if(!day.has) return null;
+
+  let html = `<div class="t-date">${ds}（周${wd}）<span class="t-badge">${ACCT_LABEL[state.account]}</span></div>`;
+
+  if(day.data_quality==="missing" || day.pnl===null){
+    html += `<div class="t-meta">当日无数据（missing）</div>`;
+    if(day.note) html += `<div class="t-note">${day.note}</div>`;
+    return html;
+  }
+
+  // 主值
+  const cls = "t-"+signClass(day.pnl);
+  html += `<div class="t-row"><span class="nm">当日盈亏</span><span class="vl ${cls}">${arrowOf(day.pnl)} ${fmtJPY(day.pnl)}${day.pnl_pct!=null?'  '+fmtPct(day.pnl_pct):''}</span></div>`;
+
+  // 合计时展开各账户明细
+  if(state.account==="total" && day.perAcct){
+    html += '<hr>';
+    DATA.accounts.forEach(acct=>{
+      const a = day.perAcct[acct];
+      if(!a){ html += `<div class="t-row"><span class="nm">${acct}</span><span class="vl t-zero">—</span></div>`; return; }
+      const c = a.pnl==null ? "t-zero" : "t-"+signClass(a.pnl);
+      html += `<div class="t-row"><span class="nm">${acct}</span><span class="vl ${c}">${a.pnl==null?'—':arrowOf(a.pnl)+' '+fmtJPY(a.pnl)}</span></div>`;
+    });
+  }
+
+  html += '<hr>';
+  if(day.total_assets!=null)
+    html += `<div class="t-row"><span class="nm">收盘总资产</span><span class="vl">${fmtJPY(day.total_assets,{sign:false})}</span></div>`;
+  if(day.realized!=null && day.realized!==0)
+    html += `<div class="t-row"><span class="nm">已实现盈亏</span><span class="vl ${'t-'+signClass(day.realized)}">${fmtJPY(day.realized)}</span></div>`;
+  if(day.net_flow && day.net_flow!==0)
+    html += `<div class="t-row"><span class="nm">外部净入金</span><span class="vl">${fmtJPY(day.net_flow)}</span></div>`;
+
+  if(day.net_flow && day.net_flow!==0)
+    html += `<div class="t-note">含现金流 ${fmtJPY(day.net_flow)}，当日盈亏已剔除</div>`;
+  if(day.data_quality==="partial")
+    html += `<div class="t-note">⚠ 数据不完整（partial）</div>`;
+
+  // note（账户级；合计取各账户去重）
+  const notes = new Set();
+  if(state.account!=="total"){ if(day.note) notes.add(day.note); }
+  else if(day.perAcct){ DATA.accounts.forEach(a=>{ const r=day.perAcct[a]; if(r&&r.note) notes.add(r.note); }); }
+  notes.forEach(n=>{ html += `<div class="t-note">· ${n}</div>`; });
+
+  return html;
+}
+
+function showTip(target, ds){
+  const html = tooltipHTML(ds);
+  if(!html){ hideTip(); return; }
+  tip.innerHTML = html;
+  tip.classList.add("show");
+  tip.setAttribute("aria-hidden","false");
+  positionTip(target);
+}
+function positionTip(target){
+  const r = target.getBoundingClientRect();
+  const tw = tip.offsetWidth, th = tip.offsetHeight;
+  let left = r.left + r.width/2 - tw/2;
+  let top  = r.top - th - 9;
+  if(top < 8) top = r.bottom + 9;            // 上方放不下→放下方
+  left = Math.max(8, Math.min(left, window.innerWidth - tw - 8));
+  tip.style.left = left+"px";
+  tip.style.top  = top+"px";
+}
+function hideTip(){
+  tip.classList.remove("show");
+  tip.setAttribute("aria-hidden","true");
+}
+
+function bindCellTooltips(){
+  viewEl.querySelectorAll("[data-date]").forEach(el=>{
+    const ds = el.getAttribute("data-date");
+    el.addEventListener("mouseenter", ()=>showTip(el, ds));
+    el.addEventListener("mouseleave", hideTip);
+    el.addEventListener("focus", ()=>showTip(el, ds));
+    el.addEventListener("blur", hideTip);
+  });
+}
+
+/* ======================= 控制栏事件 ======================= */
+document.getElementById("acctSeg").addEventListener("click", e=>{
+  const b = e.target.closest("button"); if(!b) return;
+  state.account = b.dataset.acct; render();
+});
+document.getElementById("viewSeg").addEventListener("click", e=>{
+  const b = e.target.closest("button"); if(!b) return;
+  state.view = b.dataset.view; render();
+});
+document.getElementById("prevBtn").addEventListener("click", ()=>{
+  if(state.view==="month") state.cursor.setMonth(state.cursor.getMonth()-1);
+  else state.cursor.setFullYear(state.cursor.getFullYear()-1);
+  render();
+});
+document.getElementById("nextBtn").addEventListener("click", ()=>{
+  if(state.view==="month") state.cursor.setMonth(state.cursor.getMonth()+1);
+  else state.cursor.setFullYear(state.cursor.getFullYear()+1);
+  render();
+});
+document.getElementById("recentBtn").addEventListener("click", ()=>{
+  state.cursor = parseISO(latestDate); render();
+});
+// 键盘左右翻页
+document.addEventListener("keydown", e=>{
+  if(e.target.tagName==="INPUT") return;
+  if(e.key==="ArrowLeft"){ document.getElementById("prevBtn").click(); }
+  if(e.key==="ArrowRight"){ document.getElementById("nextBtn").click(); }
+});
+// 滚动时隐藏 tooltip，避免错位
+window.addEventListener("scroll", hideTip, true);
+
+/* ======================= 启动 ======================= */
+document.getElementById("genAt").textContent =
+  (DATA.generated_at||"").replace("T"," ").replace(/(\+09:00)$/," JST");
+render();
+</script>
+</body>
+</html>

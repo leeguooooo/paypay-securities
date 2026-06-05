@@ -90,6 +90,7 @@ uv run paypay tax                   # per-year tax view: 売却 / 譲渡益税 /
 uv run paypay snapshot save         # save a dated account snapshot (the CLI's own time series)
 uv run paypay snapshot list         # list saved snapshots
 uv run paypay diff [--days N]       # diff a live read vs the latest (or ~N-days-old) snapshot
+uv run paypay calendar              # build 每日涨跌日历 HTML from snapshots (--json = raw schema; --out PATH; -a all = household, the default)
 uv run paypay doctor [--online]     # diagnose setup/login readiness (offline by default; --online probes login + 証券/投信 to confirm the session is live)
 uv run paypay accounts              # list configured account profiles
 uv run paypay cache-clear           # clear the local response cache
@@ -106,8 +107,18 @@ advice**, same boundary as every other command.
 realized, deposits); `diff` compares a live read against the latest snapshot (or
 `--days N` ago) so you get "this week's change" — asset/holdings/deposit/realized deltas.
 Automate it: `bin/snapshot-cron.sh install` schedules a daily (07:30 local, trading
-days) read-only snapshot + a Monday `diff --days 7`, logged to
-`~/.paypay-sec/snapshot-cron.log` (`uninstall` / `status` too).
+days) read-only snapshot of **every** profile + a calendar rebuild + a Monday
+`diff --days 7`, logged to `~/.paypay-sec/snapshot-cron.log` (`uninstall` / `status` too).
+
+**`calendar`** reads only the saved snapshots (no creds/network) and builds a
+single self-contained, offline HTML — the 每日涨跌日历: month + year (GitHub-style
+heatmap) views, 红涨/绿跌, per-account toggle + 合计. Each day's value is the
+snapshot-to-snapshot change in 総資産 **minus that day's net cash flow** (so deposits
+aren't counted as profit; full-quality, includes 投信). Needs ≥2 snapshots on
+different days per account. Default / `-a all` = household (all profiles); `-a <name>`
+= one. Labels come from `PAYPAY_LABEL` in each `.env` (else the profile name). The
+template (`paypay_sec/calendar_template.html`) is data-driven: the cron regex-swaps
+the JSON between `/* DATA_START */ … /* DATA_END */`. `--json` emits the raw schema.
 
 Any command takes `-a <name>` to target a non-default account, and
 `--format table|lark|json`. **`--format lark`** emits Feishu/Lark-friendly

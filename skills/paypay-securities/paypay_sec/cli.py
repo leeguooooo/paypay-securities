@@ -41,6 +41,11 @@ def _now_jst_str() -> str:
     return datetime.now(timezone.utc).astimezone(_JST).strftime("%Y-%m-%d %H:%M JST")
 
 
+def _now_jst_iso() -> str:
+    """ISO-8601 with the +09:00 offset (the calendar's generated_at format)."""
+    return datetime.now(timezone.utc).astimezone(_JST).strftime("%Y-%m-%dT%H:%M:%S+09:00")
+
+
 # --all pages until NEXT_FLG=false; this is the upper bound that keeps a stuck
 # feed from looping forever (settlement_records already stops at NEXT_FLG).
 _ALL_PAGES_CAP = 500
@@ -802,6 +807,70 @@ def cmd_diff(client: PayPayClient, args) -> int:
         print("\n".join(L))
 
     _emit_fmt(payload, _fmt(args), table, lark)
+    return 0
+
+
+def _calendar_payload(per_account: dict) -> dict:
+    """Assemble the daily P&L calendar schema from {label: [snapshots]}.
+    Pure: snapshot lists in → calendar JSON out (see report.daily_pnl_series)."""
+    accounts = list(per_account.keys())
+    series = {lab: report.daily_pnl_series(snaps) for lab, snaps in per_account.items()}
+    all_dates = sorted({d for s in series.values() for d in s})
+    days = []
+    for d in all_dates:
+        accts = {lab: series[lab][d] for lab in accounts if d in series[lab]}
+        if accts:
+            days.append({"date": d, "accounts": accts})
+    return {"schema_version": SCHEMA_VERSION, "currency": "JPY",
+            "generated_at": _now_jst_iso(), "accounts": accounts, "days": days}
+
+
+def cmd_calendar(client: PayPayClient, args) -> int:
+    """Build the 每日涨跌日历 (P&L calendar): per-day mark-to-market gain/loss from
+    the saved snapshot series, emitted as the viewer's data schema, and (by default)
+    injected into the bundled HTML template → a standalone offline file.
+
+    Accounts: default / -a all → every configured profile (household calendar);
+    -a <name> → just that one. Labels come from each profile's PAYPAY_LABEL."""
+    from pathlib import Path
+    from .client import state_dir as _state_dir
+
+    acct_arg = getattr(args, "account", None)
+    profiles = ([acct_arg] if acct_arg and acct_arg != "all"
+                else (config.list_accounts() or [config.DEFAULT_ACCOUNT]))
+    per: dict[str, list] = {}
+    for prof in profiles:
+        label = config.account_label(prof)
+        if label in per:                       # de-collide duplicate labels
+            label = f"{label}({prof})"
+        per[label] = [snapshots.load(p) for p in snapshots.list_paths(prof)]
+
+    payload = _calendar_payload(per)
+
+    if getattr(args, "json", False):
+        print(_json_dump(payload))
+        return 0
+
+    tpl = (Path(__file__).resolve().parent / "calendar_template.html").read_text(encoding="utf-8")
+    dumped = json.dumps(payload, ensure_ascii=False, indent=2)
+    html, n = re.subn(r"/\* DATA_START \*/.*?/\* DATA_END \*/",
+                      lambda m: "/* DATA_START */ " + dumped + " /* DATA_END */",
+                      tpl, count=1, flags=re.S)
+    if n != 1:
+        print("calendar template is missing the DATA_START/DATA_END markers", file=sys.stderr)
+        return 1
+
+    out = getattr(args, "out", None)
+    out_path = Path(out).expanduser() if out else (_state_dir(None) / "pnl-calendar.html")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(html, encoding="utf-8")
+
+    n_days = len(payload["days"])
+    print(f"P&L calendar written: {out_path}")
+    print(f"  accounts: {', '.join(payload['accounts']) or '(none)'}  ·  {n_days} 天有日度盈亏")
+    if n_days == 0:
+        print("  ⚠ 还没有日度盈亏 —— 每个账户需要 ≥2 个不同日期的快照。")
+        print("    跑 `paypay snapshot save`(或装 bin/snapshot-cron.sh 每日自动存)。")
     return 0
 
 
@@ -1862,6 +1931,10 @@ def build_parser() -> argparse.ArgumentParser:
                      help="baseline selector; 'last' = latest snapshot (the default)")
     dff.add_argument("--pages", type=int, default=8, help="ledger pages to scan for the live read")
 
+    cal = sub.add_parser("calendar", parents=[common]); cal.set_defaults(func=cmd_calendar)
+    cal.add_argument("--out", default=None,
+                     help="output HTML path (default: <state_dir>/pnl-calendar.html). Ignored with --json")
+
     buy = sub.add_parser("buy", parents=[common]); buy.set_defaults(func=cmd_buy)
     sell = sub.add_parser("sell", parents=[common]); sell.set_defaults(func=cmd_sell)
     for sp_ in (buy, sell):
@@ -1903,6 +1976,10 @@ def main(argv=None) -> int:
         return cmd_accounts(None, args)
     if args.func is cmd_doctor:
         return cmd_doctor(None, args)
+    # `calendar` only reads saved snapshots from disk (no creds/network); it handles
+    # account selection (incl. -a all = household) itself.
+    if args.func is cmd_calendar:
+        return cmd_calendar(None, args)
     # -a all: consolidate across every configured profile (handled inside the cmd).
     if getattr(args, "account", None) == "all":
         if args.func not in (cmd_total, cmd_assets, cmd_risk, cmd_plans, cmd_tax):

@@ -269,3 +269,78 @@ def tax_summary(sec_txns: list[dict], inv_txns: list[dict]) -> list[dict]:
         elif t["type"] == "譲渡益税" and t.get("amount"):
             row(y)["capital_gains_tax"] += -t["amount"]
     return [years[y] for y in sorted(years)]
+
+
+def _snap_date(snap: dict) -> str | None:
+    """ISO date (YYYY-MM-DD) of a snapshot, from its ts stem ('20260604-120608')
+    or, failing that, the as_of string ('2026-06-04 12:06 JST')."""
+    ts = str(snap.get("ts") or "")
+    if len(ts) >= 8 and ts[:8].isdigit():
+        return f"{ts[0:4]}-{ts[4:6]}-{ts[6:8]}"
+    a = str(snap.get("as_of") or "")[:10]
+    return a if re.match(r"\d{4}-\d{2}-\d{2}", a) else None
+
+
+def daily_pnl_series(snapshots: list[dict]) -> dict[str, dict]:
+    """Per-day mark-to-market P&L from a series of account snapshots.
+
+    Each snapshot carries cumulative figures (grand_total, net_deposit,
+    realized_total). The day's *investment* gain/loss is the change in total
+    assets MINUS the day's external cash flow, so deposits/withdrawals don't read
+    as profit:
+
+        pnl[d]      = (grand_total[d] - grand_total[prev]) - net_flow[d]
+        net_flow[d] =  net_deposit[d] - net_deposit[prev]
+        realized[d] =  realized_total[d] - realized_total[prev]
+
+    Multiple snapshots on one calendar day collapse to the last (closing) one.
+    A snapshot with no grand_total is emitted as data_quality="missing" and does
+    NOT advance the baseline, so the next good day's pnl spans the gap. The first
+    good day has no baseline and is omitted (no daily pnl is computable for it).
+
+    Returns {date: {pnl, pnl_pct, total_assets, net_flow, realized,
+    data_quality, note}} — the per-account shape the calendar consumes.
+    """
+    by_date: dict[str, dict] = {}
+    for s in snapshots or []:
+        d = _snap_date(s)
+        if not d:
+            continue
+        # last snapshot of the day wins (closing); tie-break by ts string
+        if d not in by_date or str(s.get("ts") or "") >= str(by_date[d].get("ts") or ""):
+            by_date[d] = s
+
+    out: dict[str, dict] = {}
+    prev = None  # last snapshot with a usable grand_total
+    for d in sorted(by_date):
+        s = by_date[d]
+        gt = s.get("grand_total")
+        if gt is None:
+            out[d] = {"pnl": None, "pnl_pct": None, "total_assets": None,
+                      "net_flow": 0, "realized": None, "data_quality": "missing",
+                      "note": s.get("note") or "当天数据抓取失败"}
+            continue
+        if prev is None:
+            prev = s            # baseline only — no pnl for the first good day
+            continue
+        pgt = prev.get("grand_total") or 0
+        net_flow = (s.get("net_deposit") or 0) - (prev.get("net_deposit") or 0)
+        pnl = (gt - pgt) - net_flow
+        realized = None
+        if s.get("realized_total") is not None and prev.get("realized_total") is not None:
+            realized = s["realized_total"] - prev["realized_total"]
+        quality = "full"
+        src = s.get("sources") or {}
+        if any(v not in ("ok", "live", None) for v in src.values()):
+            quality = "partial"
+        out[d] = {
+            "pnl": pnl,
+            "pnl_pct": round(pnl / pgt * 100, 2) if pgt else None,
+            "total_assets": gt,
+            "net_flow": net_flow,
+            "realized": realized,
+            "data_quality": quality,
+            "note": "当日有现金流,盈亏已剔除" if net_flow else None,
+        }
+        prev = s
+    return out

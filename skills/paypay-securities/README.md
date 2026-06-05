@@ -66,8 +66,29 @@ paypay trades-summary              # per-brand buy/sell/net/realized P&L
 paypay snapshot save               # save a dated account snapshot (your own time series)
 paypay snapshot list               # list saved snapshots
 paypay diff [--days 7]             # diff a live read vs the latest (or N-days-old) snapshot
-bin/snapshot-cron.sh install       # schedule a daily read-only snapshot + Monday weekly diff (macOS launchd)
+paypay calendar                    # build the 每日涨跌日历 HTML from saved snapshots (--json for raw data, --out PATH)
+bin/snapshot-cron.sh install       # schedule a daily read-only snapshot + calendar rebuild + Monday weekly diff (macOS launchd)
 ```
+
+### 每日涨跌日历 (P&L calendar)
+
+`paypay calendar` turns your saved snapshots into a self-contained, offline HTML
+calendar of **daily mark-to-market P&L** — month and year views, 红涨/绿跌 heatmap,
+per-account toggle (`leo` / `lisa` / 合计). Each day's number is the change in total
+assets **minus that day's cash flow**, so deposits never read as profit; it includes
+投信 (full-quality), unlike the US-stock-only live series.
+
+```bash
+paypay calendar                    # household calendar → <state_dir>/pnl-calendar.html
+paypay calendar -a second          # just one account
+paypay calendar --json             # the raw schema (for piping / dashboards)
+paypay calendar --out ~/pnl.html   # choose the output path
+```
+
+Needs **≥2 snapshots on different days** per account to show any P&L (the daily cron
+accumulates them). Account labels come from `PAYPAY_LABEL` in each profile's `.env`
+(falls back to the profile name). The viewer is data-driven — swap the JSON between
+the `/* DATA_START */ … /* DATA_END */` markers and the calendar re-renders.
 
 ### Useful flags (place after the subcommand)
 

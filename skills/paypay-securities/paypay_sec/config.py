@@ -48,6 +48,25 @@ def load_dotenv(account: str | None = None) -> None:
         os.environ.setdefault(key.strip(), val.strip().strip('"').strip("'"))
 
 
+def account_label(account: str | None) -> str:
+    """Display label for an account (used by the P&L calendar). Reads PAYPAY_LABEL
+    from the account's .env; falls back to the profile name. Credential-free — it
+    only reads the label line, so it works without loading the full Settings."""
+    name = account or DEFAULT_ACCOUNT
+    path = env_file_for(account)
+    if path:
+        try:
+            for raw in path.read_text(encoding="utf-8").splitlines():
+                line = raw.strip()
+                if line.startswith("PAYPAY_LABEL") and "=" in line:
+                    val = line.partition("=")[2].strip().strip('"').strip("'")
+                    if val:
+                        return val
+        except OSError:
+            pass
+    return name
+
+
 def list_accounts() -> list[str]:
     """Configured account names (default if ~/.paypay-sec/.env exists, plus each
     <name>.env)."""

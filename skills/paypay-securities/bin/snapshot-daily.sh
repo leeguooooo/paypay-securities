@@ -26,7 +26,18 @@ fi
 
 {
   echo "=== $(date '+%Y-%m-%d %H:%M %Z') daily snapshot ==="
+  # default account
   uv run --project "$SKILL_DIR" paypay snapshot save 2>&1
+  # each named profile ~/.paypay-sec/<name>.env (the *.env glob skips the dotfile .env)
+  for envf in "$HOME"/.paypay-sec/*.env; do
+    [ -e "$envf" ] || continue
+    name="$(basename "$envf" .env)"
+    echo "--- snapshot -a $name ---"
+    uv run --project "$SKILL_DIR" paypay snapshot save -a "$name" 2>&1
+  done
+  # rebuild the household 每日涨跌日历 from the accumulated snapshots
+  echo "--- rebuild P&L calendar ---"
+  uv run --project "$SKILL_DIR" paypay calendar --out "$HOME/.paypay-sec/pnl-calendar.html" 2>&1
   if [ "$dow" = "1" ]; then
     echo "--- weekly diff (--days 7) ---"
     uv run --project "$SKILL_DIR" paypay diff --days 7 2>&1
