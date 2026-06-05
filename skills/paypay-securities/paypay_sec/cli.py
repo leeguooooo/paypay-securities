@@ -339,7 +339,10 @@ def _gather(client: PayPayClient, pages: int = 8) -> dict:
                              "category": "投信", "valuation": h["valuation"] or 0,
                              "unrealized_pl": h["unrealized_pl"]})
     inv_txns = parsers.parse_invtrust_transactions(out.get("invledger") or [])
-    cash, cash_fresh = _persist_cash(client, parsers.current_cash(ledger))
+    # cash pool is shared with 投信 — take the newest balance across both ledgers,
+    # else an 投信-only buy leaves the 証券 ledger stale and double-counts cash.
+    cash, cash_fresh = _persist_cash(
+        client, parsers.current_cash_combined(ledger, out.get("invledger") or []))
     total = sum(h["valuation"] for h in holdings) + (cash or 0)
     tdates = [t["date"] for t in txns if t["type"] in costs.TRADE_TYPES and t["date"]]
     series = market.usdjpy_series(min(tdates), max(tdates)) if tdates else {}
@@ -1068,7 +1071,11 @@ def _total_payload(client: PayPayClient, args) -> dict:
     sec_total = sum(v for v in sec_by_market.values() if v)
     inv = parsers.parse_invtrust(client.invtrust_top())
     invested = sec_total + (inv.valuation or 0)
-    cash, cash_fresh = _persist_cash(client, parsers.current_cash(client.settlement_records(max_pages=1)))
+    # shared cash pool: newest balance across 証券 + 投信 ledgers (page-1 of each is
+    # enough — both are newest-first) so an 投信 buy doesn't leave 証券 cash stale.
+    cash, cash_fresh = _persist_cash(client, parsers.current_cash_combined(
+        client.settlement_records(max_pages=1),
+        client.invtrust_settlement_records(max_pages=1)))
     if not cash_fresh:
         errors.append("cash: throttled→stale")
     return {
@@ -1080,8 +1087,9 @@ def _total_payload(client: PayPayClient, args) -> dict:
             "securities": "ok" if any(v for v in sec_by_market.values()) else "failed",
             "invtrust": "ok" if inv.valuation is not None else "failed",
             "cash": "live" if cash_fresh else ("stale" if cash is not None else "failed")},
-        "note": ("grand_total = 証券 + 投信 holdings + 証券 cash balance, matching the "
-                 "app's 保有資産 total. CFD (separate login) is not included."),
+        "note": ("grand_total = 証券 + 投信 holdings + cash (newest balance across the "
+                 "証券+投信 shared pool), matching the app's 保有資産 total. CFD "
+                 "(separate login) is not included."),
     }
 
 
@@ -1156,7 +1164,11 @@ def _consolidated_holdings(client: PayPayClient):
     tasks = {
         "sec_usa": lambda: parsers.parse_holdings(client.brands_html("usa")),
         "inv_top": client.invtrust_top,
-        "cash": lambda: parsers.current_cash(client.settlement_records(max_pages=1)),
+        # shared cash pool — newest balance across 証券 + 投信 ledgers (see
+        # parsers.current_cash_combined) so an 投信 buy doesn't double-count cash.
+        "cash": lambda: parsers.current_cash_combined(
+            client.settlement_records(max_pages=1),
+            client.invtrust_settlement_records(max_pages=1)),
         "names": client.invtrust_brands,
     }
     out = {}
@@ -1431,8 +1443,9 @@ def _build_assets(rows, cash, cash_fresh, sell_pending, sources, lots, want_acco
     p = {"holdings": rows, "invested_total": invested, "cash": cash, "cash_fresh": cash_fresh,
          "grand_total": invested + (cash or 0), "invtrust_sell_pending": sell_pending,
          "sources": sources,
-         "note": "grand_total = invested holdings + 証券 cash balance, matching the "
-                 "app's 保有資産 total. CFD (separate login) is not included."}
+         "note": "grand_total = invested holdings + cash (newest balance across the "
+                 "証券+投信 shared pool), matching the app's 保有資産 total. CFD "
+                 "(separate login) is not included."}
     if want_accounts:
         p["by_account_pct"] = _account_split(rows, lots or [], cash, p["grand_total"])
     if accounts is not None:

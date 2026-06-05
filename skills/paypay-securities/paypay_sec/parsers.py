@@ -270,7 +270,10 @@ def parse_invtrust_transactions(records: list) -> list[dict]:
 
 
 def current_cash(records: list) -> Optional[int]:
-    """Latest running cash balance (= the app's 現金) from the ledger."""
+    """Latest running cash balance (= the app's 現金) from a SINGLE ledger.
+
+    Only correct in isolation when that ledger holds the account's latest movement
+    (see current_cash_combined for the 証券+投信 shared-pool case)."""
     for r in records:
         bal = r.get("CASH_BALANCE")
         if bal not in (None, ""):
@@ -279,6 +282,40 @@ def current_cash(records: list) -> Optional[int]:
             except (TypeError, ValueError):
                 pass
     return None
+
+
+def current_cash_combined(*record_lists) -> Optional[int]:
+    """Current cash from settlement ledgers that SHARE one cash pool (証券 + 投信).
+
+    Each market only stamps a fresh CASH_BALANCE on ITS OWN transactions, so after
+    an 投信-only buy the 証券 ledger still shows the pre-buy (stale) cash while the
+    投信 ledger already shows the post-buy balance. Reading the 証券 ledger alone
+    then double-counts the spent cash (once inside the now-larger fund holding,
+    once as still-held cash). Returns the CASH_BALANCE of the single most-recent
+    row across all given ledgers, ranked by (BASE_D, SEQ_NO).
+
+    BASE_D shares one format across these CO_TRADE_HIST feeds, so a lexicographic
+    date compare orders them correctly; SEQ_NO (an account-wide sequence — the same
+    入金 row carries one SEQ_NO in both market views) breaks same-day ties."""
+    best_key = None
+    best_cash = None
+    for recs in record_lists:
+        for r in recs or []:
+            bal = r.get("CASH_BALANCE")
+            if bal in (None, ""):
+                continue
+            try:
+                cash = int(round(float(bal)))
+            except (TypeError, ValueError):
+                continue
+            try:
+                seq = int(float(r.get("SEQ_NO")))
+            except (TypeError, ValueError):
+                seq = -1
+            key = (str(r.get("BASE_D") or ""), seq)
+            if best_key is None or key > best_key:
+                best_key, best_cash = key, cash
+    return best_cash
 
 
 def parse_cash_balance(html: str) -> Optional[int]:
