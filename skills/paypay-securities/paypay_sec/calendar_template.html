@@ -56,6 +56,13 @@ body{
 }
 .wrap{ max-width: 1080px; margin: 0 auto; padding: 28px 22px 64px; }
 
+/* 示例数据横幅（仅当 DATA.demo 为真时由 JS 注入）—— 防止把样例当成真实账户 */
+.demo-banner{
+  background:#fff4d6; border:1px solid #f0d98a; color:#7a5d00;
+  border-radius:var(--radius); padding:10px 14px; margin-bottom:14px;
+  font-size:13px; font-weight:600;
+}
+
 /* ---------- 顶部 header ---------- */
 header.app{ margin-bottom: 18px; }
 .app-title{
@@ -339,6 +346,7 @@ header.app{ margin-bottom: 18px; }
    结构见需求文档：{ currency, generated_at, accounts:[...], days:[{date, accounts:{acct:{pnl,...}}}] }
    ========================================================================= */
 const DATA = /* DATA_START */ {
+  "demo": true,
   "currency": "JPY",
   "generated_at": "2026-06-05T09:58:00+09:00",
   "accounts": [
@@ -1938,6 +1946,13 @@ window.addEventListener("scroll", hideTip, true);
 /* ======================= 启动 ======================= */
 document.getElementById("genAt").textContent =
   (DATA.generated_at||"").replace("T"," ").replace(/(\+09:00)$/," JST");
+// 样例数据警示横幅（真实数据由 `paypay calendar` 生成，不带 demo 标记）
+if (DATA.demo) {
+  const b = document.createElement("div");
+  b.className = "demo-banner";
+  b.textContent = "⚠ 这是示例数据(DEMO)，非真实账户。真实日历请运行：paypay calendar";
+  document.querySelector(".wrap").prepend(b);
+}
 render();
 </script>
 </body>
