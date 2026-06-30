@@ -267,6 +267,26 @@ def cmd_logout(client: PayPayClient, args) -> int:
     return 0
 
 
+def cmd_passkey_setup(_unused, args) -> int:
+    """One-time: extract the PayPay passkey from Bitwarden (forked `rbw fido2 get`)
+    and cache it in the macOS Keychain so headless login can sign locally. The
+    private key is parsed in-process and never printed."""
+    from . import passkey_login as pk
+    account = getattr(args, "account", None) or config.DEFAULT_ACCOUNT
+    try:
+        info = pk.setup(account, rp_id=args.rp_id, rbw_bin=args.rbw_bin)
+    except pk.PasskeyLoginError as e:
+        print(f"error: passkey setup failed — {e}", file=sys.stderr)
+        print("       (unlock the vault first: `bitwarden-use unlock`, and make sure "
+              "bitwarden-use with `fido2` support is on PATH or pass --rbw-bin)", file=sys.stderr)
+        return 1
+    _emit(info, args.json, lambda o: print(
+        f"✅ passkey cached in Keychain for account '{account}'\n"
+        f"   credentialId: {o['credential_id']}\n   rpId: {o['rp_id']}\n"
+        f"   (private key stored, not displayed) — `paypay login` is now headless"))
+    return 0
+
+
 def cmd_fees(client: PayPayClient, args) -> int:
     txns = parsers.parse_transactions(client.settlement_records(max_pages=_pages(args, 3)))
     trade_dates = [t["date"] for t in txns if t["type"] in costs.TRADE_TYPES and t["date"]]
@@ -1919,6 +1939,12 @@ def build_parser() -> argparse.ArgumentParser:
             sp.add_argument("--price-spread-pct", type=float, default=0.0,
                             help="add an estimated price-spread cost at this %% of US turnover")
 
+    pks = sub.add_parser("passkey-setup", parents=[common]); pks.set_defaults(func=cmd_passkey_setup)
+    pks.add_argument("--rp-id", default="paypay-sec.co.jp",
+                     help="passkey rpId / entry selector in Bitwarden (default paypay-sec.co.jp)")
+    pks.add_argument("--rbw-bin", default="bitwarden-use",
+                     help="path to the bitwarden-use binary with `fido2` support (default: bitwarden-use on PATH)")
+
     snap = sub.add_parser("snapshot", parents=[common]); snap.set_defaults(func=cmd_snapshot)
     snap.add_argument("snap_cmd", nargs="?", choices=("save", "list"), default="save",
                       help="save (default) a snapshot of the account, or list saved snapshots")
@@ -1976,6 +2002,10 @@ def main(argv=None) -> int:
         return cmd_accounts(None, args)
     if args.func is cmd_doctor:
         return cmd_doctor(None, args)
+    # `passkey-setup` only extracts from Bitwarden (via rbw) into the Keychain — no
+    # PayPay login/network of its own.
+    if args.func is cmd_passkey_setup:
+        return cmd_passkey_setup(None, args)
     # `calendar` only reads saved snapshots from disk (no creds/network); it handles
     # account selection (incl. -a all = household) itself.
     if args.func is cmd_calendar:

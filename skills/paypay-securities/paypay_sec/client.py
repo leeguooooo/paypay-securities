@@ -165,6 +165,14 @@ class PayPayClient:
     # ---- auth ----
     def login(self) -> dict:
         """Force a fresh /login.json. Returns the parsed payload; saves session."""
+        # If a passkey is cached, go straight to the headless FIDO2 flow — skip the
+        # password POST entirely. (The password /login.json sets an UNAUTHORIZED
+        # laravel_session that pollutes the session so the passkey callback can't
+        # mint a clean one — and the password path is pointless on a passkey-locked
+        # account anyway.)
+        from . import passkey_login as pk
+        if pk.load_passkey(self.settings.account):
+            return self._passkey_login()
         r = self._session.post(
             f"{BASE}/login.json",
             data={
@@ -195,10 +203,35 @@ class PayPayClient:
                 "device/cookie is not trusted; refresh PAYPAY_COOKIE from a "
                 "logged-in browser."
             )
+        if payload.get("PASSKEY_REQUIRED"):
+            # STATUS=True here is a TRAP: login.json accepts the password but the
+            # account is policy-locked to passkey (FIDO2) auth, so the laravel_session
+            # it mints is unauthorized — every /trade fetch then bounces to /login.
+            # Drive the headless passkey flow (key from the Keychain, signed locally)
+            # to mint a real authorized session; fall back to a loud error if no key.
+            return self._passkey_login(passkey_message=payload.get("MESSAGE"))
         self.token = payload.get("TOKEN")
         self._from_cache = True
         self._save_session()
         return payload
+
+    def _passkey_login(self, *, passkey_message: str | None = None) -> dict:
+        """Headless FIDO2 passkey login (private key from the Keychain, signed
+        locally). Populates self._session with the www laravel_session and caches
+        it. Raises LoginError if no passkey is set up or the server rejects us."""
+        from . import passkey_login as pk
+        try:
+            result = pk.passkey_login(self._session, self.settings.account,
+                                      self.session_file.parent)
+        except pk.PasskeyLoginError as e:
+            raise LoginError(
+                f"passkey login failed: {e}"
+                + (f" (server: {passkey_message})" if passkey_message else "")
+            ) from e
+        self.token = None
+        self._from_cache = True
+        self._save_session()
+        return {"STATUS": True, "PASSKEY": True, "result": result}
 
     def ensure_session(self) -> None:
         """Log in only if we don't already have a (cached) session."""
