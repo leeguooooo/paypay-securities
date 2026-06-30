@@ -269,8 +269,13 @@ def passkey_login(session: requests.Session, account: str, state_dir: Path,
     # /login with a passkey_status=error. (Checking cookie presence is a false
     # positive — a stale laravel_session is always in the jar.)
     final = cbr.url
-    ok = ("/trade" in final) and ("passkey_status=error" not in final) \
-        and "laravel_session" in session.cookies
+    # Success = the callback followed its redirects to an authenticated /trade page;
+    # a rejected assertion bounces to /login?passkey_status=error instead. (Do NOT
+    # gate on a laravel_session cookie — that was a false NEGATIVE on a fresh session
+    # with no seeded cookie, even though /trade/ loaded fine. Landing on /trade after
+    # redirects already proves the session is authorized.)
+    ok = ("/trade" in final) and ("/login" not in final) \
+        and ("passkey_status=error" not in final)
     err_code = ""
     if "error_code=" in final:
         err_code = final.split("error_code=", 1)[1].split("&", 1)[0]
