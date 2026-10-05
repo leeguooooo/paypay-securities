@@ -144,7 +144,6 @@ class PayPayMobileClient:
 
     def init(self) -> dict:
         """POST /v2/common/init — device/catalog bootstrap. Returns parsed JSON."""
-        s = self.settings
         r = self._session.post(
             f"{AUTH_BASE}/v2/common/init",
             data={
@@ -176,7 +175,12 @@ class PayPayMobileClient:
         )
         if r.status_code != 200:
             raise MobileLoginError(f"login returned HTTP {r.status_code}")
-        payload = r.json()
+        try:
+            payload = r.json()
+        except ValueError as e:
+            raise MobileLoginError(f"login did not return JSON: {e}") from e
+        if not isinstance(payload, dict):
+            raise MobileLoginError("login returned unexpected JSON shape")
         self.login_payload = payload
         if not payload.get("STATUS"):
             raise MobileLoginError(f"login rejected: {payload.get('MESSAGE_ARRAY')}")

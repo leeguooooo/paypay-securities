@@ -161,5 +161,45 @@ def test_assets_lark_is_bullets_not_wide_table():
     assert "CATEGORY" not in out and "WEIGHT" not in out   # NOT the wide-table header
 
 
+# ---------------------------------------------------------- -a all merges
+def test_merge_sources_worst_status_wins():
+    got = cli._merge_sources([
+        {"securities": "ok", "invtrust": "partial", "cash": "live"},
+        {"securities": "failed", "invtrust": "ok", "cash": "stale"},
+        {"securities": "partial", "invtrust": "stale", "cash": "live"},
+    ])
+    assert got == {"securities": "failed", "invtrust": "partial", "cash": "stale"}
+
+
+def _raw(val, cash, fresh, sources):
+    return {"rows": [{"category": "証券", "name": "TSLA", "valuation": val,
+                      "unrealized_pl": 0, "account_types": []}],
+            "cash": cash, "cash_fresh": fresh, "sell_pending": None, "sources": sources}
+
+
+def test_merge_assets_and_risk_propagate_staleness():
+    per = {"a": _raw(100, 10, True, {"securities": "ok", "cash": "live"}),
+           "b": _raw(200, 20, False, {"securities": "partial", "cash": "stale"})}
+    a = cli._merge_assets(per)
+    assert a["cash_fresh"] is False
+    assert a["sources"] == {"securities": "partial", "cash": "stale"}
+    assert a["grand_total"] == 330 and a["accounts"] == {"a": 110, "b": 220}
+    r = cli._merge_risk(per)
+    assert r["sources"] == {"securities": "partial", "cash": "stale"}
+
+
+def test_merge_total_does_not_claim_fresh():
+    ok = {"securities_total": 1, "invtrust_valuation": 1, "invested_total": 2, "cash": 1,
+          "grand_total": 3, "invtrust_sell_pending": 0, "cash_fresh": True, "errors": [],
+          "sources": {"securities": "ok", "cash": "live"}}
+    stale = {**ok, "cash_fresh": False, "sources": {"securities": "ok", "cash": "stale"}}
+    m = cli._merge_total({"a": ok, "b": stale})
+    assert m["cash_fresh"] is False and m["sources"]["cash"] == "stale"
+    m = cli._merge_total({"a": ok, "b": {"_error": "LoginError"}})
+    assert m["cash_fresh"] is False
+    assert m["sources"]["account:b"] == "failed"
+    assert cli._merge_total({"a": ok})["cash_fresh"] is True
+
+
 if __name__ == "__main__":
     raise SystemExit(run(globals()))

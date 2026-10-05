@@ -12,11 +12,40 @@ Each account keeps its own session + response cache (see client.state_dir).
 from __future__ import annotations
 
 import os
+import stat
+import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
 HOME = Path.home() / ".paypay-sec"
 DEFAULT_ACCOUNT = "default"
+
+
+def private_dir(path: Path) -> Path:
+    """mkdir -p with 0700 on newly created dirs (state dirs hold session cookies)."""
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    return path
+
+
+def write_private(path: Path, text: str) -> None:
+    """Atomically write `text` to `path` as 0600: temp file in the same dir, fsync,
+    os.replace — readers never see a half-written file and the old one survives a
+    crash mid-write."""
+    private_dir(path.parent)
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:   # mkstemp → already 0600
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def env_file_for(account: str | None) -> Path | None:
@@ -35,17 +64,44 @@ def env_file_for(account: str | None) -> Path | None:
     return next((p for p in candidates if p.exists()), None)
 
 
+def _unquote(val: str) -> str:
+    """Strip ONE matching pair of surrounding quotes (a value may legitimately
+    contain or end with a quote character)."""
+    if len(val) >= 2 and val[0] == val[-1] and val[0] in "\"'":
+        return val[1:-1]
+    return val
+
+
+_warned: set = set()
+
+
+def _warn_if_loose(path: Path) -> None:
+    """The .env holds credentials — nag (don't refuse, once per file) if group/other
+    can read it."""
+    if path in _warned:
+        return
+    _warned.add(path)
+    try:
+        mode = path.stat().st_mode
+    except OSError:
+        return
+    if mode & (stat.S_IRWXG | stat.S_IRWXO):
+        print(f"warning: {path} is readable by others (mode {oct(mode & 0o777)}) — "
+              f"run: chmod 600 {path}", file=sys.stderr)
+
+
 def load_dotenv(account: str | None = None) -> None:
     """Seed os.environ from the account's .env (without overriding real env vars)."""
     path = env_file_for(account)
     if not path:
         return
+    _warn_if_loose(path)
     for raw in path.read_text(encoding="utf-8").splitlines():
         line = raw.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
         key, _, val = line.partition("=")
-        os.environ.setdefault(key.strip(), val.strip().strip('"').strip("'"))
+        os.environ.setdefault(key.strip(), _unquote(val.strip()))
 
 
 def account_label(account: str | None) -> str:
@@ -59,7 +115,7 @@ def account_label(account: str | None) -> str:
             for raw in path.read_text(encoding="utf-8").splitlines():
                 line = raw.strip()
                 if line.startswith("PAYPAY_LABEL") and "=" in line:
-                    val = line.partition("=")[2].strip().strip('"').strip("'")
+                    val = _unquote(line.partition("=")[2].strip())
                     if val:
                         return val
         except OSError:
@@ -101,13 +157,14 @@ class Settings:
             where = (f"~/.paypay-sec/{account}.env" if account not in (None, DEFAULT_ACCOUNT)
                      else "~/.paypay-sec/.env")
             raise RuntimeError(f"no credential file for account '{account}' ({where})")
+        _warn_if_loose(path)
         d = {}
         for raw in path.read_text(encoding="utf-8").splitlines():
             line = raw.strip()
             if not line or line.startswith("#") or "=" not in line:
                 continue
             k, _, v = line.partition("=")
-            d[k.strip()] = v.strip().strip('"').strip("'")
+            d[k.strip()] = _unquote(v.strip())
         member_id, password = d.get("PAYPAY_MEMBER_ID", "").strip(), d.get("PAYPAY_PASSWORD", "").strip()
         if not member_id or not password:
             raise RuntimeError(f"account '{account}' {path} is missing PAYPAY_MEMBER_ID / PAYPAY_PASSWORD")

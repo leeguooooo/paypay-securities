@@ -18,11 +18,13 @@ from bs4 import BeautifulSoup
 # ---------------------------------------------------------------- value parsing
 
 _DASH = {"ー", "−", "-", "―", ""}
+_NUM = re.compile(r"^\d+(?:\.\d+)?$")
 
 
 def parse_yen(text: Optional[str]) -> Optional[int]:
-    """Parse a JPY amount in either '12万3456円' or '¥12,345' / '+¥678' form.
-    Returns int yen, or None for blanks/dashes ('ー')."""
+    """Parse a JPY amount in either '12万3456円' / '1.5万' or '¥12,345' / '+¥678' /
+    '¥1,234.5' form. Returns int yen (decimals rounded), or None for blanks/dashes
+    ('ー') and anything unparseable."""
     if text is None:
         return None
     t = text.strip()
@@ -37,8 +39,10 @@ def parse_yen(text: Optional[str]) -> Optional[int]:
         return None
     if "万" in cleaned:
         man, _, rest = cleaned.partition("万")
-        return sign * ((int(man) if man.isdigit() else 0) * 10000 + (int(rest) if rest.isdigit() else 0))
-    return sign * int(cleaned) if cleaned.lstrip("-").isdigit() else None
+        if not _NUM.match(man) or (rest and not _NUM.match(rest)):
+            return None
+        return sign * int(float(man) * 10000 + (float(rest) if rest else 0) + 0.5)  # half-up
+    return sign * int(float(cleaned) + 0.5) if _NUM.match(cleaned) else None
 
 
 def _find_yen(text: str) -> Optional[int]:
@@ -46,7 +50,7 @@ def _find_yen(text: str) -> Optional[int]:
     Whitespace is collapsed first because get_text() splits '16万0768円' into
     '16 万 0768 円'."""
     text = re.sub(r"\s+", "", text)
-    cands = re.findall(r"[+\-−]?¥?\d[\d,]*万?\d*円?", text)
+    cands = re.findall(r"[+\-−]?¥?\d[\d,]*(?:\.\d+)?万?\d*円?", text)
     cands = [c for c in cands if ("円" in c or "¥" in c or "万" in c)]
     return parse_yen(cands[0]) if cands else None
 
@@ -284,21 +288,12 @@ def current_cash(records: list) -> Optional[int]:
     return None
 
 
-def current_cash_combined(*record_lists) -> Optional[int]:
-    """Current cash from settlement ledgers that SHARE one cash pool (証券 + 投信).
-
-    Each market only stamps a fresh CASH_BALANCE on ITS OWN transactions, so after
-    an 投信-only buy the 証券 ledger still shows the pre-buy (stale) cash while the
-    投信 ledger already shows the post-buy balance. Reading the 証券 ledger alone
-    then double-counts the spent cash (once inside the now-larger fund holding,
-    once as still-held cash). Returns the CASH_BALANCE of the single most-recent
-    row across all given ledgers, ranked by (BASE_D, SEQ_NO).
-
-    BASE_D shares one format across these CO_TRADE_HIST feeds, so a lexicographic
-    date compare orders them correctly; SEQ_NO (an account-wide sequence — the same
-    入金 row carries one SEQ_NO in both market views) breaks same-day ties."""
-    best_key = None
-    best_cash = None
+def latest_cash_row(*record_lists) -> Optional[tuple]:
+    """((date, seq), cash) of the single most-recent CASH_BALANCE row across
+    ledgers that SHARE one cash pool, or None. The key is comparable across runs
+    (date ISO-normalized, SEQ_NO an account-wide sequence), so callers can tell
+    whether a stored balance is newer than a freshly fetched one."""
+    best = None
     for recs in record_lists:
         for r in recs or []:
             bal = r.get("CASH_BALANCE")
@@ -312,10 +307,27 @@ def current_cash_combined(*record_lists) -> Optional[int]:
                 seq = int(float(r.get("SEQ_NO")))
             except (TypeError, ValueError):
                 seq = -1
-            key = (str(r.get("BASE_D") or ""), seq)
-            if best_key is None or key > best_key:
-                best_key, best_cash = key, cash
-    return best_cash
+            key = (re.sub(r"[./]", "-", str(r.get("BASE_D") or "")), seq)
+            if best is None or key > best[0]:
+                best = (key, cash)
+    return best
+
+
+def current_cash_combined(*record_lists) -> Optional[int]:
+    """Current cash from settlement ledgers that SHARE one cash pool (証券 + 投信).
+
+    Each market only stamps a fresh CASH_BALANCE on ITS OWN transactions, so after
+    an 投信-only buy the 証券 ledger still shows the pre-buy (stale) cash while the
+    投信 ledger already shows the post-buy balance. Reading the 証券 ledger alone
+    then double-counts the spent cash (once inside the now-larger fund holding,
+    once as still-held cash). Returns the CASH_BALANCE of the single most-recent
+    row across all given ledgers, ranked by (BASE_D, SEQ_NO).
+
+    BASE_D is normalized to ISO so a lexicographic date compare orders them
+    correctly; SEQ_NO (an account-wide sequence — the same 入金 row carries one
+    SEQ_NO in both market views) breaks same-day ties."""
+    best = latest_cash_row(*record_lists)
+    return best[1] if best else None
 
 
 def parse_cash_balance(html: str) -> Optional[int]:

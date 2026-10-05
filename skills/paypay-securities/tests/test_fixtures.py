@@ -163,5 +163,16 @@ def test_parsers_survive_login_redirect_html():
     assert parsers.parse_summary(login_html).total_valuation is None
 
 
+def test_parse_yen_decimals_and_man_units():
+    assert parsers.parse_yen("¥1,234.5") == 1235          # half-up, not None
+    assert parsers.parse_yen("-¥1,234.5") == -1235
+    assert parsers.parse_yen("1.5万") == 15000             # not 0
+    assert parsers.parse_yen("1.5万円") == 15000
+    assert parsers.parse_yen("12万3456円") == 123456
+    assert parsers.parse_yen("万円") is None
+    assert parsers.parse_yen("abc") is None
+    assert parsers._find_yen("含み損益 +¥1,234.5") == 1235
+
+
 if __name__ == "__main__":
     raise SystemExit(run(globals()))

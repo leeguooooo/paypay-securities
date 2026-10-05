@@ -59,14 +59,8 @@ def _pages(args, default: int) -> int:
 
 
 def _measured_cost(explicit_fees, fx_cost, inv_tax, inv_transfer) -> dict:
-    """Measured trading cost. 投信譲渡益税 + 送金手数料 already settle in the 証券 cash
-    ledger (so they're inside explicit_fees) — they are a BREAKDOWN, not extra cost.
-    The only cost outside the ledger is the reconstructed FX spread. residual<0 means
-    the cash-ledger window missed some 投信 rows (→ --all)."""
-    ef, fx = explicit_fees or 0, fx_cost or 0
-    residual = ef - (inv_tax or 0) - (inv_transfer or 0)
-    return {"total_cost": ef + fx, "securities_fee_residual": residual,
-            "cost_reconciles": residual >= 0}
+    """Measured trading cost — see costs.measured_cost (shared with `fees`)."""
+    return costs.measured_cost(explicit_fees, fx_cost, inv_tax, inv_transfer)
 
 
 def _hist_pages(args) -> int:
@@ -200,42 +194,105 @@ def _emit(obj, as_json: bool, render):
         _run_localized(render, obj)
 
 
-def _persist_cash(client: PayPayClient, cash):
-    """現金 with a persistent fallback for when the settlement ledger throttles to
-    empty. Pass the freshly-parsed cash (may be None); on success it's cached to
-    disk, on failure we fall back to the last good value. Returns (yen, fresh) —
-    fresh=False means the number is a stale disk value, not live; None = nothing
-    on record yet, so callers must NOT silently treat it as ¥0."""
+def _pick_cash(stored, sec_recs, inv_recs):
+    """Pure core of _resolve_cash → (cash, fresh, to_store_or_None).
+
+    The 証券 + 投信 ledgers share ONE cash pool and each only stamps CASH_BALANCE on
+    its own rows, so cash = the newest row across both (never a sum). It counts as
+    live only when BOTH ledgers returned rows — with one throttled to empty, the
+    other's newest row may predate a movement the missing one holds. `stored` is
+    the last_cash.json dict ({"cash", "key": [date, seq]}); whichever of stored vs
+    fetched carries the newer (BASE_D, SEQ_NO) key wins, so a cached/lagging read
+    can never overwrite a newer known balance."""
+    live = bool(sec_recs) and bool(inv_recs)
+    row = parsers.latest_cash_row(sec_recs or [], inv_recs or [])
+    scash = skey = None
+    if isinstance(stored, dict) and stored.get("cash") is not None:
+        scash = stored["cash"]
+        k = stored.get("key")
+        skey = (str(k[0]), int(k[1])) if isinstance(k, list) and len(k) == 2 else None
+    if row is not None:
+        key, cash = row
+        rec = {"cash": cash, "key": [key[0], key[1]]}
+        if skey is not None:
+            if key >= skey:
+                return cash, live, (rec if key > skey else None)
+            return scash, False, None          # disk knows a newer balance
+        if live or scash is None:              # legacy keyless file: trust a live read
+            return cash, live, rec
+    if scash is not None:
+        return scash, False, None
+    return None, False, None
+
+
+def _resolve_cash(client: PayPayClient, sec_recs, inv_recs):
+    """現金 from the shared-pool ledgers with a persistent fallback for when a
+    ledger throttles to empty. Returns (yen, fresh) — fresh=False means the number
+    is not a complete live read (stale disk value or one ledger missing); None =
+    nothing on record yet, so callers must NOT silently treat it as ¥0."""
     path = client.session_file.parent / "last_cash.json"
-    if cash is not None:
+    try:
+        stored = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        stored = None
+    cash, fresh, to_store = _pick_cash(stored, sec_recs, inv_recs)
+    if to_store is not None:
         try:
-            path.write_text(json.dumps({"cash": int(cash)}), encoding="utf-8")
+            snapshots.atomic_write_text(path, json.dumps(to_store))
         except OSError:
             pass
-        return cash, True
-    try:
-        return json.loads(path.read_text(encoding="utf-8")).get("cash"), False
-    except (OSError, ValueError):
-        return None, False
+    return cash, fresh
+
+
+def _cash_source(cash, fresh) -> str:
+    return "live" if fresh else ("stale" if cash is not None else "failed")
+
+
+def _holding_source(fetched, rows) -> str:
+    """ok / partial (a row whose valuation didn't parse) / failed (no fetch)."""
+    if fetched is None:
+        return "failed"
+    return "partial" if any(v is None for v in rows) else "ok"
+
+
+_SOURCE_RANK = {"failed": 3, "partial": 2, "stale": 1, "missing": 1}
+
+
+def _merge_sources(dicts) -> dict:
+    """Per-key worst status across accounts: failed > partial > stale > ok/live."""
+    out: dict = {}
+    for d in dicts:
+        for k, v in (d or {}).items():
+            if k not in out or _SOURCE_RANK.get(v, 0) > _SOURCE_RANK.get(out[k], 0):
+                out[k] = v
+    return out
 
 
 def _expected_phrase(req) -> str:
-    qty_or_amt = req.qty if req.qty is not None else req.amount_jpy
-    # normalize numbers like 1.0 -> "1"
-    q = int(qty_or_amt) if float(qty_or_amt).is_integer() else qty_or_amt
-    return f"{req.symbol} {q}"
+    return f"{req.side.value.upper()} {req.symbol} {req.amount_jpy}"
+
+
+def _order_terms(req, preview=None) -> str:
+    """One honest line describing what the web flow actually sends."""
+    pv = preview or {}
+    if pv.get("preorder"):
+        when = (f"executes at the next session's quote ({pv['execute_date']})"
+                if pv.get("execute_date") else "executes at the next session's quote")
+        fill = f"— 予約注文 (成行予約; market closed now): {when}, no limit price"
+    else:
+        fill = "— executed at the current quote (成行相当/按现价; no limit price)"
+    return (f"{req.side.value.upper()} {req.symbol}  金額指定 ¥{req.amount_jpy:,}  "
+            f"口座: {_orders.account_type_name(req.account_type)}  {fill}")
 
 
 def make_confirmer(reader=input):
     """Return confirmer(req, preview) -> bool. Requires the user to type the exact
-    '<SYMBOL> <qty|amount>' phrase — defends against a reflexive Enter."""
+    '<SIDE> <SYMBOL> <amount>' phrase — defends against a reflexive Enter."""
     def confirmer(req, preview) -> bool:
         want = _expected_phrase(req)
-        side = req.side.value.upper()
         total = (preview or {}).get("total_jpy")
-        size = f"qty {req.qty}" if req.qty is not None else f"¥{req.amount_jpy:,}"
-        total_frag = f"  est. total ¥{total:,}" if total is not None else ""
-        print(f"\n⚠ LIVE ORDER — {side} {req.symbol} {size}{total_frag}")
+        total_frag = f"\n  server amount: ¥{total:,}" if total is not None else ""
+        print(f"\n⚠ LIVE ORDER — {_order_terms(req, preview)}{total_frag}")
         print(f"  To place this order, type exactly:  {want}")
         try:
             typed = (reader(f"  confirm> ") or "").strip()
@@ -289,9 +346,20 @@ def cmd_passkey_setup(_unused, args) -> int:
 
 def cmd_fees(client: PayPayClient, args) -> int:
     txns = parsers.parse_transactions(client.settlement_records(max_pages=_pages(args, 3)))
-    trade_dates = [t["date"] for t in txns if t["type"] in costs.TRADE_TYPES and t["date"]]
-    series = market.usdjpy_series(min(trade_dates), max(trade_dates)) if trade_dates else {}
-    result = costs.compute_costs(txns, series)
+    result = costs.compute_costs(txns, _fx_series_for(txns))
+    # same measured-cost breakdown as `review` (costs.measured_cost): the 投信
+    # 譲渡益税 / 送金手数料 are a breakdown of the cash-ledger fees, not extra cost.
+    try:
+        inv = report.aggregate_invtrust(parsers.parse_invtrust_transactions(
+            client.invtrust_settlement_records(max_pages=max(_pages(args, 3), 30))))
+        inv_tax, inv_transfer = inv["capital_gains_tax"], inv["transfer_fees"]
+    except Exception:  # noqa: BLE001 — breakdown is optional; total doesn't need it
+        inv_tax = inv_transfer = None
+    mc = costs.measured_cost(result["explicit_fees"], result["fx_spread_cost"], inv_tax, inv_transfer)
+    result = {**result, "measured_total": mc["total_cost"],
+              "inv_capital_gains_tax": inv_tax, "inv_transfer_fees": inv_transfer,
+              "securities_fee_residual": mc["securities_fee_residual"] if inv_tax is not None else None,
+              "cost_reconciles": mc["cost_reconciles"] if inv_tax is not None else None}
 
     pps_pct = getattr(args, "price_spread_pct", 0.0) or 0.0
     pps = None
@@ -303,6 +371,10 @@ def cmd_fees(client: PayPayClient, args) -> int:
     def render(p):
         print("PayPay証券 — cost analysis (read-only)\n")
         print(f"  手数料/税 (explicit)    : {_yen(p['explicit_fees'])}")
+        if p["inv_capital_gains_tax"] is not None:
+            cmark = "" if p["cost_reconciles"] else "  ⚠現金ledger不足(--allで再取得)"
+            print(f"     (うち 投信譲渡益税 {_yen(p['inv_capital_gains_tax'])} / 送金手数料 "
+                  f"{_yen(p['inv_transfer_fees'])} / 証券手数料 {_yen(p['securities_fee_residual'])}){cmark}")
         if p["fx_available"]:
             print(f"  為替スプレッド (measured) : {_yen(p['fx_spread_cost'])}"
                   f"   [{p['fx_trades']} trades, ${p['usd_notional']:,.0f}, ~{p['avg_spread_per_usd']} JPY/USD]")
@@ -327,15 +399,17 @@ def cmd_fees(client: PayPayClient, args) -> int:
     return 0
 
 
-def _gather(client: PayPayClient, pages: int = 8) -> dict:
-    """Fetch everything a review needs, concurrently."""
+def _fetch_account(client: PayPayClient, ledger_pages: int = 1, inv_ledger_pages: int = 1) -> dict:
+    """THE concurrent per-account fetch behind review/snapshot/diff/assets/risk:
+    証券 holdings (usa + japan) + 投信 holdings + both settlement ledgers (which
+    also yield the shared-pool cash). Degrades per source — a failed feed is
+    marked 'failed' (a row with an unparsed valuation → 'partial'), never a crash."""
     client.ensure_session()
     tasks = {
-        "ledger": lambda: client.settlement_records(max_pages=pages),
-        # 投信 ledger is a separate, churnier feed (≈14 pages); fetch generously —
-        # it stops early on NEXT_FLG, so the cap is just an upper bound.
-        "invledger": lambda: client.invtrust_settlement_records(max_pages=max(pages, 30)),
-        "sec": lambda: parsers.parse_holdings(client.brands_html("usa")),
+        "ledger": lambda: client.settlement_records(max_pages=ledger_pages),
+        "invledger": lambda: client.invtrust_settlement_records(max_pages=inv_ledger_pages),
+        "sec_usa": lambda: parsers.parse_holdings(client.brands_html("usa")),
+        "sec_japan": lambda: parsers.parse_holdings(client.brands_html("japan")),
         "inv": lambda: parsers.parse_invtrust(client.invtrust_top()),
         "names": client.invtrust_brands,
     }
@@ -345,50 +419,78 @@ def _gather(client: PayPayClient, pages: int = 8) -> dict:
         for k, f in futs.items():
             try:
                 out[k] = f.result()
-            except Exception:  # noqa: BLE001
+            except Exception:  # noqa: BLE001 — degrade gracefully per source
                 out[k] = None
 
-    ledger = out.get("ledger") or []
-    txns = parsers.parse_transactions(ledger)
-    names = out.get("names") or {}
-    holdings = []
-    for h in (out.get("sec") or []):
-        if h.is_cash:
-            continue
-        holdings.append({"name": h.name, "category": "証券", "valuation": h.valuation or 0,
-                         "unrealized_pl": h.unrealized_pl})
     inv = out.get("inv")
+    names = out.get("names") or {}
+    rows = []
     if inv:
         for h in inv.holdings:
-            holdings.append({"name": names.get(str(h["brand_id"])) or f"投信#{h['brand_id']}",
-                             "category": "投信", "valuation": h["valuation"] or 0,
-                             "unrealized_pl": h["unrealized_pl"]})
-    inv_txns = parsers.parse_invtrust_transactions(out.get("invledger") or [])
-    # cash pool is shared with 投信 — take the newest balance across both ledgers,
-    # else an 投信-only buy leaves the 証券 ledger stale and double-counts cash.
-    cash, cash_fresh = _persist_cash(
-        client, parsers.current_cash_combined(ledger, out.get("invledger") or []))
-    total = sum(h["valuation"] for h in holdings) + (cash or 0)
-    tdates = [t["date"] for t in txns if t["type"] in costs.TRADE_TYPES and t["date"]]
-    series = market.usdjpy_series(min(tdates), max(tdates)) if tdates else {}
+            rows.append({"category": "投信", "name": names.get(str(h["brand_id"])) or f"#{h['brand_id']}",
+                         "valuation": h["valuation"], "unrealized_pl": h["unrealized_pl"],
+                         "account_types": []})   # 投信 口座別 needs the ledger (see _invtrust_lots)
+    sec = [h for mkt in ("sec_usa", "sec_japan") for h in (out.get(mkt) or []) if not h.is_cash]
+    for h in sec:
+        rows.append({"category": "証券", "name": h.name,
+                     "valuation": h.valuation, "unrealized_pl": h.unrealized_pl,
+                     "account_types": list(h.account_types or [])})
+    ledger, invledger = out.get("ledger") or [], out.get("invledger") or []
+    cash, cash_fresh = _resolve_cash(client, ledger, invledger)
+    sec_src = _holding_source(out.get("sec_usa"), [h.valuation for h in sec])
+    if sec_src == "ok" and out.get("sec_japan") is None:
+        sec_src = "partial"                    # 米国株 read, 日本株 page didn't
     sources = {
-        "securities": "ok" if out.get("sec") is not None else "failed",
-        "invtrust": "ok" if out.get("inv") is not None else "failed",
-        "ledger": "ok" if out.get("ledger") else "failed",
-        "invledger": "ok" if out.get("invledger") is not None else "failed",
-        "cash": "live" if cash_fresh else ("stale" if cash is not None else "failed"),
-        "fx": "ok" if series else "missing",
+        "securities": sec_src,
+        "invtrust": _holding_source(inv, [h["valuation"] for h in (inv.holdings if inv else [])]),
+        "ledger": "ok" if ledger else "failed",
+        "invledger": "ok" if invledger else "failed",
+        "cash": _cash_source(cash, cash_fresh),
     }
-    return {"txns": txns, "inv_txns": inv_txns, "holdings": holdings,
-            "cash": cash or 0, "cash_fresh": cash_fresh, "total": total,
-            "fx_series": series, "sources": sources}
+    return {"rows": rows, "cash": cash, "cash_fresh": cash_fresh,
+            "sell_pending": inv.sell_order_pending if inv else None,
+            "ledger": ledger, "invledger": invledger, "sources": sources}
+
+
+_PAGE_SIZE = 20   # settlement feeds return 20 rows per PAGE_NUM step
+
+
+def _gather(client: PayPayClient, pages: int = 8) -> dict:
+    """Fetch everything a review/snapshot needs (see _fetch_account)."""
+    # 投信 ledger is a separate, churnier feed (≈14 pages); fetch generously —
+    # it stops early on NEXT_FLG, so the cap is just an upper bound.
+    inv_pages = max(pages, 30)
+    a = _fetch_account(client, pages, inv_pages)
+    ledger, invledger = a["ledger"], a["invledger"]
+    # 証券 first (stable order for equal valuations, as before)
+    holdings = [{"name": r["name"], "category": r["category"], "valuation": r["valuation"] or 0,
+                 "unrealized_pl": r["unrealized_pl"]}
+                for r in sorted(a["rows"], key=lambda r: r["category"] != "証券")]
+    cash = a["cash"]
+    total = sum(h["valuation"] for h in holdings) + (cash or 0)
+    # both ledgers returned AND neither hit its page cap → cumulative figures
+    # (deposits / realized) cover the whole account history
+    ledger_complete = (bool(ledger) and bool(invledger)
+                       and len(ledger) < pages * _PAGE_SIZE
+                       and len(invledger) < inv_pages * _PAGE_SIZE)
+    return {"txns": parsers.parse_transactions(ledger),
+            "inv_txns": parsers.parse_invtrust_transactions(invledger),
+            "holdings": holdings, "cash": cash or 0, "cash_fresh": a["cash_fresh"],
+            "total": total, "sources": a["sources"], "ledger_complete": ledger_complete}
+
+
+def _fx_series_for(txns) -> dict:
+    tdates = [t["date"] for t in txns if t["type"] in costs.TRADE_TYPES and t["date"]]
+    return market.usdjpy_series(min(tdates), max(tdates)) if tdates else {}
 
 
 def cmd_review(client: PayPayClient, args) -> int:
     g = _gather(client, pages=_pages(args, 8))
     agg = report.aggregate_trades(g["txns"])
     inv = report.aggregate_invtrust(g.get("inv_txns") or [])
-    fx_cost = costs.compute_costs(g["txns"], g["fx_series"])["fx_spread_cost"]
+    fx_series = _fx_series_for(g["txns"])
+    g["sources"]["fx"] = "ok" if fx_series else "missing"
+    fx_cost = costs.compute_costs(g["txns"], fx_series)["fx_spread_cost"]
     unreal = sum((h["unrealized_pl"] or 0) for h in g["holdings"])
     total, cash = g["total"], g["cash"]
     hold = sorted(g["holdings"], key=lambda x: -x["valuation"])
@@ -701,8 +803,13 @@ def cmd_doctor(client, args) -> int:
 
 
 def _build_snapshot(client: PayPayClient, args) -> dict:
-    """Compute the account's headline numbers for a snapshot (review-level)."""
-    g = _gather(client, pages=_pages(args, 8))
+    """Compute the account's headline numbers for a snapshot (review-level).
+
+    Always scans the FULL ledger history: net_deposit / realized_total are
+    cumulative, and a capped window lets old 入金 fall out between snapshots,
+    which the calendar would then book as profit/loss. `ledger_full` records
+    whether that full scan actually completed (calendar trusts only full↔full)."""
+    g = _gather(client, pages=_ALL_PAGES_CAP)
     agg = report.aggregate_trades(g["txns"])
     inv = report.aggregate_invtrust(g.get("inv_txns") or [])
     unreal = sum((h["unrealized_pl"] or 0) for h in g["holdings"])
@@ -718,6 +825,7 @@ def _build_snapshot(client: PayPayClient, args) -> dict:
         "net_deposit": agg["deposits"] - agg["withdrawals"],
         "deposits": agg["deposits"], "withdrawals": agg["withdrawals"],
         "holdings": holdings, "sources": g.get("sources"),
+        "ledger_full": bool(g.get("ledger_complete")),
     }
 
 
@@ -725,11 +833,8 @@ def cmd_snapshot(client: PayPayClient, args) -> int:
     """Save / list account snapshots — the CLI's own long-term time series."""
     account = getattr(args, "account", None)
     if getattr(args, "snap_cmd", "save") == "list":
-        paths = snapshots.list_paths(account)
-        rows = []
-        for p in paths:
-            s = snapshots.load(p)
-            rows.append({k: s.get(k) for k in ("ts", "as_of", "grand_total", "cash", "realized_total")})
+        rows = [{k: s.get(k) for k in ("ts", "as_of", "grand_total", "cash", "realized_total")}
+                for s in snapshots.load_all(account)]
         payload = {"snapshots": rows}
 
         def render(pl):
@@ -863,7 +968,7 @@ def cmd_calendar(client: PayPayClient, args) -> int:
         label = config.account_label(prof)
         if label in per:                       # de-collide duplicate labels
             label = f"{label}({prof})"
-        per[label] = [snapshots.load(p) for p in snapshots.list_paths(prof)]
+        per[label] = snapshots.load_all(prof)
 
     payload = _calendar_payload(per)
 
@@ -882,8 +987,7 @@ def cmd_calendar(client: PayPayClient, args) -> int:
 
     out = getattr(args, "out", None)
     out_path = Path(out).expanduser() if out else (_state_dir(None) / "pnl-calendar.html")
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(html, encoding="utf-8")
+    snapshots.atomic_write_text(out_path, html)
 
     n_days = len(payload["days"])
     print(f"P&L calendar written: {out_path}")
@@ -1101,6 +1205,7 @@ def _all_accounts(args, render, payload_fn, merge) -> int:
     per = {}
     for name, client in _account_clients(args):
         if client is None:
+            per[name] = {"_error": "ProfileLoadError"}
             continue
         try:
             per[name] = payload_fn(client, args)
@@ -1153,29 +1258,42 @@ def _total_payload(client: PayPayClient, args) -> dict:
     for mkt in ("usa", "japan"):
         try:
             s = parsers.parse_summary(client.portfolio_html(mkt))
-            sec_by_market[mkt] = s.total_valuation or 0
+            sec_by_market[mkt] = s.total_valuation   # None = page read, value didn't parse
+            if s.total_valuation is None:
+                errors.append(f"{mkt}: valuation unparsed")
         except (requests.HTTPError, requests.RequestException) as e:
             sec_by_market[mkt] = None
             errors.append(f"{mkt}: {type(e).__name__}")
     sec_total = sum(v for v in sec_by_market.values() if v)
-    inv = parsers.parse_invtrust(client.invtrust_top())
-    invested = sec_total + (inv.valuation or 0)
+    try:
+        inv = parsers.parse_invtrust(client.invtrust_top())
+    except Exception as e:  # noqa: BLE001 — degrade like the other sources
+        inv = None
+        errors.append(f"invtrust: {type(e).__name__}")
+    inv_val = inv.valuation if inv else None
+    invested = sec_total + (inv_val or 0)
     # shared cash pool: newest balance across 証券 + 投信 ledgers (page-1 of each is
     # enough — both are newest-first) so an 投信 buy doesn't leave 証券 cash stale.
-    cash, cash_fresh = _persist_cash(client, parsers.current_cash_combined(
-        client.settlement_records(max_pages=1),
-        client.invtrust_settlement_records(max_pages=1)))
+    ledgers = []
+    for fetch in (client.settlement_records, client.invtrust_settlement_records):
+        try:
+            ledgers.append(fetch(max_pages=1))
+        except Exception:  # noqa: BLE001
+            ledgers.append([])
+    cash, cash_fresh = _resolve_cash(client, *ledgers)
     if not cash_fresh:
         errors.append("cash: throttled→stale")
+    fetched = [v for v in sec_by_market.values() if v is not None]
     return {
         "securities_by_market": sec_by_market, "securities_total": sec_total,
-        "invtrust_valuation": inv.valuation, "invested_total": invested,
+        "invtrust_valuation": inv_val, "invested_total": invested,
         "cash": cash, "cash_fresh": cash_fresh, "grand_total": invested + (cash or 0),
-        "invtrust_sell_pending": inv.sell_order_pending, "errors": errors,
+        "invtrust_sell_pending": inv.sell_order_pending if inv else None, "errors": errors,
         "sources": {
-            "securities": "ok" if any(v for v in sec_by_market.values()) else "failed",
-            "invtrust": "ok" if inv.valuation is not None else "failed",
-            "cash": "live" if cash_fresh else ("stale" if cash is not None else "failed")},
+            "securities": ("failed" if not fetched
+                           else "ok" if len(fetched) == len(sec_by_market) else "partial"),
+            "invtrust": "ok" if inv_val is not None else "failed",
+            "cash": _cash_source(cash, cash_fresh)},
         "note": ("grand_total = 証券 + 投信 holdings + cash (newest balance across the "
                  "証券+投信 shared pool), matching the app's 保有資産 total. CFD "
                  "(separate login) is not included."),
@@ -1220,6 +1338,13 @@ def _render_total(p: dict, fmt: str) -> None:
             print(line)
 
 
+def _acct_sources(per: dict) -> list:
+    """Each account's sources for _merge_sources; an account that errored out
+    entirely counts as one failed source (so the merge never looks complete)."""
+    return [{f"account:{a}": "failed"} if p.get("_error") else (p.get("sources") or {})
+            for a, p in per.items()]
+
+
 def _merge_total(per: dict) -> dict:
     keys = ("securities_total", "invtrust_valuation", "invested_total", "cash",
             "grand_total", "invtrust_sell_pending")
@@ -1231,8 +1356,11 @@ def _merge_total(per: dict) -> dict:
         for k in keys:
             out[k] += p.get(k) or 0
         accounts[acct] = p.get("grand_total") or 0
-    out.update({"accounts": accounts, "errors": errors, "cash_fresh": True,
-                "sources": {}, "note": "全口座合算。CFD は別ログイン未集計。"})
+        errors += [f"{acct}: {e}" for e in p.get("errors") or []]
+    out.update({"accounts": accounts, "errors": errors,
+                "cash_fresh": all(p.get("cash_fresh", False) for p in per.values()),
+                "sources": _merge_sources(_acct_sources(per)),
+                "note": "全口座合算。CFD は別ログイン未集計。"})
     return out
 
 
@@ -1246,50 +1374,11 @@ def cmd_total(client: PayPayClient, args) -> int:
 
 
 def _consolidated_holdings(client: PayPayClient):
-    """Concurrent fetch of 証券(usa) + 投信 holdings + securities cash. Degrades
-    per source (a failed feed → that source marked 'failed', not a crash).
-    Returns (rows, cash, cash_fresh, invtrust_sell_pending, sources)."""
-    client.ensure_session()
-    tasks = {
-        "sec_usa": lambda: parsers.parse_holdings(client.brands_html("usa")),
-        "inv_top": client.invtrust_top,
-        # shared cash pool — newest balance across 証券 + 投信 ledgers (see
-        # parsers.current_cash_combined) so an 投信 buy doesn't double-count cash.
-        "cash": lambda: parsers.current_cash_combined(
-            client.settlement_records(max_pages=1),
-            client.invtrust_settlement_records(max_pages=1)),
-        "names": client.invtrust_brands,
-    }
-    out = {}
-    with cf.ThreadPoolExecutor(max_workers=len(tasks)) as ex:
-        futs = {k: ex.submit(fn) for k, fn in tasks.items()}
-        for k, f in futs.items():
-            try:
-                out[k] = f.result()
-            except Exception:  # noqa: BLE001 — degrade gracefully per source
-                out[k] = None
-
-    inv = parsers.parse_invtrust(out["inv_top"]) if out.get("inv_top") else None
-    names = out.get("names") or {}
-    cash, cash_fresh = _persist_cash(client, out.get("cash"))
-    rows = []
-    if inv:
-        for h in inv.holdings:
-            rows.append({"category": "投信", "name": names.get(str(h["brand_id"])) or f"#{h['brand_id']}",
-                         "valuation": h["valuation"], "unrealized_pl": h["unrealized_pl"],
-                         "account_types": []})   # 投信 口座別 needs the ledger (see _invtrust_lots)
-    for h in (out.get("sec_usa") or []):
-        if h.is_cash:
-            continue
-        rows.append({"category": "証券", "name": h.name,
-                     "valuation": h.valuation, "unrealized_pl": h.unrealized_pl,
-                     "account_types": list(h.account_types or [])})
-    sources = {
-        "securities": "ok" if out.get("sec_usa") is not None else "failed",
-        "invtrust": "ok" if out.get("inv_top") is not None else "failed",
-        "cash": "live" if cash_fresh else ("stale" if cash is not None else "failed"),
-    }
-    return rows, cash, cash_fresh, (inv.sell_order_pending if inv else None), sources
+    """証券 + 投信 holdings + shared-pool cash (page 1 of each ledger), via
+    _fetch_account. Returns (rows, cash, cash_fresh, invtrust_sell_pending, sources)."""
+    a = _fetch_account(client, 1, 1)
+    sources = {k: a["sources"][k] for k in ("securities", "invtrust", "cash")}
+    return a["rows"], a["cash"], a["cash_fresh"], a["sell_pending"], sources
 
 
 # Best-effort ETF classification (factual labelling, not a judgment): a holding is
@@ -1396,10 +1485,11 @@ def _account_split(rows, invtrust_lots, cash, total) -> dict:
     return {k: round(100.0 * v / total, 1) for k, v in by.items()} if total else {}
 
 
-def _risk_account_raw(client: PayPayClient, args) -> dict:
-    """Per-account materials for risk (used by -a all merge)."""
+def _account_raw(client: PayPayClient, args) -> dict:
+    """Per-account materials for assets/risk (also the -a all merge input)."""
     rows, cash, cash_fresh, sell_pending, sources = _consolidated_holdings(client)
-    raw = {"rows": rows, "cash": cash, "sell_pending": sell_pending, "sources": sources}
+    raw = {"rows": rows, "cash": cash, "cash_fresh": cash_fresh,
+           "sell_pending": sell_pending, "sources": sources}
     if getattr(args, "accounts", False):
         try:
             lots, _, _ = _invtrust_lots(client, _pages(args, 30))
@@ -1407,6 +1497,37 @@ def _risk_account_raw(client: PayPayClient, args) -> dict:
             lots = None
         raw["lots"] = lots if lots is not None else []
     return raw
+
+
+
+def _merge_holdings(per: dict) -> dict:
+    """Combine per-account raws (same fund summed) for -a all. Sources merge per
+    key by worst status; cash_fresh only if every account's cash was live."""
+    combined, lots, accts = {}, [], {}
+    cash = sell = 0
+    want_accounts = False
+    for acct, raw in per.items():
+        if raw.get("_error"):
+            continue
+        cash += raw.get("cash") or 0
+        sell += raw.get("sell_pending") or 0
+        if "lots" in raw:
+            want_accounts = True
+            lots += raw.get("lots") or []
+        acct_total = raw.get("cash") or 0
+        for r in raw.get("rows", []):
+            acct_total += r.get("valuation") or 0
+            key = (r["name"], r["category"])
+            cur = combined.setdefault(key, {"name": r["name"], "category": r["category"],
+                                            "valuation": 0, "unrealized_pl": 0, "account_types": []})
+            cur["valuation"] += r.get("valuation") or 0
+            cur["unrealized_pl"] = (cur["unrealized_pl"] or 0) + (r.get("unrealized_pl") or 0)
+            cur["account_types"] = sorted(set(cur["account_types"]) | set(r.get("account_types") or []))
+        accts[acct] = acct_total
+    return {"rows": list(combined.values()), "cash": cash, "sell_pending": sell or None,
+            "cash_fresh": all(r.get("cash_fresh", False) for r in per.values()),
+            "sources": _merge_sources(_acct_sources(per)),
+            "lots": lots, "want_accounts": want_accounts, "accounts": accts}
 
 
 def _build_risk(rows, cash, sell_pending, sources, lots, want_accounts) -> dict:
@@ -1418,31 +1539,9 @@ def _build_risk(rows, cash, sell_pending, sources, lots, want_accounts) -> dict:
 
 def _merge_risk(per: dict) -> dict:
     """Combine holdings across accounts (same fund summed) → household concentration."""
-    combined, lots, accts = {}, [], {}
-    cash = sell = 0
-    sources = {}
-    want_accounts = False
-    for acct, raw in per.items():
-        if raw.get("_error"):
-            continue
-        cash += raw.get("cash") or 0
-        sell += raw.get("sell_pending") or 0
-        sources.update(raw.get("sources") or {})
-        if "lots" in raw:
-            want_accounts = True
-            lots += raw.get("lots") or []
-        acct_total = (raw.get("cash") or 0)
-        for r in raw.get("rows", []):
-            acct_total += r.get("valuation") or 0
-            key = (r["name"], r["category"])
-            cur = combined.setdefault(key, {"name": r["name"], "category": r["category"],
-                                            "valuation": 0, "unrealized_pl": 0, "account_types": []})
-            cur["valuation"] += r.get("valuation") or 0
-            cur["unrealized_pl"] = (cur["unrealized_pl"] or 0) + (r.get("unrealized_pl") or 0)
-            cur["account_types"] = sorted(set(cur["account_types"]) | set(r.get("account_types") or []))
-        accts[acct] = acct_total
-    p = _build_risk(list(combined.values()), cash, sell or None, sources, lots, want_accounts)
-    p["accounts"] = accts
+    m = _merge_holdings(per)
+    p = _build_risk(m["rows"], m["cash"], m["sell_pending"], m["sources"], m["lots"], m["want_accounts"])
+    p["accounts"] = m["accounts"]
     p["note"] = "全口座合算。" + p["note"]
     return p
 
@@ -1504,27 +1603,14 @@ def cmd_risk(client: PayPayClient, args) -> int:
     """Structural exposure of the account — FACTS ONLY (weights, concentration,
     category/currency split). No risk verdicts, no buy/sell advice."""
     if getattr(args, "account", None) == "all":
-        return _all_accounts(args, _render_risk, _risk_account_raw, merge=_merge_risk)
-    raw = _risk_account_raw(client, args)
+        return _all_accounts(args, _render_risk, _account_raw, merge=_merge_risk)
+    raw = _account_raw(client, args)
     payload = {"as_of": _now_jst_str(),
                **_build_risk(raw["rows"], raw["cash"], raw["sell_pending"], raw["sources"],
                              raw.get("lots"), getattr(args, "accounts", False))}
     _emit_fmt(payload, _fmt(args), lambda p: _render_risk(p, "table"),
               lambda p: _render_risk(p, "lark"))
     return 0
-
-
-def _assets_account_raw(client: PayPayClient, args) -> dict:
-    rows, cash, cash_fresh, sell_pending, sources = _consolidated_holdings(client)
-    raw = {"rows": rows, "cash": cash, "cash_fresh": cash_fresh,
-           "sell_pending": sell_pending, "sources": sources}
-    if getattr(args, "accounts", False):
-        try:
-            lots, _, _ = _invtrust_lots(client, _pages(args, 30))
-        except Exception:  # noqa: BLE001
-            lots = None
-        raw["lots"] = lots if lots is not None else []
-    return raw
 
 
 def _build_assets(rows, cash, cash_fresh, sell_pending, sources, lots, want_accounts, accounts=None) -> dict:
@@ -1544,33 +1630,9 @@ def _build_assets(rows, cash, cash_fresh, sell_pending, sources, lots, want_acco
 
 
 def _merge_assets(per: dict) -> dict:
-    combined, lots, accts = {}, [], {}
-    cash = sell = 0
-    sources = {}
-    cash_fresh = True
-    want_accounts = False
-    for acct, raw in per.items():
-        if raw.get("_error"):
-            continue
-        cash += raw.get("cash") or 0
-        sell += raw.get("sell_pending") or 0
-        sources.update(raw.get("sources") or {})
-        cash_fresh = cash_fresh and raw.get("cash_fresh", True)
-        if "lots" in raw:
-            want_accounts = True
-            lots += raw.get("lots") or []
-        acct_total = raw.get("cash") or 0
-        for r in raw.get("rows", []):
-            acct_total += r.get("valuation") or 0
-            key = (r["name"], r["category"])
-            cur = combined.setdefault(key, {"name": r["name"], "category": r["category"],
-                                            "valuation": 0, "unrealized_pl": 0, "account_types": []})
-            cur["valuation"] += r.get("valuation") or 0
-            cur["unrealized_pl"] = (cur["unrealized_pl"] or 0) + (r.get("unrealized_pl") or 0)
-            cur["account_types"] = sorted(set(cur["account_types"]) | set(r.get("account_types") or []))
-        accts[acct] = acct_total
-    return _build_assets(list(combined.values()), cash, cash_fresh, sell or None,
-                         sources, lots, want_accounts, accounts=accts)
+    m = _merge_holdings(per)
+    return _build_assets(m["rows"], m["cash"], m["cash_fresh"], m["sell_pending"],
+                         m["sources"], m["lots"], m["want_accounts"], accounts=m["accounts"])
 
 
 def _render_assets(p: dict, fmt: str) -> None:
@@ -1628,8 +1690,8 @@ def cmd_assets(client: PayPayClient, args) -> int:
     """Consolidated view: 証券 + 投信 holdings + securities cash. `-a all` merges
     every account (same fund summed) into a household view + per-account totals."""
     if getattr(args, "account", None) == "all":
-        return _all_accounts(args, _render_assets, _assets_account_raw, merge=_merge_assets)
-    raw = _assets_account_raw(client, args)
+        return _all_accounts(args, _render_assets, _account_raw, merge=_merge_assets)
+    raw = _account_raw(client, args)
     payload = {"as_of": _now_jst_str(),
                **_build_assets(raw["rows"], raw["cash"], raw["cash_fresh"], raw["sell_pending"],
                                raw["sources"], raw.get("lots"), getattr(args, "accounts", False))}
@@ -1692,9 +1754,11 @@ def _invtrust_lots(client: PayPayClient, pages: int = 30):
     for b in lots:
         tot = brand_shares.get(b["brand"]) or 0
         val = round(fund_val.get(b["brand"], 0) * b["net_shares"] / tot) if tot else 0
+        # moving-average cost of the 口 still held — buy−sell (net_invested) is wrong
+        # after a partial sell, as it leaves the sold lots' gain/loss in the "cost"
+        cost = b["remaining_cost"]
         holdings.append({"brand": b["brand"], "acct": b["acct"], "net_shares": b["net_shares"],
-                         "cost": b["net_invested"], "valuation": val,
-                         "unrealized_pl": val - b["net_invested"]})
+                         "cost": cost, "valuation": val, "unrealized_pl": val - cost})
     holdings.sort(key=lambda x: -x["valuation"])
     return holdings, agg, txns
 
@@ -1743,28 +1807,69 @@ def cmd_invtrust_history(client: PayPayClient, args) -> int:
     return 0
 
 
+def _stdin_is_tty() -> bool:
+    try:
+        return sys.stdin.isatty()
+    except (AttributeError, ValueError):
+        return False
+
+
+def _refuse_non_tty() -> bool:
+    """--execute is for a human at a keyboard only. True (and an error printed) if
+    stdin is not a terminal — an agent / pipe / cron can never place an order."""
+    if _stdin_is_tty():
+        return False
+    print("error: --execute requires an interactive terminal (stdin is not a TTY). "
+          "Live orders are human-only; run it yourself in a terminal.", file=sys.stderr)
+    return True
+
+
+def _portfolio_total_jpy(client):
+    """保有資産 total (holdings valuation + cash) the same way `assets` computes it;
+    None if any source failed — the max_pct guard then fails closed."""
+    try:
+        rows, cash, _fresh, _sell, sources = _consolidated_holdings(client)
+    except Exception:  # noqa: BLE001 — unknown total -> guard blocks
+        return None
+    if cash is None or any(s == "failed" for s in (sources or {}).values()):
+        return None
+    return sum(r.get("valuation") or 0 for r in rows) + cash
+
+
 def _guard_ctx(client, args) -> "_guards.GuardContext":
     acct = getattr(args, "account", None)
     return _guards.GuardContext(
         now=datetime.now(timezone.utc),
-        today_order_count=_audit.count_today(account=acct, kind="submit"),
-        current_quote=None,        # Task 13: fill from a quote fetch
-        portfolio_total_jpy=None,  # Task 13: fill from portfolio total
+        today_order_count=_audit.count_today(account=acct, kind=_audit.CAP_KINDS),
+        portfolio_total_jpy=_portfolio_total_jpy(client),
     )
 
 
 def _order_common(client, args, side: str) -> int:
+    acct = getattr(args, "account", None)
+    execute = getattr(args, "execute", False)
     try:
         req = _orders.build(market=args.market, symbol=args.symbol, side=side,
-                            qty=args.qty, amount_jpy=args.amount, limit=args.limit,
-                            market_order=getattr(args, "market_order", False),
-                            account=getattr(args, "account", None),
+                            amount_jpy=args.amount, account=acct,
                             account_type=getattr(args, "account_type", 2))
     except _orders.OrderError as e:
         print(f"error: {e}", file=sys.stderr); return 2
-    cfg = _guards.load_trade_config(getattr(args, "account", None))
+    if execute and _refuse_non_tty():
+        return 2
+    cfg = _guards.load_trade_config(acct)
     ctx = _guard_ctx(client, args)
     confirm = lambda r: client.order_confirm(r)
+    base = {"symbol": req.symbol, "side": side, "amount_jpy": req.amount_jpy,
+            "amount_type": "金額指定", "account_type": req.account_type}
+
+    def audit(event: dict) -> None:
+        ok = _audit.record({**base, **event}, account=acct)
+        if not ok and event.get("kind") in _audit.CAP_KINDS:
+            print("\n!!! WARNING: the order audit log could NOT be written — this live "
+                  "order is NOT counted toward daily_order_cap. Check `paypay orders` "
+                  "and fix ~/.paypay-sec permissions before placing more. !!!",
+                  file=sys.stderr)
+
     # TRADE_PASSWORD (取引パスワード) is prompted (not echoed, never stored) only if/when
     # we actually submit — the agent never supplies it; the human does, at the keyboard.
     _pw = {}
@@ -1776,7 +1881,7 @@ def _order_common(client, args, side: str) -> int:
                 _pw["v"] = ""
         return _pw["v"]
     try:
-        if getattr(args, "execute", False):
+        if execute:
             res = _orders.place(req, cfg, ctx, confirm=confirm,
                                 submit=lambda tok, r: client.order_submit(tok, r, trade_password=_trade_pw()),
                                 confirmer=make_confirmer())
@@ -1784,25 +1889,24 @@ def _order_common(client, args, side: str) -> int:
             res = _orders.dry_run(req, cfg, ctx, confirm=confirm)
     except NotImplementedError as e:
         print(f"[pending Phase 0] guards OK, but {e}", file=sys.stderr)
-        _audit.record({"kind": "dry_run", "symbol": req.symbol, "side": side,
-                       "qty": req.qty, "amount_jpy": req.amount_jpy,
-                       "limit": req.limit_price, "status": "confirm_pending_phase0"},
-                      account=getattr(args, "account", None))
+        audit({"kind": "dry_run", "status": "confirm_pending_phase0"})
         return 3
     except (RuntimeError, requests.RequestException) as e:
-        # confirm rejected (e.g. market closed / over buyable), session, or submit error
+        # confirm rejected (e.g. market closed / over buyable), session, or submit rejected
         print(f"error: {e}", file=sys.stderr)
-        _audit.record({"kind": "error", "symbol": req.symbol, "side": side,
-                       "qty": req.qty, "amount_jpy": req.amount_jpy,
-                       "limit": req.limit_price, "error": str(e)[:200]},
-                      account=getattr(args, "account", None))
+        audit({"kind": "error", "error": str(e)[:200]})
         return 1
 
-    _audit.record({"kind": "submit" if res.submitted else "dry_run",
-                   "symbol": req.symbol, "side": side, "qty": req.qty,
-                   "amount_jpy": req.amount_jpy, "limit": req.limit_price,
-                   "violations": res.violations, "order_id": res.order_id},
-                  account=getattr(args, "account", None))
+    if res.outcome_unknown:
+        kind = "submit_unknown"
+    elif res.submitted:
+        kind = "submit"
+    elif res.aborted_reason:
+        kind = "aborted"
+    else:
+        kind = "dry_run"
+    audit({"kind": kind, "violations": res.violations, "order_id": res.order_id,
+           "preorder": bool((res.preview or {}).get("preorder")), "reason": res.aborted_reason})
 
     def render(d):
         # d is res.__dict__ (a plain dict — _emit also json-serializes it)
@@ -1811,18 +1915,31 @@ def _order_common(client, args, side: str) -> int:
             for v in d["violations"]:
                 print(f"   - {v}")
             return
+        if d.get("outcome_unknown"):
+            print(f"❓ outcome UNKNOWN — {_order_terms(req, d.get('preview'))}")
+            print(f"   {d.get('aborted_reason')}")
+            print("   The order may or may not have been placed. Check `paypay orders` "
+                  "before retrying.")
+            return
+        if d.get("aborted_reason"):
+            print(f"ABORTED: {d['aborted_reason']}  (nothing was sent)")
+            return
         pv = d.get("preview") or {}
-        print(f"{'✅ SUBMITTED' if d.get('submitted') else '🔎 DRY-RUN (not sent)'}  "
-              f"{side.upper()} {req.symbol}")
+        print(f"{'✅ SUBMITTED' if d.get('submitted') else '🔎 DRY-RUN (not sent)'}  {_order_terms(req, pv)}")
         if pv.get("total_jpy") is not None:
-            print(f"   est. total : ¥{pv['total_jpy']:,}   est. price: {pv.get('est_price')}   fee: ¥{pv.get('fee_jpy', 0):,}")
+            print(f"   server amount: ¥{pv['total_jpy']:,}   quote: {pv.get('est_price')}   fee: ¥{pv.get('fee_jpy', 0):,}")
         if d.get("submitted"):
-            print(f"   order id   : {d.get('order_id')}")
-        elif not getattr(args, 'execute', False):
-            print("   (re-run with --execute to place; you will be asked to type a confirmation)")
+            if d.get("order_id"):
+                print(f"   order no.  : {d['order_id']}")
+            else:
+                print("   submitted; order number not returned — verify with `paypay orders`")
+        elif not execute:
+            print("   (re-run with --execute in a terminal to place; you will be asked to type a confirmation)")
 
     _emit(res.__dict__, getattr(args, "json", False), render)
-    return 0 if (res.submitted or not res.violations) else 1
+    if res.outcome_unknown or res.aborted_reason or res.violations:
+        return 1
+    return 0
 
 
 def cmd_buy(client, args) -> int:
@@ -1861,6 +1978,8 @@ def cmd_cancel(client, args) -> int:
     if not getattr(args, "execute", False):
         print(f"🔎 DRY-RUN: would cancel order {args.order_id}. Re-run with --execute.")
         return 0
+    if _refuse_non_tty():
+        return 2
     try:
         typed = input(f"  To cancel, type the order id exactly: {args.order_id}\n  confirm> ").strip()
     except (EOFError, KeyboardInterrupt):
@@ -1948,14 +2067,16 @@ def build_parser() -> argparse.ArgumentParser:
     snap = sub.add_parser("snapshot", parents=[common]); snap.set_defaults(func=cmd_snapshot)
     snap.add_argument("snap_cmd", nargs="?", choices=("save", "list"), default="save",
                       help="save (default) a snapshot of the account, or list saved snapshots")
-    snap.add_argument("--pages", type=int, default=8, help="ledger pages to scan for the snapshot")
+    snap.add_argument("--pages", type=int, default=8,
+                      help="ignored — snapshots always scan the full ledger (cumulative deposits)")
 
     dff = sub.add_parser("diff", parents=[common]); dff.set_defaults(func=cmd_diff)
     dff.add_argument("--days", type=int, default=None,
                      help="compare a live read against the snapshot ~N days old (default: the latest snapshot)")
     dff.add_argument("--since", default=None,
                      help="baseline selector; 'last' = latest snapshot (the default)")
-    dff.add_argument("--pages", type=int, default=8, help="ledger pages to scan for the live read")
+    dff.add_argument("--pages", type=int, default=8,
+                     help="ignored — the live read scans the full ledger, like snapshot save")
 
     cal = sub.add_parser("calendar", parents=[common]); cal.set_defaults(func=cmd_calendar)
     cal.add_argument("--out", default=None,
@@ -1965,14 +2086,11 @@ def build_parser() -> argparse.ArgumentParser:
     sell = sub.add_parser("sell", parents=[common]); sell.set_defaults(func=cmd_sell)
     for sp_ in (buy, sell):
         sp_.add_argument("symbol", help="ticker, e.g. TSLA")
-        g = sp_.add_mutually_exclusive_group(required=True)
-        g.add_argument("--qty", type=float, help="number of shares (株数指定)")
-        g.add_argument("--amount", type=int, help="order amount in JPY (金額指定)")
-        sp_.add_argument("--limit", type=float, default=None, help="limit price (指値); optional — US fills at the quote, omit for a market-priced order")
-        sp_.add_argument("--market-order", action="store_true", help="place a market order (成行) — blocked unless allowed in trade.json")
+        sp_.add_argument("--amount", type=int, required=True,
+                         help="order amount in JPY (金額指定) — fills at the current quote (成行相当)")
         sp_.add_argument("--account-type", dest="account_type", type=int, choices=(2, 3, 4), default=2,
                          help="brokerage account: 2=特定(cash, default) | 3=成長投資枠NISA | 4=つみたて")
-        sp_.add_argument("--execute", action="store_true", help="actually place the order (default is dry-run)")
+        sp_.add_argument("--execute", action="store_true", help="actually place the order (default is dry-run; human-only, needs a TTY)")
 
     ords = sub.add_parser("orders", parents=[common]); ords.set_defaults(func=cmd_orders)
     canc = sub.add_parser("cancel", parents=[common]); canc.set_defaults(func=cmd_cancel)

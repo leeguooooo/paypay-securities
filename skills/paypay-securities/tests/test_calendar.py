@@ -63,13 +63,54 @@ def test_last_snapshot_of_day_wins():
     assert s["2026-06-02"]["pnl"] == 5000
 
 
-def test_failed_source_marks_partial():
+def test_stale_source_marks_partial():
     snaps = [
         _snap("20260601-120000", 500000),
-        _snap("20260602-120000", 502000, sources={"securities": "ok", "invtrust": "failed"}),
+        _snap("20260602-120000", 502000, sources={"securities": "ok", "cash": "stale"}),
     ]
     s = report.daily_pnl_series(snaps)
     assert s["2026-06-02"]["data_quality"] == "partial"
+    assert s["2026-06-02"]["pnl"] == 2000
+
+
+def test_failed_source_is_missing_and_keeps_baseline():
+    # a feed dropped out → grand_total is just whatever was left (e.g. stale cash);
+    # booking it would read as a huge loss. Emit missing, keep the old baseline.
+    snaps = [
+        _snap("20260601-120000", 500000),
+        _snap("20260602-120000", 20000, sources={"securities": "failed", "invtrust": "failed",
+                                                 "ledger": "failed", "cash": "stale"}),
+        _snap("20260603-120000", 504000, sources={"securities": "ok", "invtrust": "ok"}),
+    ]
+    s = report.daily_pnl_series(snaps)
+    assert s["2026-06-02"]["data_quality"] == "missing"
+    assert s["2026-06-02"]["pnl"] is None
+    assert s["2026-06-03"]["pnl"] == 4000            # spans 06-01 → 06-03
+    assert s["2026-06-03"]["data_quality"] == "full"
+
+
+def test_ledger_coverage_change_is_missing_then_rebaselines():
+    # old capped-window snapshot → new full-history one: net_deposit jumps because
+    # the window grew, not because money arrived. Don't book it as a cash flow.
+    snaps = [
+        _snap("20260601-120000", 500000, nd=100000, deposits=100000),
+        _snap("20260602-120000", 501000, nd=400000, deposits=400000, ledger_full=True),
+        _snap("20260603-120000", 503000, nd=400000, deposits=400000, ledger_full=True),
+    ]
+    s = report.daily_pnl_series(snaps)
+    assert s["2026-06-02"]["data_quality"] == "missing"
+    assert s["2026-06-03"]["pnl"] == 2000            # baseline moved to 06-02
+
+
+def test_deposit_falling_out_of_window_is_not_booked():
+    # cumulative deposits can't go down; a drop means an old 入金 left the window.
+    snaps = [
+        _snap("20260601-120000", 500000, nd=300000, deposits=300000),
+        _snap("20260602-120000", 502000, nd=250000, deposits=250000),
+    ]
+    s = report.daily_pnl_series(snaps)
+    assert s["2026-06-02"]["data_quality"] == "missing"
+    assert s["2026-06-02"]["pnl"] is None
 
 
 def test_calendar_payload_shape_and_total_aggregation_inputs():

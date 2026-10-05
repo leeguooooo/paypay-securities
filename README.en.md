@@ -2,15 +2,18 @@
 
 [日本語](README.md) | **English**
 
-A read-only command-line client for a **PayPay証券 (PayPay Securities, ペイペイ証券)**
+A command-line client for a **PayPay証券 (PayPay Securities, ペイペイ証券)**
 account — balance, holdings, mutual funds (投資信託), US stocks (米国株), transaction
 history, a measured cost analysis (incl. the FX spread PayPay never itemizes), and
 a portfolio **review** with realized/unrealized P&L. Great for NISA and routine
 investment review. Data display only — no advice. Distributed as an
 [agent skill](https://skills.sh) and usable as a plain CLI.
 
-> Read-only: it never places or cancels orders. Use on your own account at your
-> own risk — automated access may conflict with PayPay証券's terms of service.
+> Read commands are read-only. US-stock buy/sell/cancel is supported but OFF by
+> default (`PAYPAY_TRADING_ENABLED=1`), dry-run by default, and a live order needs a
+> human at a terminal (TTY) running `--execute` + a typed confirmation + the trade
+> password. Orders are yen-amount only, filled at the quote (off-hours: a 予約注文 for the next session). Use on your own
+> account at your own risk — automated access may conflict with PayPay証券's terms of service.
 
 ## Install
 

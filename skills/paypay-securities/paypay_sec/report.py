@@ -23,15 +23,17 @@ def _ym(date: str) -> str | None:
     return f"{m.group(1)}-{m.group(2)}" if m else None
 
 
-def _realized_moving_avg(events) -> tuple[int, bool]:
+def _realized_moving_avg(events) -> tuple[int, bool, int]:
     """移動平均法 realized P&L over CHRONOLOGICAL (type, qty, signed_amount) events
     (買付 amount < 0 = cash out, 売却 amount > 0 = proceeds). Unlike a whole-window
     average this stays correct when buys and sells interleave (re-buy after a sell),
     and it matches the cost basis JP brokers report for 特定口座.
 
-    Returns (realized_yen, ok); ok=False if a sell ever exceeds the shares held so
-    far — the cost basis is incomplete in the fetched window, so realized is an
-    under-estimate and callers should flag it rather than trust it blindly."""
+    Returns (realized_yen, ok, remaining_cost_yen); ok=False if a sell ever exceeds
+    the shares held so far — the cost basis is incomplete in the fetched window, so
+    realized is an under-estimate and callers should flag it rather than trust it
+    blindly. remaining_cost is the moving-average cost of the shares still held
+    (NOT buy−sell, which goes wrong after a partial sell at a gain/loss)."""
     shares = cost = realized = 0.0
     ok = True
     for typ, qty, amt in events:
@@ -52,7 +54,7 @@ def _realized_moving_avg(events) -> tuple[int, bool]:
             realized += amt - sold * avg
             cost -= sold * avg
             shares -= sold
-    return round(realized), ok
+    return round(realized), ok, round(cost) if shares > 1e-9 else 0
 
 
 @dataclass
@@ -80,7 +82,12 @@ class BrandFlow:
 
     def realized(self) -> tuple[int, bool]:
         """(realized_yen, reconciles) via moving-average cost."""
-        return _realized_moving_avg(self.events)
+        return _realized_moving_avg(self.events)[:2]
+
+    @property
+    def remaining_cost(self) -> int:
+        """Moving-average cost basis of the shares still held."""
+        return _realized_moving_avg(self.events)[2]
 
     @property
     def realized_pl(self) -> int:
@@ -91,7 +98,8 @@ class BrandFlow:
                 "buy_yen": self.buy_yen, "buy_shares": round(self.buy_shares, 6),
                 "sell_yen": self.sell_yen, "sell_shares": round(self.sell_shares, 6),
                 "net_invested": self.net_invested, "net_shares": self.net_shares,
-                "realized_pl": self.realized_pl, "reconciles": self.realized()[1]}
+                "realized_pl": self.realized_pl, "reconciles": self.realized()[1],
+                "remaining_cost": self.remaining_cost}
 
 
 def _add_trade(flows: dict, key, name: str, t: dict, brand: str = "", acct: str = "") -> None:
@@ -266,8 +274,6 @@ def tax_summary(sec_txns: list[dict], inv_txns: list[dict]) -> list[dict]:
             continue
         if t["type"] == "売却" and t.get("amount"):
             row(y)["sec_sell"] += abs(t["amount"])
-        elif t["type"] == "譲渡益税" and t.get("amount"):
-            row(y)["capital_gains_tax"] += -t["amount"]
     return [years[y] for y in sorted(years)]
 
 
@@ -279,6 +285,11 @@ def _snap_date(snap: dict) -> str | None:
         return f"{ts[0:4]}-{ts[4:6]}-{ts[6:8]}"
     a = str(snap.get("as_of") or "")[:10]
     return a if re.match(r"\d{4}-\d{2}-\d{2}", a) else None
+
+
+def _missing_day(note: str) -> dict:
+    return {"pnl": None, "pnl_pct": None, "total_assets": None, "net_flow": 0,
+            "realized": None, "data_quality": "missing", "note": note}
 
 
 def daily_pnl_series(snapshots: list[dict]) -> dict[str, dict]:
@@ -294,9 +305,16 @@ def daily_pnl_series(snapshots: list[dict]) -> dict[str, dict]:
         realized[d] =  realized_total[d] - realized_total[prev]
 
     Multiple snapshots on one calendar day collapse to the last (closing) one.
-    A snapshot with no grand_total is emitted as data_quality="missing" and does
-    NOT advance the baseline, so the next good day's pnl spans the gap. The first
-    good day has no baseline and is omitted (no daily pnl is computable for it).
+    A snapshot with no grand_total, or with any source "failed", is emitted as
+    data_quality="missing" and does NOT advance the baseline, so the next good
+    day's pnl spans the gap. The first good day has no baseline and is omitted.
+
+    net_flow is only meaningful when both snapshots summed the SAME ledger span.
+    A pair whose `ledger_full` markers differ, or whose cumulative deposits went
+    DOWN (an old 入金 fell out of a capped ledger window), would book that
+    deposit as profit/loss — so the day is emitted as missing and the newer
+    snapshot becomes the baseline. Pre-`ledger_full` snapshots keep the old
+    behavior (their window was capped, so the figures are approximate).
 
     Returns {date: {pnl, pnl_pct, total_assets, net_flow, realized,
     data_quality, note}} — the per-account shape the calendar consumes.
@@ -315,13 +333,21 @@ def daily_pnl_series(snapshots: list[dict]) -> dict[str, dict]:
     for d in sorted(by_date):
         s = by_date[d]
         gt = s.get("grand_total")
+        src = s.get("sources") or {}
         if gt is None:
-            out[d] = {"pnl": None, "pnl_pct": None, "total_assets": None,
-                      "net_flow": 0, "realized": None, "data_quality": "missing",
-                      "note": s.get("note") or "当天数据抓取失败"}
+            out[d] = _missing_day(s.get("note") or "当天数据抓取失败")
+            continue
+        if any(v == "failed" for v in src.values()):
+            out[d] = _missing_day("部分数据源抓取失败,当天总资产不可信")
             continue
         if prev is None:
             prev = s            # baseline only — no pnl for the first good day
+            continue
+        dep, pdep = s.get("deposits"), prev.get("deposits")
+        if (bool(s.get("ledger_full")) != bool(prev.get("ledger_full"))
+                or (dep is not None and pdep is not None and dep < pdep)):
+            out[d] = _missing_day("账本覆盖范围变化,当天盈亏无法剔除现金流")
+            prev = s            # comparable from here on
             continue
         pgt = prev.get("grand_total") or 0
         net_flow = (s.get("net_deposit") or 0) - (prev.get("net_deposit") or 0)
@@ -330,7 +356,6 @@ def daily_pnl_series(snapshots: list[dict]) -> dict[str, dict]:
         if s.get("realized_total") is not None and prev.get("realized_total") is not None:
             realized = s["realized_total"] - prev["realized_total"]
         quality = "full"
-        src = s.get("sources") or {}
         if any(v not in ("ok", "live", None) for v in src.values()):
             quality = "partial"
         out[d] = {

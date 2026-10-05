@@ -57,7 +57,7 @@ PLIST
     echo "uninstalled: ${LABEL}"
     ;;
   status)
-    if launchctl list | grep -q "$LABEL"; then
+    if launchctl list "$LABEL" >/dev/null 2>&1; then
       echo "loaded: ${LABEL}"
     else
       echo "not loaded (run: bin/snapshot-cron.sh install)"

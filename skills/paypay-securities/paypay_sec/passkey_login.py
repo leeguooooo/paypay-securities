@@ -33,6 +33,7 @@ from pathlib import Path
 
 import requests
 
+from .config import write_private
 from .passkey_signer import b64url_decode, b64url_encode, build_assertion
 
 
@@ -53,6 +54,8 @@ ORIGIN = "https://cdn.cross-platform-web.devops-app.paypay-sec.co.jp"
 RP_ID = "paypay-sec.co.jp"
 APP_ID = "NATIVE_PC"
 KEYCHAIN_SERVICE = "paypay-passkey"
+_SECURITY_TIMEOUT = 15     # `security` can hang on a locked-keychain prompt
+_RBW_TIMEOUT = 120         # rbw may wait on a pinentry unlock
 
 
 class PasskeyLoginError(RuntimeError):
@@ -71,8 +74,7 @@ def _device_id(state_dir: Path) -> str:
     except OSError:
         pass
     v = str(uuid.uuid4())
-    state_dir.mkdir(parents=True, exist_ok=True)
-    f.write_text(v, encoding="utf-8")
+    write_private(f, v)
     return v
 
 
@@ -97,21 +99,35 @@ def store_passkey(account: str, blob: dict) -> None:
     """Persist {credential_id, user_handle, rp_id, private_key_b64url} in the
     macOS login Keychain (item is credential-equivalent; -U overwrites)."""
     payload = json.dumps(blob, separators=(",", ":"))
-    subprocess.run(
-        ["security", "add-generic-password", "-U",
-         "-a", _keychain_account(account), "-s", KEYCHAIN_SERVICE,
-         "-D", "paypay passkey", "-w", payload],
-        check=True, capture_output=True, text=True,
-    )
+    # The private key is on this argv — never let it reach an exception message /
+    # traceback (CalledProcessError would embed the full command).
+    try:
+        r = subprocess.run(
+            ["security", "add-generic-password", "-U",
+             "-a", _keychain_account(account), "-s", KEYCHAIN_SERVICE,
+             "-D", "paypay passkey", "-w", payload],
+            check=False, capture_output=True, text=True, timeout=_SECURITY_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        raise PasskeyLoginError(
+            "Keychain write timed out (keychain locked?) — unlock it and retry") from None
+    except OSError as e:
+        raise PasskeyLoginError(f"could not run `security`: {e.strerror}") from None
+    if r.returncode != 0:
+        raise PasskeyLoginError(
+            f"Keychain write failed (security exit {r.returncode}): {r.stderr.strip()}") from None
 
 
 def load_passkey(account: str) -> dict | None:
     """Read the cached passkey blob from the Keychain, or None if not set."""
-    r = subprocess.run(
-        ["security", "find-generic-password",
-         "-a", _keychain_account(account), "-s", KEYCHAIN_SERVICE, "-w"],
-        capture_output=True, text=True,
-    )
+    try:
+        r = subprocess.run(
+            ["security", "find-generic-password",
+             "-a", _keychain_account(account), "-s", KEYCHAIN_SERVICE, "-w"],
+            check=False, capture_output=True, text=True, timeout=_SECURITY_TIMEOUT,
+        )
+    except (subprocess.TimeoutExpired, OSError):   # hung keychain prompt / no `security`
+        return None
     if r.returncode != 0:
         return None
     try:
@@ -128,8 +144,15 @@ def extract_via_rbw(rp_id: str = RP_ID, rbw_bin: str = "bitwarden-use") -> dict:
     private key. The private key is parsed in-process and NEVER printed by the caller.
     Requires bitwarden-use on PATH and the vault unlocked (prompts via pinentry).
     """
-    r = subprocess.run([rbw_bin, "fido2", "get", rp_id],
-                       capture_output=True, text=True)
+    try:
+        r = subprocess.run([rbw_bin, "fido2", "get", rp_id],
+                           check=False, capture_output=True, text=True, timeout=_RBW_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        raise PasskeyLoginError(
+            f"`{rbw_bin} fido2 get {rp_id}` timed out after {_RBW_TIMEOUT}s "
+            "(pinentry left unanswered?)") from None
+    except OSError as e:
+        raise PasskeyLoginError(f"could not run `{rbw_bin}`: {e.strerror}") from None
     if r.returncode != 0:
         raise PasskeyLoginError(
             f"`{rbw_bin} fido2 get {rp_id}` failed (unlock rbw first?): "
@@ -165,38 +188,30 @@ def setup(account: str, rp_id: str = RP_ID, rbw_bin: str = "bitwarden-use") -> d
 # --------------------------------------------------------------------------- #
 # the headless login                                                           #
 # --------------------------------------------------------------------------- #
-def _post_json(session: requests.Session, url: str, headers: dict, body: dict) -> dict:
-    r = session.post(url, headers=headers, data=json.dumps(body), timeout=30)
-    r.raise_for_status()
+def _bff(session: requests.Session, method: str, url: str, headers: dict, body: dict) -> dict:
+    r = session.request(method, url, headers=headers, data=json.dumps(body), timeout=30)
+    # parse BEFORE raise_for_status: a 4xx still carries the business_error_code
     try:
         data = r.json()
     except ValueError:
         data = {}
-    err = data.get("business_error_code")
-    if err:
-        raise PasskeyLoginError(f"{url.split('/api/')[-1]}: {err}")
-    return data
-
-
-def _delete_json(session: requests.Session, url: str, headers: dict, body: dict) -> dict:
-    r = session.request("DELETE", url, headers=headers, data=json.dumps(body), timeout=30)
-    r.raise_for_status()
-    try:
-        data = r.json()
-    except ValueError:
+    if not isinstance(data, dict):
         data = {}
     err = data.get("business_error_code")
     if err:
-        raise PasskeyLoginError(f"{url.split('/api/')[-1]}: {err}")
+        raise PasskeyLoginError(f"{url.split('/api/')[-1]}: {err} (HTTP {r.status_code})")
+    r.raise_for_status()
     return data
 
 
 def passkey_login(session: requests.Session, account: str, state_dir: Path,
-                  *, action: str = "VERIFY", debug: bool = False) -> dict:
+                  *, blob: dict | None = None, action: str = "VERIFY",
+                  debug: bool = False) -> dict:
     """Run the full headless passkey login on `session` (a requests.Session whose
     cookies we want populated with the www laravel_session). Returns a result dict.
+    `blob` = an already-loaded passkey (else read from the Keychain).
     Raises PasskeyLoginError if no cached passkey or the server rejects us."""
-    blob = load_passkey(account)
+    blob = blob or load_passkey(account)
     if not blob:
         raise PasskeyLoginError(
             "no cached passkey for this account — run `paypay passkey-setup` once "
@@ -221,15 +236,15 @@ def passkey_login(session: requests.Session, account: str, state_dir: Path,
     q = f"?action={action}"
 
     # 1. prepare -> temp_id
-    prep = _post_json(session, f"{BFF}/api/passkey/prepare/v1{q}", headers,
-                      {"redirect_url": f"{WWW}/login/passkey/callback"})
+    prep = _bff(session, "POST", f"{BFF}/api/passkey/prepare/v1{q}", headers,
+                {"redirect_url": f"{WWW}/login/passkey/callback"})
     temp_id = prep.get("temp_id")
     if not temp_id:
         raise PasskeyLoginError(f"prepare returned no temp_id: {prep}")
 
     # 2. options -> challenge
-    opts = _delete_json(session, f"{BFF}/api/passkey/options/v1{q}", headers,
-                        {"temp_id": temp_id})
+    opts = _bff(session, "DELETE", f"{BFF}/api/passkey/options/v1{q}", headers,
+                {"temp_id": temp_id})
     public_key = (opts.get("options") or {}).get("publicKey") or {}
     challenge = public_key.get("challenge")
     if not challenge:
@@ -248,11 +263,11 @@ def passkey_login(session: requests.Session, account: str, state_dir: Path,
 
     # 4. credential — submit the assertion (temp_id alongside)
     cred_body = {**assertion, "temp_id": temp_id}
-    cred = _post_json(session, f"{BFF}/api/passkey/credential/v1{q}", headers, cred_body)
+    cred = _bff(session, "POST", f"{BFF}/api/passkey/credential/v1{q}", headers, cred_body)
 
     # 5. complete
-    comp = _post_json(session, f"{BFF}/api/passkey/complete/v1{q}", headers,
-                      {"passkey_id": blob["credential_id"], "temp_id": temp_id})
+    comp = _bff(session, "POST", f"{BFF}/api/passkey/complete/v1{q}", headers,
+                {"passkey_id": blob["credential_id"], "temp_id": temp_id})
 
     # 6. callback on www -> mints laravel_session on `session`. The exact handoff
     #    (does complete hand back a redirect_url with a one-time code, or is

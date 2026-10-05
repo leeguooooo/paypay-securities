@@ -14,7 +14,7 @@ description: >-
   or buy/sell judgments.
 ---
 
-# paypay-securities — read-only PayPay証券 client
+# paypay-securities — PayPay証券 client (read + human-gated orders)
 
 A small Python CLI that authenticates to the PayPay証券 web frontend and reads
 account data. There is **no official or unofficial API/SDK** for PayPay証券, so
@@ -157,33 +157,53 @@ gate sits on top of the dry-run + confirm + TRADE_PASSWORD wall below.
 PayPay証券 has no order API; this drives the same un-pinned web order endpoints
 the site uses (`/trade/brand/ajax_*_popup` → `ajax_*_complete`). **The agent never
 auto-submits a live order.** Every order is a dry-run (見積/preview only) unless a
-human adds `--execute`, and `--execute` then requires (1) typing an exact
-confirmation phrase and (2) entering the account **TRADE_PASSWORD** (取引パスワード)
-at an interactive `getpass` prompt. The agent does not know, store, or handle that
-password — only the live confirm/preview ever runs unattended.
+human adds `--execute`, and `--execute` then requires (0) an interactive terminal —
+it refuses (exit 2) when stdin is not a TTY, so an agent/pipe/cron can never place
+an order — (1) typing the exact confirmation phrase `<SIDE> <SYMBOL> <AMOUNT>` (e.g.
+`BUY TSLA 10000`) and (2) entering the account **TRADE_PASSWORD** (取引パスワード)
+at a `getpass` prompt. The agent does not know, store, or handle that password —
+only the dry-run confirm/preview ever runs unattended.
+
+**What is actually sent:** only 金額指定 (a yen amount, `amountTyp=0`), filled at the
+**current quote** (成行相当 / 按现价). There is no share-count or limit-price order —
+`--qty` / `--limit` / `--market-order` do not exist. The dry-run and the confirm
+prompt both print side, symbol, ¥amount, "executed at the current quote" and the
+account type. **Off-hours → 予約注文:** when the market is closed the immediate order
+is refused (`買付可能金額を超える…`, regardless of cash); if the brand is PREORDERABLE
+the confirm automatically retries as a 成行予約 (`preorder=1`) that fills at the next
+session's quote, and the dry-run/prompt say `予約注文` + the execute date. Submit is
+two-step (`ajax_*_complete` = the order, then `ajax_*_complete_popup.json` = receipt);
+a receipt failure still counts as submitted (order no. may be missing → check
+`paypay orders`). The CSRF cookie is seeded by a full GET of the order page first.
 
 ```bash
 # DRY-RUN (default) — runs the real 見積/confirm, prints the quote, places NOTHING
 uv run paypay buy  TSLA --amount 10000        # 金額指定: ¥10,000 of TSLA, at the quote
-uv run paypay buy  TSLA --qty 1               # 株数指定: 1 share
-uv run paypay sell TSLA --qty 0.5             # sell 0.5 share
+uv run paypay sell TSLA --amount 5000         # sell ¥5,000 worth, at the quote
 uv run paypay buy  QQQ  --amount 50000 --account-type 3   # into 成長投資枠 NISA
 
-# LIVE — human only. Prompts for the confirmation phrase, THEN the TRADE_PASSWORD.
+# LIVE — human only, in a terminal. Type `BUY TSLA 10000`, THEN the TRADE_PASSWORD.
 uv run paypay buy  TSLA --amount 10000 --execute
 
 uv run paypay orders                          # list 未約定/予約注文 (pending orders)
 uv run paypay cancel <ORDER_ID>               # cancel a pending order
 ```
 
-- `--amount <yen>` (金額指定) **or** `--qty <shares>` (株数指定) — exactly one.
-- `--limit <price>` is **optional** — PayPay 米国株 fill at the prevailing quote;
-  give `--limit` only for a 指値, or `--market-order` to force 成行.
+- `--amount <yen>` (金額指定, required, positive whole yen) — the only order size.
 - `--account-type` — `2`=特定 (taxable/cash, default) · `3`=成長投資枠NISA · `4`=つみたて.
-- **Guards** (in `guards.py` / `TradeConfig`): `allow_markets` (米国株 only for now),
-  `max_order_jpy` per order, and a daily order-count cap. A blocked order prints
-  `⛔ order blocked by guards: …` and never reaches the network confirm.
-- Every order attempt is appended to an **audit log** (`audit.py`) with a daily count.
+- **Guards** (`~/.paypay-sec/[<account>/]trade.json`, `guards.py`): `allow_markets`
+  (米国株 only for now), `allow_symbols`, `max_order_jpy`, `max_pct_of_portfolio`
+  (vs the `assets` grand total — if that total can't be fetched the order is
+  **blocked**), `daily_order_cap`, optional `trading_hours`. Checked before the
+  network confirm (on `--amount`) and again after it (on the server's amount). Bad
+  values (NaN, bools, strings, ≤0) fall back to the defaults — a typo never loosens a
+  guard. Old `price_collar_pct` / `allow_market_order` keys are ignored.
+- Every order attempt is appended to an **audit log** (`audit.py`); `submit` and
+  `submit_unknown` count toward the daily cap, and an unreadable log blocks.
+- If the submit was sent but no answer came back (timeout / 5xx / bad body) the
+  result is `outcome UNKNOWN` — run `paypay orders` before retrying; never resend
+  blindly. A submit whose response lacks an order number says so — verify with
+  `paypay orders`.
 - Funding model: the account is funded by cash balance (you top it up); orders are
   placed against that cash. Bank-card buying is mobile-app/passkey-only and out of scope.
 
@@ -230,8 +250,9 @@ Flags (place AFTER the subcommand, e.g. `uv run paypay portfolio -m usa -a secon
 - `orders.py` — order model (`OrderRequest`) + the build→guard→confirm→[confirm
   phrase]→submit pipeline (`dry_run()` / `place()`); injected confirm/submit
   callables so the live submit is never reached except via the human path.
-- `guards.py` — `TradeConfig` + `check_guards()`: allow-listed market, per-order
-  yen cap, daily order-count cap (pre- and post-confirm checks).
+- `guards.py` — `TradeConfig` + `check_guards()`: allow-listed market/symbols,
+  per-order yen cap, % of portfolio (fails closed), daily order-count cap, trading
+  hours (pre- and post-confirm checks).
 - `audit.py` — append-only order log + daily order count.
 - `parsers.py` — **all site-specific selectors live here.** Data sources:
   - account header → `div.mypage_assets_data / .mypage_invest / .mypage_gain`

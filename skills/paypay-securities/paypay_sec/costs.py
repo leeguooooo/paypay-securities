@@ -14,6 +14,19 @@ FEE_TYPES = ("手数料/税", "手数料")
 TRADE_TYPES = ("買付", "売却")
 
 
+def measured_cost(explicit_fees, fx_cost, inv_tax=None, inv_transfer=None) -> dict:
+    """THE measured-cost definition shared by `fees` and `review`.
+
+    投信譲渡益税 + 送金手数料 already settle in the 証券 cash ledger (so they're
+    inside explicit_fees) — they are a BREAKDOWN, not extra cost. The only cost
+    outside the ledger is the reconstructed FX spread. residual<0 means the
+    cash-ledger window missed some 投信 rows (→ --all)."""
+    ef, fx = explicit_fees or 0, fx_cost or 0
+    residual = ef - (inv_tax or 0) - (inv_transfer or 0)
+    return {"total_cost": ef + fx, "securities_fee_residual": residual,
+            "cost_reconciles": residual >= 0}
+
+
 def compute_costs(transactions: list[dict], series: dict) -> dict:
     explicit_total = sum(t["amount"] for t in transactions
                          if t["type"] in FEE_TYPES and t["amount"])   # negative
@@ -41,7 +54,7 @@ def compute_costs(transactions: list[dict], series: dict) -> dict:
         "fx_trades": len(fx_rows),
         "usd_notional": usd_notional,
         "avg_spread_per_usd": round(fx_total / usd_notional, 4) if usd_notional else None,
-        "measured_total": explicit + fx_total,
+        "measured_total": measured_cost(explicit, fx_total)["total_cost"],
         "fx_rows": fx_rows,
         "fx_available": bool(fx_rows),
     }

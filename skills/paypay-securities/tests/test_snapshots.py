@@ -141,5 +141,70 @@ def test_cmd_diff_no_baseline():
     assert rc == 1  # no baseline → clean error, exit 1
 
 
+def test_same_second_save_does_not_overwrite():
+    _tmp_redirect()
+    p1 = snapshots.save("default", {"ts": "20260301-090000", "grand_total": 1})
+    p2 = snapshots.save("default", {"ts": "20260301-090000", "grand_total": 2})
+    assert p1 != p2 and p1.exists() and p2.exists()
+    assert snapshots.latest("default")["grand_total"] == 2      # suffix sorts later
+    assert snapshots.parse_ts(p2.stem) == snapshots.parse_ts(p1.stem)
+    # atomic write leaves no temp files behind
+    assert not [p for p in p1.parent.iterdir() if p.name.endswith(".tmp")]
+
+
+def test_unreadable_snapshot_is_skipped_not_fatal():
+    import contextlib
+    import io
+    d = _tmp_redirect()
+    snapshots.save("default", {"ts": "20260101-090000", "grand_total": 1})
+    (d / "snapshots" / "20260201-090000.json").write_text("{truncated", encoding="utf-8")
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err):
+        assert snapshots.latest("default")["grand_total"] == 1     # falls back past it
+        assert [s["grand_total"] for s in snapshots.load_all("default")] == [1]
+        assert snapshots.nearest_before("default", days=1)["grand_total"] == 1
+    assert "skipping unreadable snapshot" in err.getvalue()
+
+
+def _fake_client(ledger, invledger, brands_html=None, japan_fails=False):
+    d = Path(tempfile.mkdtemp(prefix="pp_fetch_test_"))
+
+    def brands(mkt):
+        if mkt == "japan" and japan_fails:
+            raise RuntimeError("boom")
+        return brands_html if mkt == "usa" and brands_html else "<html></html>"
+
+    return SimpleNamespace(
+        session_file=d / "session.json", ensure_session=lambda: None,
+        settlement_records=lambda max_pages: ledger,
+        invtrust_settlement_records=lambda max_pages: invledger,
+        brands_html=brands,
+        invtrust_top=lambda: {"SECURITIES_VALUE_TOTAL": "0", "INVEST_BRAND_ARRAY": []},
+        invtrust_brands=lambda: {})
+
+
+_LEDGER = [{"BASE_D": "2026.06.01", "SEQ_NO": 1, "SUMMARY_TYPE": "3", "AMOUNT": "1000",
+            "CASH_BALANCE": "1000"}]
+
+
+def test_fetch_account_sources_reflect_empty_and_partial_feeds():
+    bad_val = ("<table class='d_table'><tr><td>●テスト株</td><td>ー(—)</td>"
+               "<td>(1.0)</td><td>¥90(+¥1)</td></tr></table>")
+    a = cli._fetch_account(_fake_client(_LEDGER, [], brands_html=bad_val), 1, 1)
+    assert a["sources"]["invledger"] == "failed"          # empty = throttled, not ok
+    assert a["sources"]["cash"] == "stale"                # only one ledger → not live
+    assert a["sources"]["securities"] == "partial"        # unparsed valuation
+    a = cli._fetch_account(_fake_client(_LEDGER, _LEDGER, japan_fails=True), 1, 1)
+    assert a["sources"]["securities"] == "partial" and a["sources"]["cash"] == "live"
+
+
+def test_build_snapshot_full_ledger_marker():
+    snap = cli._build_snapshot(_fake_client(_LEDGER, _LEDGER), SimpleNamespace())
+    assert snap["ledger_full"] is True
+    assert snap["deposits"] == 1000 and "fx" not in snap["sources"]   # no FX fetch
+    snap = cli._build_snapshot(_fake_client(_LEDGER, []), SimpleNamespace())
+    assert snap["ledger_full"] is False
+
+
 if __name__ == "__main__":
     raise SystemExit(run(globals()))

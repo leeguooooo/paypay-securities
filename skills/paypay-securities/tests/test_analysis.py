@@ -58,5 +58,31 @@ def test_tax_summary_by_year():
     assert rows["2026"]["inv_sell"] == 30000 and rows["2026"]["sec_sell"] == 70000
 
 
+def test_partial_sell_unrealized_uses_moving_average_cost():
+    """Buy 100口 @¥10,000, buy 100口 @¥14,000 (avg ¥12,000), sell 100口 for ¥15,000.
+    Remaining cost is 100 × 12,000 = 1,200,000 — NOT buy−sell (2.4M − 1.5M = 0.9M)."""
+    from types import SimpleNamespace
+    from paypay_sec import cli
+
+    recs = [  # newest first, like the feed
+        {"BASE_D": "2026.06.03", "SUMMARY_TYPE": "2", "BRAND_NM": "テストファンド",
+         "ACCOUNT_TYPE": "2", "QTY": "100", "AMOUNT": "1500000"},
+        {"BASE_D": "2026.06.02", "SUMMARY_TYPE": "1", "BRAND_NM": "テストファンド",
+         "ACCOUNT_TYPE": "2", "QTY": "100", "AMOUNT": "-1400000"},
+        {"BASE_D": "2026.06.01", "SUMMARY_TYPE": "1", "BRAND_NM": "テストファンド",
+         "ACCOUNT_TYPE": "2", "QTY": "100", "AMOUNT": "-1000000"},
+    ]
+    fake = SimpleNamespace(
+        invtrust_settlement_records=lambda max_pages: recs,
+        invtrust_top=lambda: {"INVEST_BRAND_ARRAY": [
+            {"BRAND_ID": "9", "SECURITIES_VALUE": "1300000", "SUM_GROSS_PROFIT": "100000"}]},
+        invtrust_brands=lambda: {"9": "テストファンド"})
+    holdings, agg, _ = cli._invtrust_lots(fake, 1)
+    (h,) = holdings
+    assert agg["realized_pl"] == 300000            # 1.5M − 100 × 12,000
+    assert h["cost"] == 1200000
+    assert h["unrealized_pl"] == 100000            # 1.3M − 1.2M (not 1.3M − 0.9M)
+
+
 if __name__ == "__main__":
     raise SystemExit(run(globals()))

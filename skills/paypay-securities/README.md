@@ -110,12 +110,14 @@ payload carries a `schema_version` so cron jobs / dashboards can parse it stably
 **Trading is OFF by default** — `buy`/`sell`/`orders`/`cancel` refuse to run unless you
 set `PAYPAY_TRADING_ENABLED=1` (in `~/.paypay-sec/.env` or the shell). Even then orders
 are **dry-run by default**; a live order needs an explicit human `--execute`, which then
-prompts for a typed confirmation **and** the account TRADE_PASSWORD. See [Safety](#safety).
+prompts for a typed confirmation **and** the account TRADE_PASSWORD. Orders are
+**金額指定 only** (a yen `--amount`), executed at the **current quote** (成行相当) — no
+share-count or limit-price orders; off-hours the order becomes a 予約注文 (成行予約, next session's quote) and says so. See [Safety](#safety).
 
 ```bash
 export PAYPAY_TRADING_ENABLED=1              # enable the trading commands first
 paypay buy TSLA --amount 10000               # DRY-RUN (preview only)
-paypay buy TSLA --amount 10000 --execute     # LIVE — human only; prompts for TRADE_PASSWORD
+paypay buy TSLA --amount 10000 --execute     # LIVE — human, in a terminal; type `BUY TSLA 10000` + TRADE_PASSWORD
 paypay orders                                # list pending orders
 paypay cancel <ORDER_ID> --execute           # cancel (human only)
 ```
@@ -127,12 +129,14 @@ paypay cancel <ORDER_ID> --execute           # cancel (human only)
   verdicts, no judgments** — `paypay risk` reports *structure* (weights,
   concentration), not opinions.
 - **Order placement is human-gated:** disabled unless `PAYPAY_TRADING_ENABLED=1`;
-  dry-run by default; `--execute` is the only path to a live order and requires a
-  typed confirmation **and** the TRADE_PASSWORD at an interactive prompt. The agent
+  dry-run by default; `--execute` is the only path to a live order, refuses to run
+  without an interactive terminal (TTY), and requires a typed confirmation **and**
+  the TRADE_PASSWORD at an interactive prompt. The agent
   never enters that password and is not built to submit a live order unattended.
-  Per-order yen caps, an allow-listed market, and a daily order-count cap are
-  enforced (`guards.py`); every attempt is logged (`audit.py`); confirm tokens are
-  single-use and writes never auto-retry.
+  Per-order yen caps, a %-of-portfolio cap (blocks if the total is unknown), an
+  allow-listed market, and a daily order-count cap are enforced (`guards.py`); every
+  attempt is logged (`audit.py`); confirm tokens are single-use and writes never
+  auto-retry — an unanswered submit is reported as outcome UNKNOWN, not resent.
 
 Automated access to a brokerage may conflict with PayPay証券's terms of service —
 use on your own account at your own risk.

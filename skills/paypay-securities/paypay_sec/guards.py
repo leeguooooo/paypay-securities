@@ -7,11 +7,13 @@ never committed. Missing/broken config -> conservative defaults that reject.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field, asdict
+import math
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
 
+from .audit import COUNT_UNREADABLE
 from .client import state_dir
 
 DEFAULT_TRADE_CONFIG = {
@@ -20,10 +22,11 @@ DEFAULT_TRADE_CONFIG = {
     "allow_symbols": [],          # empty = no symbol restriction
     "allow_markets": ["usa"],
     "daily_order_cap": 5,
-    "price_collar_pct": 5,
-    "allow_market_order": False,
     "trading_hours": None,        # null = unrestricted; else {market: {tz, windows}}
 }
+# Retired keys (price_collar_pct, allow_market_order) are ignored when an old
+# trade.json still carries them: orders are 金額指定 filled at the quote, so there
+# is no limit price to collar and no separate market-order mode to allow.
 
 
 @dataclass(frozen=True)
@@ -33,8 +36,6 @@ class TradeConfig:
     allow_symbols: List[str] = field(default_factory=lambda: list(DEFAULT_TRADE_CONFIG["allow_symbols"]))
     allow_markets: List[str] = field(default_factory=lambda: list(DEFAULT_TRADE_CONFIG["allow_markets"]))
     daily_order_cap: int = DEFAULT_TRADE_CONFIG["daily_order_cap"]
-    price_collar_pct: float = DEFAULT_TRADE_CONFIG["price_collar_pct"]
-    allow_market_order: bool = DEFAULT_TRADE_CONFIG["allow_market_order"]
     trading_hours: Optional[dict] = None
 
 
@@ -42,24 +43,38 @@ def _config_path(account: Optional[str]) -> Path:
     return state_dir(account) / "trade.json"
 
 
+def _pos_num(v, default, cast):
+    """A finite, positive number (bools and strings rejected) cast with `cast`,
+    else `default` — a typo in trade.json must never loosen a guard."""
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v):
+        return default
+    v = cast(v)
+    return v if v > 0 else default
+
+
+def _str_list(v, default, norm):
+    if not isinstance(v, list) or not all(isinstance(x, str) for x in v):
+        return list(default)
+    return [norm(x) for x in v]
+
+
 def load_trade_config(account: Optional[str] = None, *, config_path: Optional[Path] = None) -> TradeConfig:
     path = config_path or _config_path(account)
-    data = dict(DEFAULT_TRADE_CONFIG)
+    d = DEFAULT_TRADE_CONFIG
+    data = dict(d)
     try:
         loaded = json.loads(path.read_text(encoding="utf-8"))
         if isinstance(loaded, dict):
-            data.update({k: v for k, v in loaded.items() if k in DEFAULT_TRADE_CONFIG})
+            data.update({k: v for k, v in loaded.items() if k in d})
     except (OSError, ValueError):
         pass  # fail-safe: keep conservative defaults
     return TradeConfig(
-        max_order_jpy=int(data["max_order_jpy"]),
-        max_pct_of_portfolio=float(data["max_pct_of_portfolio"]),
-        allow_symbols=[str(s).upper() for s in (data["allow_symbols"] or [])],
-        allow_markets=[str(s).lower() for s in (data["allow_markets"] or [])],
-        daily_order_cap=int(data["daily_order_cap"]),
-        price_collar_pct=float(data["price_collar_pct"]),
-        allow_market_order=bool(data["allow_market_order"]),
-        trading_hours=data["trading_hours"],
+        max_order_jpy=_pos_num(data["max_order_jpy"], d["max_order_jpy"], int),
+        max_pct_of_portfolio=_pos_num(data["max_pct_of_portfolio"], d["max_pct_of_portfolio"], float),
+        allow_symbols=_str_list(data["allow_symbols"], d["allow_symbols"], str.upper),
+        allow_markets=_str_list(data["allow_markets"], d["allow_markets"], str.lower),
+        daily_order_cap=_pos_num(data["daily_order_cap"], d["daily_order_cap"], int),
+        trading_hours=data["trading_hours"],   # validated (fail-closed) in check_guards
     )
 
 
@@ -76,12 +91,12 @@ class GuardContext:
     """External facts the guards need; injected so the guards stay pure/testable."""
     now: Optional[datetime] = None
     today_order_count: int = 0
-    current_quote: Optional[float] = None        # for the price collar (same currency as limit)
-    portfolio_total_jpy: Optional[int] = None     # for max_pct check (with a preview)
+    portfolio_total_jpy: Optional[int] = None     # None = unknown -> max_pct fails closed
 
 
 def _within_hours(now: datetime, market: str, trading_hours: dict) -> Optional[bool]:
     """True/False if a window is defined for the market, else None (no opinion).
+    A malformed window spec is False (fail closed).
 
     Only same-day windows are supported; a cross-midnight window like
     ["22:00", "02:00"] is NOT handled by the string HH:MM comparison.
@@ -92,55 +107,49 @@ def _within_hours(now: datetime, market: str, trading_hours: dict) -> Optional[b
     try:
         from zoneinfo import ZoneInfo
         local = now.astimezone(ZoneInfo(spec.get("tz", "UTC")))
-    except Exception:  # noqa: BLE001 — tz lookup failure -> don't block
-        return None
-    hm = local.strftime("%H:%M")
-    for start, end in spec.get("windows", []):
-        if start <= hm <= end:
-            return True
+        hm = local.strftime("%H:%M")
+        for start, end in spec.get("windows", []):
+            if str(start) <= hm <= str(end):
+                return True
+    except Exception:  # noqa: BLE001 — bad tz / malformed windows -> block
+        return False
     return False
 
 
 def check_guards(req, cfg: TradeConfig, ctx: GuardContext, preview: Optional[dict] = None) -> List[str]:
-    """Return a list of violation strings (empty = pass). Runs every check whose
-    inputs are available; checks needing a `preview` (amount/pct) are skipped when
-    preview is None (pre-confirm pass) and enforced when it is given (post-confirm).
-
-    `req` is an OrderRequest (left untyped here because OrderType is imported
-    function-locally below to avoid the orders.py circular import)."""
-    from .orders import OrderType
+    """Return a list of violation strings (empty = pass). Runs every check on both
+    passes. The order amount is the request's yen amount pre-confirm (preview None)
+    and the server's ORDER_AMOUNT (preview total_jpy) post-confirm."""
     v: List[str] = []
 
     if cfg.allow_markets and req.market not in cfg.allow_markets:
         v.append(f"market '{req.market}' not in allow_markets {cfg.allow_markets}")
     if cfg.allow_symbols and req.symbol not in cfg.allow_symbols:
         v.append(f"symbol '{req.symbol}' not in allow_symbols")
-    if req.order_type is OrderType.MARKET and not cfg.allow_market_order:
-        v.append("market order blocked (set allow_market_order=true to permit)")
-    if ctx.today_order_count >= cfg.daily_order_cap:
+    if ctx.today_order_count >= COUNT_UNREADABLE:
+        v.append("daily order count unavailable (audit log unreadable) — blocking")
+    elif ctx.today_order_count >= cfg.daily_order_cap:
         v.append(f"daily order cap reached ({ctx.today_order_count}/{cfg.daily_order_cap})")
 
-    # price collar — only if we have both a limit and a current quote
-    if req.limit_price is not None and ctx.current_quote is not None and ctx.current_quote > 0:
-        dev = abs(req.limit_price - ctx.current_quote) / ctx.current_quote * 100.0
-        if dev > cfg.price_collar_pct:
-            v.append(f"price collar: limit deviates {dev:.1f}% from quote "
-                     f"{ctx.current_quote} (> {cfg.price_collar_pct}%)")
-
     # trading hours
-    if cfg.trading_hours:
+    if cfg.trading_hours is not None and not isinstance(cfg.trading_hours, dict):
+        v.append("trading_hours in trade.json is malformed — blocking")
+    elif cfg.trading_hours:
         ok = _within_hours(ctx.now, req.market, cfg.trading_hours)
         if ok is False:
             v.append(f"outside configured trading hours for {req.market}")
 
-    # amount / pct — authoritative only with a confirm preview
-    if preview is not None:
-        total = preview.get("total_jpy")
-        if total is not None:
-            if total > cfg.max_order_jpy:
-                v.append(f"order total ¥{total:,} exceeds max_order_jpy ¥{cfg.max_order_jpy:,}")
-            if ctx.portfolio_total_jpy is not None and ctx.portfolio_total_jpy > 0:
-                pct = 100.0 * total / ctx.portfolio_total_jpy
-                if pct > cfg.max_pct_of_portfolio:
-                    v.append(f"order is {pct:.1f}% of portfolio (> max {cfg.max_pct_of_portfolio}%)")
+    # amount / pct
+    total = (preview or {}).get("total_jpy")
+    if total is None:
+        total = req.amount_jpy
+    if total is not None:
+        if total > cfg.max_order_jpy:
+            v.append(f"order total ¥{total:,} exceeds max_order_jpy ¥{cfg.max_order_jpy:,}")
+        if ctx.portfolio_total_jpy is None or ctx.portfolio_total_jpy <= 0:
+            v.append("portfolio total unavailable — cannot check max_pct_of_portfolio")
+        else:
+            pct = 100.0 * total / ctx.portfolio_total_jpy
+            if pct > cfg.max_pct_of_portfolio:
+                v.append(f"order is {pct:.1f}% of portfolio (> max {cfg.max_pct_of_portfolio}%)")
     return v

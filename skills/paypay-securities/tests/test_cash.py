@@ -54,5 +54,39 @@ def test_skips_rows_without_balance_and_handles_empty():
     assert parsers.current_cash_combined(recs) == 999
 
 
+# ---- cli._pick_cash: live only with BOTH ledgers; newer (BASE_D, SEQ_NO) wins
+from paypay_sec import cli  # noqa: E402
+
+
+def test_pick_cash_live_needs_both_ledgers():
+    cash, fresh, store = cli._pick_cash(None, SEC, INV)
+    assert (cash, fresh) == (0, True)
+    assert store == {"cash": 0, "key": ["2026-06-04", 105]}
+    # 投信 ledger throttled to empty → the 証券 row may predate an 投信 buy: not live
+    cash, fresh, _ = cli._pick_cash(None, SEC, [])
+    assert cash == 47539 and fresh is False
+
+
+def test_pick_cash_keeps_newer_stored_balance():
+    stored = {"cash": 1234, "key": ["2026-06-05", 130]}
+    cash, fresh, store = cli._pick_cash(stored, SEC, INV)     # cached/lagging read
+    assert (cash, fresh, store) == (1234, False, None)
+
+
+def test_pick_cash_replaces_older_stored_balance():
+    stored = {"cash": 999, "key": ["2026-06-01", 90]}
+    cash, fresh, store = cli._pick_cash(stored, SEC, INV)
+    assert (cash, fresh) == (0, True) and store["key"] == ["2026-06-04", 105]
+    # same key → no rewrite needed
+    assert cli._pick_cash({"cash": 0, "key": ["2026-06-04", 105]}, SEC, INV)[2] is None
+
+
+def test_pick_cash_fallbacks():
+    assert cli._pick_cash(None, [], []) == (None, False, None)
+    # legacy keyless file + partial read → keep the stored value, stale
+    assert cli._pick_cash({"cash": 500}, SEC, [])[:2] == (500, False)
+    assert cli._pick_cash({"cash": 500}, [], [])[:2] == (500, False)
+
+
 if __name__ == "__main__":
     raise SystemExit(run(globals()))

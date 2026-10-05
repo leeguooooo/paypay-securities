@@ -40,5 +40,30 @@ def test_count_today_missing_log_is_zero(tmp=Path("/tmp/pp_audit_3")):
                              now=datetime(2026, 5, 29, tzinfo=timezone.utc)) == 0
 
 
+def test_count_today_default_counts_submit_unknown(tmp=Path("/tmp/pp_audit_4")):
+    _clean(tmp)
+    log = tmp / "orders.log"
+    d = datetime(2026, 5, 29, 10, 0, tzinfo=timezone.utc)
+    for k in ("submit", "submit_unknown", "aborted", "dry_run", "error"):
+        audit.record({"kind": k}, log_path=log, now=d)
+    assert audit.count_today(log_path=log, now=d) == 2
+
+
+def test_count_today_unreadable_log_blocks(tmp=Path("/tmp/pp_audit_5")):
+    _clean(tmp)
+    d = datetime(2026, 5, 29, tzinfo=timezone.utc)
+    (tmp / "dir.log").mkdir()                              # IsADirectoryError
+    assert audit.count_today(log_path=tmp / "dir.log", now=d) >= audit.COUNT_UNREADABLE
+    (tmp / "bad.log").write_bytes(b"\xff\xfe not utf-8")   # UnicodeDecodeError
+    assert audit.count_today(log_path=tmp / "bad.log", now=d) >= audit.COUNT_UNREADABLE
+
+
+def test_record_failure_returns_false(tmp=Path("/tmp/pp_audit_6")):
+    _clean(tmp)
+    (tmp / "orders.log").mkdir()                           # can't open a dir for append
+    assert audit.record({"kind": "submit"}, log_path=tmp / "orders.log") is False
+    assert audit.record({"kind": "submit"}, log_path=tmp / "ok.log") is True
+
+
 if __name__ == "__main__":
     raise SystemExit(run(globals()))
