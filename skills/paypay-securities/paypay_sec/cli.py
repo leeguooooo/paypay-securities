@@ -2018,6 +2018,8 @@ def build_parser() -> argparse.ArgumentParser:
                              "instead of the default page cap — for complete realized P&L")
 
     p = argparse.ArgumentParser(prog="paypay", description="Read-only PayPay証券 client (Phase 1)")
+    from . import __version__
+    p.add_argument("--version", action="version", version=f"paypay {__version__}")
     sub = p.add_subparsers(dest="command", required=True)
     for name, fn in (("login", cmd_login), ("logout", cmd_logout),
                      ("balance", cmd_balance), ("portfolio", cmd_portfolio),
@@ -2097,7 +2099,25 @@ def build_parser() -> argparse.ArgumentParser:
     canc.add_argument("order_id", help="order id from `paypay orders`")
     canc.add_argument("--execute", action="store_true", help="actually cancel (default is dry-run)")
 
+    upd = sub.add_parser("self-update", aliases=["upgrade"],
+                         help="update this skill + CLI from GitHub (no login, no account data)")
+    upd.set_defaults(func=cmd_self_update)
+    upd.add_argument("--check", action="store_true",
+                     help="only report installed vs target version; change nothing")
+    upd.add_argument("--ref", default="main",
+                     help="branch, tag or full commit sha to install (default: main)")
+    upd.add_argument("--yes", action="store_true",
+                     help="skip the confirmation prompt (required without a TTY)")
+    upd.add_argument("--force", action="store_true",
+                     help="update even if the installed folder has local edits (keeps a backup)")
+    upd.add_argument("--json", action="store_true", help="machine-readable result")
+
     return p
+
+
+def cmd_self_update(_client, args) -> int:
+    from .selfupdate import cmd_self_update as _run
+    return _run(args)
 
 
 # Trading commands are OFF by default — a read-only/复盘 invocation should not even
@@ -2115,6 +2135,9 @@ def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
     global _LANG
     _LANG = getattr(args, "lang", "ja")
+    # `self-update` only talks to GitHub + uv — never loads credentials or logs in.
+    if args.func is cmd_self_update:
+        return cmd_self_update(None, args)
     # `accounts` / `doctor` only inspect local config — no credentials / network.
     if args.func is cmd_accounts:
         return cmd_accounts(None, args)

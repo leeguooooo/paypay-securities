@@ -22,6 +22,24 @@ npx skills add leeguooooo/paypay-securities --skill paypay-securities -g     # �
 `paypay-securities` スキル(SKILL.md + 同梱の Python CLI)がエージェントのスキル
 ディレクトリに導入されます。[`uv`](https://docs.astral.sh/uv/) が必要です。
 
+## 更新
+
+```bash
+paypay self-update --check --json   # インストール済み版と最新版(main)を比較するだけ。何も変更しない
+paypay self-update --yes            # その場で更新(TTY では --yes の代わりに確認プロンプト)
+paypay self-update --ref <tag|sha> --yes   # バージョン固定
+```
+
+スキルと CLI は同じフォルダで配布されるため、一緒に更新されます。`self-update` は GitHub
+(git fetch)と `uv` にのみアクセスし、ログイン・認証情報の読み込み・発注系コマンドは一切
+行わず、`~/.paypay-sec`(認証情報・セッション・キャッシュ・スナップショット)にも触れません。
+自動更新するのは `~/.agents/.skill-lock.json` に記録された `npx skills add -g` のグローバル
+インストールのみで、git チェックアウトやその他の導入方法では手動コマンド
+(`npx skills update paypay-securities -g -y`)を案内します。コピーしたフォルダは対象の git
+tree ハッシュで検証し、更新後に `uv sync` とオフラインの `--help` を実行、失敗したら元の
+フォルダに戻します。スキルフォルダにローカル編集がある場合は `--force` を付けない限り更新
+しません(バックアップを残します)。フォルダ内の `.env` や追加したファイルは引き継がれます。
+
 ## 設定
 
 認証情報を `~/.paypay-sec/.env` に置きます

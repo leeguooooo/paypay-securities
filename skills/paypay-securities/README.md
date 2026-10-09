@@ -31,6 +31,25 @@ paypay review --format lark --lang zh
 (The launcher runs `uv run --project <skill>` for you and silences uv's
 `VIRTUAL_ENV` warning.)
 
+## Update
+
+```bash
+paypay self-update --check --json   # installed vs latest (main); changes nothing
+paypay self-update --yes            # update in place (prompts instead of --yes on a TTY)
+paypay self-update --ref <tag|sha> --yes   # pin a version
+```
+
+The skill and the CLI ship as one folder, so they update together. `self-update`
+only talks to GitHub (git fetch) and `uv`; it never logs in, never reads credentials,
+never runs trading commands, and never touches `~/.paypay-sec` (credentials, sessions,
+cache, snapshots). It only updates a global `npx skills add -g` install recorded in
+`~/.agents/.skill-lock.json`; for git checkouts or other installs it prints the manual
+command (`npx skills update paypay-securities -g -y`). The copied folder is checked
+against the target git tree hash, `uv sync` + offline `--help` run afterwards, and the
+previous folder is restored if that fails. Local edits to the skill folder block the
+update unless you pass `--force` (a backup is kept); a `.env` inside the folder and
+files you added are carried over.
+
 ## Configure credentials
 
 Copy `.env.example` to `~/.paypay-sec/.env` and fill it in (this path is searched
