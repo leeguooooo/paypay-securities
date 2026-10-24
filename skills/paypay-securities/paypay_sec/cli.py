@@ -690,18 +690,23 @@ def cmd_accounts(client, args) -> int:
 
 
 def cmd_doctor(client, args) -> int:
-    """Diagnose local setup + login readiness. Needs no network — it inspects the
-    account's .env, cookie, cached session, and cache dir, and says whether the
-    next login would need an SMS code."""
+    """Inspect local configuration; only --online verifies authentication.
+
+    Never render server/exception messages: they may contain credentials.
+    """
     from .client import state_dir as _state_dir
     account = (getattr(args, "account", None) or os.environ.get("PAYPAY_ACCOUNT")
                or config.DEFAULT_ACCOUNT)
     env_path = config.env_file_for(account)
-    config.load_dotenv(account)
-
-    member_id = os.environ.get("PAYPAY_MEMBER_ID", "").strip()
-    password_set = bool(os.environ.get("PAYPAY_PASSWORD", "").strip())
-    cookie = os.environ.get("PAYPAY_COOKIE", "").strip()
+    settings = None
+    try:
+        settings = (Settings.from_account_file(account) if account != config.DEFAULT_ACCOUNT
+                    else Settings.from_env(account))
+    except RuntimeError:
+        pass  # Report missing configuration without echoing exception text.
+    member_id = settings.member_id if settings else ""
+    password_set = bool(settings and settings.password)
+    cookie = settings.cookie if settings else ""
     has_device_token = "SMS_AUTH_STRING" in cookie
 
     sd = _state_dir(account)
@@ -710,7 +715,8 @@ def cmd_doctor(client, args) -> int:
     token_cached, last_session = False, None
     if session_exists:
         try:
-            token_cached = bool(json.loads(session_file.read_text(encoding="utf-8")).get("token"))
+            data = json.loads(session_file.read_text(encoding="utf-8"))
+            token_cached = isinstance(data, dict) and bool(data.get("token"))
         except (OSError, ValueError):
             pass
         try:
@@ -730,39 +736,63 @@ def cmd_doctor(client, args) -> int:
         {"ok": password_set, "name": "PAYPAY_PASSWORD", "detail": "set" if password_set else "missing"},
         {"ok": bool(cookie), "name": "PAYPAY_COOKIE", "detail": "set" if cookie else "missing"},
         {"ok": has_device_token, "name": "trusted-device token",
-         "detail": "cookie carries _SMS_AUTH_STRING (SMS skipped)" if has_device_token
-                   else "cookie LACKS _SMS_AUTH_STRING → login will demand an SMS code"},
+         "detail": "trusted-device token present; server policy is not verified" if has_device_token
+                   else "trusted-device token missing; password login may need SMS (passkey may work)"},
     ]
     # --online: actually hit the API to confirm the cached session is LIVE (not just
     # that the local files look right). Off by default — it touches the network.
     online = getattr(args, "online", False)
     online_checks = []
+    import shlex
+    account_flag = " -a " + shlex.quote(account)
+    actions = {
+        "CREDENTIALS_MISSING": "Configure PAYPAY_MEMBER_ID and PAYPAY_PASSWORD for this account; do not paste secrets into chat.",
+        "PASSKEY_MISSING": "No usable cached passkey (missing, locked or unreadable). Unlock the Keychain; if not configured, run `paypay passkey-setup" + account_flag + "` manually. Password/cookie refresh alone cannot satisfy required passkey authentication.",
+        "PASSKEY_LOGIN_FAILED": "Passkey authentication failed. Check the account's passkey in the official app/browser before retrying.",
+        "SESSION_EXPIRED": "Session redirected to login. Run `paypay login" + account_flag + "`, then retry doctor --online.",
+        "SMS_REQUIRED": "Complete SMS verification in the official browser and refresh this account's trusted-device cookie manually.",
+        "LOGIN_FAILED": "Login failed. Check authentication in the official app/browser, then retry doctor --online.",
+        "PROBE_FAILED": "API probe failed. Check connectivity/service availability and retry doctor --online.",
+    }
+
+    def failure(name, error=None, code=None):
+        from .client import LoginError, SessionExpired
+        if code is None:
+            code = ("SESSION_EXPIRED" if isinstance(error, SessionExpired) else
+                    error.code if isinstance(error, LoginError) else "PROBE_FAILED")
+        if code not in actions:
+            code = "LOGIN_FAILED"
+        return {"ok": False, "name": name, "code": code,
+                "detail": actions[code], "action": actions[code]}
+
     if online:
         if not (member_id and password_set):
-            online_checks.append({"ok": False, "name": "online probe",
-                                  "detail": "credentials missing — can't probe"})
+            online_checks.append(failure("online probe", code="CREDENTIALS_MISSING"))
         else:
             from .client import SessionExpired
             try:
-                c = PayPayClient(Settings.from_env(account))
+                c = PayPayClient(settings, cache_ttl=0)
                 info = c.login()
                 online_checks.append({
                     "ok": bool(info.get("STATUS")) and not info.get("IF_NEED_SMS_FLG"),
+                    "code": "OK" if info.get("STATUS") and not info.get("IF_NEED_SMS_FLG") else "LOGIN_FAILED",
                     "name": "login (web)",
                     "detail": f"STATUS={bool(info.get('STATUS'))} sms_required={bool(info.get('IF_NEED_SMS_FLG'))}"})
                 for label, probe in (("証券 page", lambda: c.portfolio_html("usa")),
                                      ("投信 API", c.invtrust_top)):
+                    if not online_checks[0]["ok"]:
+                        break
                     try:
                         probe()
-                        online_checks.append({"ok": True, "name": label, "detail": "reachable / session valid"})
-                    except SessionExpired:
-                        online_checks.append({"ok": False, "name": label, "detail": "redirected to login (session expired)"})
+                        online_checks.append({"ok": True, "code": "OK", "name": label, "detail": "reachable / session valid"})
+                    except SessionExpired as e:
+                        online_checks.append(failure(label, e))
                     except Exception as e:  # noqa: BLE001
-                        online_checks.append({"ok": False, "name": label, "detail": type(e).__name__})
+                        online_checks.append(failure(label, e))
             except Exception as e:  # noqa: BLE001
-                online_checks.append({"ok": False, "name": "login (web)", "detail": f"{type(e).__name__}: {e}"})
+                online_checks.append(failure("login (web)", e))
 
-    offline_ready = all(c["ok"] for c in checks)
+    offline_ready = bool(member_id and password_set and has_device_token)
     online_ready = (not online) or all(c["ok"] for c in online_checks)
     payload = {
         "account": account, "env_file": str(env_path) if env_path else None,
@@ -775,7 +805,14 @@ def cmd_doctor(client, args) -> int:
         "accounts": config.list_accounts(),
         "checks": checks,
         "online": online, "online_checks": online_checks,
-        "ready": offline_ready and online_ready,
+        "offline_ready": offline_ready,
+        "authentication_verified": bool(online and online_ready),
+        "status": (("READY" if online_ready else "NOT_READY") if online else
+                   "UNVERIFIED" if offline_ready else "NOT_READY"),
+        "error_codes": (list(dict.fromkeys(c["code"] for c in online_checks if not c["ok"]))
+                        if online else (["CREDENTIALS_MISSING"] if not (member_id and password_set)
+                                        else [] if offline_ready else ["TRUSTED_DEVICE_MISSING"])),
+        "ready": online_ready if online else offline_ready,
     }
 
     def render(p):
@@ -790,13 +827,12 @@ def cmd_doctor(client, args) -> int:
                 f"last {p['last_session_refresh'] or '?'})" if p["session_cached"]
                 else "none yet — the first command will log in")
         print(f"\n  cached session             : {sess}")
-        print(f"  SMS required on next login : "
-              f"{'YES — cookie missing trusted-device token' if p['sms_would_be_required'] else 'no'}")
+        print("  SMS/passkey policy         : server-controlled; cannot infer from cookie alone")
         print(f"  response cache             : {p['cache_files']} files in {p['cache_dir']}")
         print(f"  configured accounts        : {', '.join(p['accounts']) or '(none)'}")
         if not p["online"]:
             print("  (run `paypay doctor --online` to verify the session is actually live)")
-        print(f"\n  → {'READY' if p['ready'] else 'NOT READY — resolve the !! items above'}")
+        print(f"\n  → {p['status']}" + (" (local configuration only)" if not p["online"] else ""))
 
     _emit(payload, args.json, render)
     return 0 if payload["ready"] else 1

@@ -62,6 +62,10 @@ class PasskeyLoginError(RuntimeError):
     """Headless passkey login failed (no cached key, server rejection, etc.)."""
 
 
+class PasskeyMissing(PasskeyLoginError):
+    """No usable cached passkey is available (missing, locked or unreadable)."""
+
+
 # --------------------------------------------------------------------------- #
 # device-id — stable per account, minted once and persisted in the state dir   #
 # --------------------------------------------------------------------------- #
@@ -213,7 +217,7 @@ def passkey_login(session: requests.Session, account: str, state_dir: Path,
     Raises PasskeyLoginError if no cached passkey or the server rejects us."""
     blob = blob or load_passkey(account)
     if not blob:
-        raise PasskeyLoginError(
+        raise PasskeyMissing(
             "no cached passkey for this account — run `paypay passkey-setup` once "
             "(unlock rbw, extracts the PayPay passkey from Bitwarden into the Keychain)")
 
