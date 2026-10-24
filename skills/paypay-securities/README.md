@@ -60,8 +60,24 @@ first, so the CLI works from any directory). **Never commit it.**
 | `PAYPAY_MEMBER_ID`, `PAYPAY_PASSWORD` | login credentials |
 | `PAYPAY_COOKIE` | the full `Cookie:` header from a logged-in browser — **must** contain the `..._SMS_AUTH_STRING` trusted-device token, or the server demands an SMS code |
 
-Run `paypay doctor` to check your setup (it tells you if the cookie is missing the
-trusted-device token, whether a session is cached, etc.) — no network needed.
+Run `paypay doctor` for local configuration checks (no network or Keychain access).
+Offline `ready`/exit 0 means only that the password-login prerequisites look present:
+`status=UNVERIFIED` and `authentication_verified=false`. Cached sessions and trusted-device
+cookies do **not** prove that login works or bypass a server-required passkey.
+
+Use `paypay doctor --online --json -a <account>` to force fresh login and uncached
+証券/投信 probes. Exit 0 means all online probes passed; any failure exits 1.
+Online success overrides cookie-only heuristics (passkey login does not need SMS cookies).
+`error_codes` and per-probe `code`/`action` distinguish `CREDENTIALS_MISSING`,
+`PASSKEY_MISSING` (also locked/unreadable cached key), `PASSKEY_LOGIN_FAILED`,
+`SMS_REQUIRED`, `SESSION_EXPIRED`, `LOGIN_FAILED`, and `PROBE_FAILED`.
+No raw exception/server messages or credential values are printed by doctor.
+`PASSKEY_MISSING` requires manual Keychain/passkey setup, not repeated password login.
+The legacy `sms_would_be_required` field is only a cookie heuristic, not server policy.
+
+When checking multiple profiles, preserve each exit status; `cmd1; cmd2` returns only
+cmd2's status. For example: `rc=0; paypay doctor --online -a default || rc=1;
+paypay doctor --online -a second || rc=1; exit "$rc"`.
 
 **Multiple accounts:** each profile is `~/.paypay-sec/<name>.env`; select with
 `-a <name>` (the default account uses `~/.paypay-sec/.env`). `paypay accounts` lists them.

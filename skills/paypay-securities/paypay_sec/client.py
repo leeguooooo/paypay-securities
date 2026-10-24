@@ -57,7 +57,11 @@ def normalize_market(market: str) -> str:
 
 
 class LoginError(RuntimeError):
-    """Login did not succeed (bad creds, expired device token, SMS required…)."""
+    """Login did not succeed; code is safe for machine-readable diagnostics."""
+
+    def __init__(self, message: str, *, code: str = "LOGIN_FAILED"):
+        super().__init__(message)
+        self.code = code
 
 
 class SessionExpired(RuntimeError):
@@ -238,7 +242,7 @@ class PayPayClient:
             raise LoginError(
                 "server demands SMS verification (IF_NEED_SMS_FLG=1) — this "
                 "device/cookie is not trusted; refresh PAYPAY_COOKIE from a "
-                "logged-in browser."
+                "logged-in browser.", code="SMS_REQUIRED",
             )
         if payload.get("PASSKEY_REQUIRED"):
             # STATUS=True here is a TRAP: login.json accepts the password but the
@@ -264,7 +268,8 @@ class PayPayClient:
         except pk.PasskeyLoginError as e:
             raise LoginError(
                 f"passkey login failed: {e}"
-                + (f" (server: {passkey_message})" if passkey_message else "")
+                + (f" (server: {passkey_message})" if passkey_message else ""),
+                code="PASSKEY_MISSING" if isinstance(e, pk.PasskeyMissing) else "PASSKEY_LOGIN_FAILED",
             ) from e
         self.token = None
         self._from_cache = True
