@@ -148,15 +148,28 @@ def extract_via_rbw(rp_id: str = RP_ID, rbw_bin: str = "bitwarden-use") -> dict:
     private key. The private key is parsed in-process and NEVER printed by the caller.
     Requires bitwarden-use on PATH and the vault unlocked (prompts via pinentry).
     """
+    # bitwarden-use >= 0.12 masks the private key unless --reveal is passed; the
+    # older rbw fork has no such flag, so fall back to the bare call.
+    r = _run_rbw([rbw_bin, "fido2", "get", "--reveal", rp_id])
+    if r.returncode != 0 and "--reveal" in (r.stderr or ""):
+        r = _run_rbw([rbw_bin, "fido2", "get", rp_id])
+    return _parse_rbw_fido2(r, rbw_bin=rbw_bin, rp_id=rp_id)
+
+
+def _run_rbw(argv: list[str]) -> subprocess.CompletedProcess:
+    rbw_bin, rp_id = argv[0], argv[-1]
     try:
-        r = subprocess.run([rbw_bin, "fido2", "get", rp_id],
-                           check=False, capture_output=True, text=True, timeout=_RBW_TIMEOUT)
+        return subprocess.run(argv, check=False, capture_output=True, text=True,
+                              timeout=_RBW_TIMEOUT)
     except subprocess.TimeoutExpired:
         raise PasskeyLoginError(
             f"`{rbw_bin} fido2 get {rp_id}` timed out after {_RBW_TIMEOUT}s "
             "(pinentry left unanswered?)") from None
     except OSError as e:
         raise PasskeyLoginError(f"could not run `{rbw_bin}`: {e.strerror}") from None
+
+
+def _parse_rbw_fido2(r: subprocess.CompletedProcess, *, rbw_bin: str, rp_id: str) -> dict:
     if r.returncode != 0:
         raise PasskeyLoginError(
             f"`{rbw_bin} fido2 get {rp_id}` failed (unlock rbw first?): "
@@ -174,6 +187,14 @@ def extract_via_rbw(rp_id: str = RP_ID, rbw_bin: str = "bitwarden-use") -> dict:
     if missing:
         raise PasskeyLoginError(
             f"rbw fido2 get output missing {missing} — check the entry has a passkey")
+    # A masked placeholder (no --reveal) must never be cached as if it were a key.
+    from .passkey_signer import load_private_key
+    try:
+        load_private_key(fields["private_key_b64url"])
+    except Exception:   # noqa: BLE001 — never echo the value
+        raise PasskeyLoginError(
+            f"`{rbw_bin} fido2 get` did not return a usable private key "
+            "(masked output? needs --reveal / Touch ID)") from None
     # Bitwarden stores credentialId as a hex GUID; WebAuthn wants base64url bytes.
     fields["credential_id"] = _credential_id_to_b64url(fields["credential_id"])
     fields.setdefault("rp_id", rp_id)
@@ -208,6 +229,21 @@ def _bff(session: requests.Session, method: str, url: str, headers: dict, body: 
     return data
 
 
+# Cookies that must never be carried into a fresh passkey login: the www session
+# (re-minted by GET /login/) and the BFF auth state (re-minted by prepare).
+_STALE_AUTH_COOKIE_PREFIXES = ("laravel_session", "__Secure-client-auth-state")
+
+
+def _drop_stale_auth_cookies(session: requests.Session) -> list[str]:
+    """Remove stale auth cookies from the jar; returns the names dropped."""
+    dropped = []
+    for ck in list(session.cookies):
+        if ck.name.startswith(_STALE_AUTH_COOKIE_PREFIXES):
+            session.cookies.clear(ck.domain, ck.path, ck.name)
+            dropped.append(ck.name)
+    return dropped
+
+
 def passkey_login(session: requests.Session, account: str, state_dir: Path,
                   *, blob: dict | None = None, action: str = "VERIFY",
                   debug: bool = False) -> dict:
@@ -227,9 +263,12 @@ def passkey_login(session: requests.Session, account: str, state_dir: Path,
     # then AUTHORIZES that session (PayPay re-authorizes the existing cookie rather
     # than issuing a new one), so we end up owning a valid session that doesn't
     # depend on the expiring seeded cookie.
-    for ck in list(session.cookies):
-        if ck.name == "laravel_session":
-            session.cookies.clear(ck.domain, ck.path, ck.name)
+    #
+    # Also drop any seeded `__Secure-client-auth-state-*` cookie: it is the BFF's
+    # own auth state, and a stale copy (e.g. pasted into PAYPAY_COOKIE months ago)
+    # makes the callback bounce with general_system_error even though every BFF
+    # step succeeded. The BFF mints a fresh one during prepare.
+    _drop_stale_auth_cookies(session)
     try:
         session.get(f"{WWW}/login/", timeout=30)
     except requests.RequestException:
