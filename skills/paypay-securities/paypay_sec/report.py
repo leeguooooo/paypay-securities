@@ -447,9 +447,14 @@ def daily_pnl_series(snapshots: list[dict]) -> dict[str, dict]:
         gap = _gap_days(pd, d)
         if gap > MAX_GAP_DAYS:
             net_flow = (s.get("net_deposit") or 0) - (prev.get("net_deposit") or 0)
-            out[d] = {**_missing_day(f"距上次有效快照({pd}){gap} 天,区间盈亏不计入单日"),
-                      "range_from": pd, "total_assets": gt,
-                      "range_pnl": (gt - (prev.get("grand_total") or 0)) - net_flow}
+            dep, pdep = s.get("deposits"), prev.get("deposits")
+            span_ok = (bool(s.get("ledger_full")) == bool(prev.get("ledger_full"))
+                       and not (dep is not None and pdep is not None and dep < pdep))
+            note = f"距上次有效快照({pd}){gap} 天,区间盈亏不计入单日"
+            if not span_ok:
+                note += ";账本覆盖范围变化,区间盈亏无法剔除现金流"
+            out[d] = {**_missing_day(note), "range_from": pd, "total_assets": gt,
+                      "range_pnl": ((gt - (prev.get("grand_total") or 0)) - net_flow) if span_ok else None}
             prev = s
             continue
         dep, pdep = s.get("deposits"), prev.get("deposits")

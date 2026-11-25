@@ -20,7 +20,7 @@ mkdir -p "$HOME/.paypay-sec"
 
 # Skip weekends (US market closed Sat/Sun; nothing new to snapshot). 6=Sat 7=Sun.
 dow="$(date +%u)"
-if [ "$dow" = "6" ] || [ "$dow" = "7" ]; then
+if { [ "$dow" = "6" ] || [ "$dow" = "7" ]; } && [ "${PAYPAY_SNAPSHOT_ANY_DAY:-0}" != "1" ]; then
   exit 0
 fi
 
@@ -52,6 +52,6 @@ FAILED=""
 # Surface failures instead of silently logging them (the default account went
 # months without a real snapshot before this). Exit non-zero for launchd/cron.
 if [ -n "$FAILED" ]; then
-  /usr/bin/osascript -e "display notification \"snapshot failed:$FAILED — run paypay doctor --online\" with title \"PayPay snapshot\"" >/dev/null 2>&1 || true
+  [ "${PAYPAY_SNAPSHOT_NOTIFY:-1}" = "1" ] && /usr/bin/osascript -e "display notification \"snapshot failed:$FAILED — run paypay doctor --online\" with title \"PayPay snapshot\"" >/dev/null 2>&1 || true
   exit 1
 fi

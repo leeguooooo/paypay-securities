@@ -1049,6 +1049,12 @@ def cmd_diff(client: PayPayClient, args) -> int:
         print("no baseline snapshot — run `paypay snapshot save` first", file=sys.stderr)
         return 1
     cur = _build_snapshot(client, args)
+    bad = snapshots.problems(cur)
+    if bad:
+        # a failed live read would print as a crash in total assets — refuse instead
+        print(f"error: live read incomplete — {'; '.join(bad)}; no diff printed. "
+              "Run `paypay doctor --online`.", file=sys.stderr)
+        return SNAPSHOT_REJECTED_EXIT
     payload = _diff_payload(base, cur)
 
     def table(p):
@@ -1212,8 +1218,9 @@ def cmd_trend(_client, args) -> int:
                 print(f"    最良/最悪日: {st['best']['date']} {_signed_yen(st['best']['pnl'])}"
                       f" / {st['worst']['date']} {_signed_yen(st['worst']['pnl'])}")
             for g in st["gaps"]:
-                print(f"    ⚠ 空白期間 {g['from']} → {g['to']}: 区間損益 {_signed_yen(g['range_pnl'])}"
-                      "(日次には含めず)")
+                rp = (f"区間損益 {_signed_yen(g['range_pnl'])}" if g["range_pnl"] is not None
+                      else "区間損益は台帳範囲が変化したため算出不可")
+                print(f"    ⚠ 空白期間 {g['from']} → {g['to']}: {rp}(日次には含めず)")
             if t["weeks"]:
                 print("    週次       : " + "  ".join(f"{w['week'][5:]} {_signed_yen(w['pnl'])}"
                                                     for w in t["weeks"][-6:]))
@@ -1239,7 +1246,8 @@ def cmd_trend(_client, args) -> int:
                      f"**{_signed_yen(t['pnl'])}**{pct} / 純入金(期間) {_signed_yen(t['net_flow'])} / "
                      f"総資産 {_yen(t['end']['total'])}")
             for g in t["stats"]["gaps"]:
-                L.append(f"  - ⚠ 空白期間 {g['from']}→{g['to']}(区間 {_signed_yen(g['range_pnl'])})")
+                L.append(f"  - ⚠ 空白期間 {g['from']}→{g['to']}"
+                         + (f"(区間 {_signed_yen(g['range_pnl'])})" if g["range_pnl"] is not None else ""))
         h = p.get("household")
         if h:
             L.append(f"- **世帯合計** 運用損益 **{_signed_yen(h['pnl'])}** / 総資産 {_yen(h['end_total'])}"

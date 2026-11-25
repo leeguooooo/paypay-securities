@@ -112,5 +112,50 @@ def test_household_flags_misaligned_windows():
     assert h["pnl"] == 30 and h["aligned"] is False
 
 
+def test_long_gap_with_ledger_change_has_no_range_pnl():
+    snaps = [_snap("20260601-073000", 500_000, nd=500_000, ledger_full=False),
+             _snap("20261125-073000", 900_000, nd=800_000, ledger_full=True)]
+    gap = report.daily_pnl_series(snaps)["2026-11-25"]
+    assert gap["range_from"] == "2026-06-01" and gap["range_pnl"] is None
+
+
+def test_diff_refuses_failed_live_read():
+    _tmp_redirect()
+    snapshots.save(None, _snap("20260101-073000", 100))
+    orig = cli._build_snapshot
+    cli._build_snapshot = lambda client, args: _snap("20260103-073000", 403, sources=_FAILED)
+    out, err = io.StringIO(), io.StringIO()
+    try:
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(out):
+            rc = cli.cmd_diff(None, SimpleNamespace(account=None, days=None, json=False, fmt=None))
+    finally:
+        cli._build_snapshot = orig
+    assert rc == cli.SNAPSHOT_REJECTED_EXIT and out.getvalue() == "", out.getvalue()
+
+
+def test_daily_script_alerts_and_exits_nonzero():
+    import os
+    import subprocess
+    script = Path(__file__).resolve().parent.parent / "bin" / "snapshot-daily.sh"
+    with tempfile.TemporaryDirectory() as tmp:
+        home, stub = Path(tmp) / "home", Path(tmp) / "bin"
+        (home / ".paypay-sec").mkdir(parents=True)
+        (home / ".paypay-sec" / "second.env").write_text("")
+        stub.mkdir()
+        # stub uv: snapshot save fails (exit 3) for the default account only
+        (stub / "uv").write_text('#!/bin/bash\ncase "$*" in *"snapshot save -a"*) exit 0;; '
+                                 '*"snapshot save"*) echo "error: snapshot NOT saved" >&2; exit 3;; '
+                                 '*) exit 0;; esac\n')
+        (stub / "uv").chmod(0o755)
+        env = {"HOME": str(home), "PATH": f"{stub}:/usr/bin:/bin",
+               "PAYPAY_SNAPSHOT_ANY_DAY": "1", "PAYPAY_SNAPSHOT_NOTIFY": "0"}
+        r = subprocess.run(["/bin/bash", str(script)], env=env, capture_output=True, text=True,
+                           timeout=60)
+        log = (home / ".paypay-sec" / "snapshot-cron.log").read_text()
+        assert r.returncode == 1, (r.returncode, r.stderr)
+        assert "ALERT: snapshot failed for: default" in log, log
+        assert "second" not in log.split("ALERT:")[1], "a passing account was reported as failed"
+
+
 if __name__ == "__main__":
     raise SystemExit(run(globals()))
