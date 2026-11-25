@@ -108,11 +108,13 @@ uv run paypay trades-summary        # per-brand buy/sell/net-invested/net-shares
 uv run paypay risk [--accounts]     # 持仓结构 / exposure: weights, concentration, FX/category split (+口座区分 with --accounts; FACTS ONLY)
 uv run paypay plans                 # 定投/つみたて: active recurring-buy funds + monthly run-rate (scans FULL history by default; --fast = quick)
 uv run paypay tax                   # per-year tax view: 売却 / 譲渡益税 / 分配金 (FULL history by default; --fast = quick; 年間取引報告書 参考, FACTS ONLY)
-uv run paypay snapshot save         # save a dated account snapshot (the CLI's own time series)
-uv run paypay snapshot list         # list saved snapshots
+uv run paypay snapshot save         # save a dated account snapshot (the CLI's own time series); refuses a failed read (exit 3)
+uv run paypay snapshot list         # list saved snapshots (⚠ marks unusable ones)
+uv run paypay snapshot quarantine   # move unusable (failed-source) snapshots out of the series (--dry-run to preview)
+uv run paypay trend [--days 30]     # P&L trend from snapshots, deposits stripped; -a all = household (no login)
 uv run paypay diff [--days N]       # diff a live read vs the latest (or ~N-days-old) snapshot
 uv run paypay calendar              # build 每日涨跌日历 HTML from snapshots (--json = raw schema; --out PATH; -a all = household, the default)
-uv run paypay doctor [--online]     # diagnose setup/login readiness (offline by default; --online probes login + 証券/投信 to confirm the session is live)
+uv run paypay doctor [--online] [--fix]  # diagnose setup/login readiness (offline by default; --online probes login + 証券/投信 + the Keychain passkey; --fix drops stale auth cookies from .env and chmods it 600)
 uv run paypay accounts              # list configured account profiles
 uv run paypay cache-clear           # clear the local response cache
 ```
@@ -127,9 +129,21 @@ advice**, same boundary as every other command.
 `snapshot save` writes `<state_dir>/snapshots/<ts>.json` (assets, cash, holdings,
 realized, deposits); `diff` compares a live read against the latest snapshot (or
 `--days N` ago) so you get "this week's change" — asset/holdings/deposit/realized deltas.
+A read with any **failed** source (e.g. login broke and only stale cash came back) is
+**never** saved into the series: `snapshot save` keeps it under `snapshots/rejected/`
+and exits **3**, and the daily script raises a macOS notification and exits non-zero.
+`diff` baselines skip unusable snapshots. Older bad snapshots can be moved aside with
+`snapshot quarantine`.
 Automate it: `bin/snapshot-cron.sh install` schedules a daily (07:30 local, trading
 days) read-only snapshot of **every** profile + a calendar rebuild + a Monday
 `diff --days 7`, logged to `~/.paypay-sec/snapshot-cron.log` (`uninstall` / `status` too).
+
+**`trend`** reads only the saved snapshots (no login): start→end 総資産 change,
+期間の純入金, and 運用損益 = change − net deposits (% = simple Dietz), daily up/down
+counts, best/worst day and weekly sums. A gap of more than 7 days between usable
+snapshots is shown as a gap with its range P&L, never booked as one day (same rule in
+`calendar`). `-a all` adds a household line, flagged when the accounts' windows
+don't start on the same day. Facts only.
 
 **`calendar`** reads only the saved snapshots (no creds/network) and builds a
 single self-contained, offline HTML — the 每日涨跌日历: month + year (GitHub-style

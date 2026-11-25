@@ -75,6 +75,36 @@ def _unquote(val: str) -> str:
 _warned: set = set()
 
 
+def strip_cookies_from_env(path: Path, should_drop) -> list[str]:
+    """Remove cookies whose NAME matches `should_drop(name)` from the PAYPAY_COOKIE
+    line of an .env file. Keeps a 0600 backup next to it and rewrites atomically
+    as 0600. Returns the dropped names ([] = file untouched). Values never printed."""
+    import time
+    text = Path(path).read_text(encoding="utf-8")
+    out, dropped = [], []
+    for line in text.splitlines(keepends=True):
+        body = line.rstrip("\r\n")
+        eol = line[len(body):]
+        key, sep, val = body.partition("=")
+        if sep and key.strip() in ("PAYPAY_COOKIE", "export PAYPAY_COOKIE"):
+            q = val.strip()[:1] if val.strip()[:1] in ("'", '"') else ""
+            inner = _unquote(val.strip())
+            keep = []
+            for part in inner.split(";"):
+                name = part.split("=", 1)[0].strip()
+                if name and should_drop(name):
+                    dropped.append(name)
+                elif part.strip():
+                    keep.append(part.strip())
+            body = f"{key}={q}{'; '.join(keep)}{q}"
+        out.append(body + eol)
+    if dropped:
+        backup = Path(path).with_name(Path(path).name + f".bak-{time.strftime('%Y%m%d-%H%M%S')}")
+        write_private(backup, text)
+        write_private(Path(path), "".join(out))
+    return dropped
+
+
 def _warn_if_loose(path: Path) -> None:
     """The .env holds credentials — nag (don't refuse, once per file) if group/other
     can read it."""

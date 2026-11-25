@@ -17,6 +17,31 @@ from __future__ import annotations
 # Japanese term  →  Chinese term. Order does not matter here — _apply() sorts by
 # key length descending so the longest match wins.
 _ZH_TERMS: dict[str, str] = {
+    # trend (paypay trend) — whole phrases first so the term pass can't mangle them
+    "スナップショットからの事実集計のみ(入出金を除いた資産変化)。投資助言ではありません。":
+        "仅为快照的事实汇总(已剔除出入金的资产变化)。非投资建议。",
+    "スナップショット基準": "按快照",
+    "有効なスナップショットなし": "无有效快照",
+    "トレンド": "趋势",
+    "直近": "最近",
+    "全期間": "全部期间",
+    "運用損益": "投资盈亏",
+    "純入金(期間)": "期间净入金",
+    "世帯合計": "家庭合计",
+    "口座ごとに起点が異なる": "各账户起点不同",
+    "ため、合計は参考値": ",合计仅供参考",
+    "・参考値": "・仅供参考",
+    "台帳範囲が変化、入出金の除去は概算": "账本范围有变,剔除出入金为近似值",
+    "日次には含めず": "不计入每日",
+    "最良/最悪日": "最好/最差日",
+    "空白期間": "空白期",
+    "区間損益": "区间盈亏",
+    "日次": "每日",
+    "週次": "每周",
+    "集計": "统计",
+    "上昇": "上涨",
+    "下落": "下跌",
+    "欠損": "缺失",
     # headline P&L / asset vocabulary
     "評価損益率": "持仓盈亏率",
     "評価損益": "持仓盈亏",

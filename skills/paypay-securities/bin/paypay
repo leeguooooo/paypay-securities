@@ -23,4 +23,8 @@ unset VIRTUAL_ENV
 # Run the module (NOT the `paypay` console-script name): once symlinked onto PATH
 # as `paypay`, `uv run paypay` could resolve back to this launcher and loop.
 # `python -m paypay_sec` is unambiguous and can't recurse.
-exec uv run --project "$SKILL_DIR" python -m paypay_sec "$@"
+# -I (isolated mode): don't put the CWD on sys.path. Without it, running `paypay`
+# from any directory that contains a `paypay_sec/` folder (e.g. the repo checkout,
+# or a malicious download) imports THAT code instead of the installed skill — on a
+# CLI that can place orders. -I also ignores PYTHON* env vars and user site-packages.
+exec uv run --project "$SKILL_DIR" python -I -m paypay_sec "$@"

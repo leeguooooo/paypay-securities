@@ -16,6 +16,7 @@ import contextlib
 import getpass
 import io
 import json
+import stat
 import os
 import re
 import sys
@@ -708,6 +709,7 @@ def cmd_doctor(client, args) -> int:
     password_set = bool(settings and settings.password)
     cookie = settings.cookie if settings else ""
     has_device_token = "SMS_AUTH_STRING" in cookie
+    from . import passkey_login as _pk
 
     sd = _state_dir(account)
     session_file, cache_dir = sd / "session.json", sd / "cache"
@@ -726,6 +728,75 @@ def cmd_doctor(client, args) -> int:
         except OSError:
             pass
     cache_count = len(list(cache_dir.glob("*.json"))) if cache_dir.exists() else 0
+
+    # Offline health warnings (non-gating): the things that silently broke the
+    # default account for five months in 2026 (stale auth cookie, unreadable
+    # passkey, a snapshot series quietly full of failed reads).
+    fix = getattr(args, "fix", False)
+    warnings, fixed = [], []
+    if env_path:
+        try:
+            mode = stat.S_IMODE(env_path.stat().st_mode)
+            if mode & 0o077:
+                if fix:
+                    env_path.chmod(0o600)
+                    fixed.append(f"chmod 600 {env_path} (was {oct(mode)})")
+                else:
+                    warnings.append({"code": "ENV_PERMISSIONS",
+                                     "detail": f"{env_path} is {oct(mode)} — readable by others; `doctor --fix` sets 600"})
+        except OSError:
+            pass
+    stale = _pk.stale_auth_cookie_names(cookie)
+    if stale and fix and env_path:
+        dropped = config.strip_cookies_from_env(
+            env_path, lambda n: n.startswith(_pk._STALE_AUTH_COOKIE_PREFIXES))
+        if dropped:
+            fixed.append(f"removed {', '.join(sorted(set(dropped)))} from PAYPAY_COOKIE (backup kept)")
+            stale = []
+    if stale:
+        warnings.append({"code": "STALE_AUTH_COOKIE",
+                         "detail": f"PAYPAY_COOKIE carries {', '.join(sorted(set(stale)))} — session/auth cookies "
+                                   "expire within hours; a stale copy only gets in the way of a fresh "
+                                   "login. `doctor --fix` removes it (keeps a backup)"})
+    # The Keychain is only touched with --online (offline doctor never reads secrets).
+    pk_state = _pk.passkey_status(account) if getattr(args, "online", False) else None
+    if pk_state == "locked":
+        warnings.append({"code": "KEYCHAIN_LOCKED",
+                         "detail": "the cached passkey can't be read from this session (SSH?); an expired "
+                                   "session can't re-login here — run from the GUI session/launchd"})
+    elif pk_state == "invalid":
+        warnings.append({"code": "PASSKEY_INVALID",
+                         "detail": "the Keychain passkey entry is unusable — re-run `paypay passkey-setup"
+                                   + ("" if account == config.DEFAULT_ACCOUNT else f" -a {account}") + "`"})
+    session_age_min = None
+    if session_exists:
+        try:
+            ts = json.loads(session_file.read_text(encoding="utf-8")).get("ts")
+            if ts:
+                session_age_min = int((datetime.now(timezone.utc).timestamp() - ts) // 60)
+        except (OSError, ValueError, AttributeError):
+            pass
+    snaps_all = [s for s in (snapshots.try_load(p) for p in sorted((sd / "snapshots").glob("*.json")))
+                 if s is not None]
+    usable = [s for s in snaps_all if snapshots.is_usable(s)]
+    trailing_bad = 0
+    for s in reversed(snaps_all):
+        if snapshots.is_usable(s):
+            break
+        trailing_bad += 1
+    last_good = usable[-1].get("as_of") if usable else None
+    last_good_age_days = None
+    if usable:
+        lp = snapshots.parse_ts(str(usable[-1].get("ts") or ""))
+        if lp:
+            last_good_age_days = (datetime.now(timezone.utc) - lp).days
+    if snaps_all and trailing_bad:
+        warnings.append({"code": "SNAPSHOTS_FAILING",
+                         "detail": f"the last {trailing_bad} saved snapshot(s) are unusable (failed sources); "
+                                   "`paypay snapshot quarantine` moves them out of the series"})
+    if last_good_age_days is not None and last_good_age_days > 4:
+        warnings.append({"code": "SNAPSHOTS_STALE",
+                         "detail": f"last usable snapshot is {last_good_age_days} days old ({last_good})"})
 
     # gating checks (define "ready to run unattended")
     checks = [
@@ -804,6 +875,9 @@ def cmd_doctor(client, args) -> int:
         "cache_dir": str(cache_dir), "cache_files": cache_count,
         "accounts": config.list_accounts(),
         "checks": checks,
+        "passkey": pk_state, "session_age_minutes": session_age_min,
+        "last_usable_snapshot": last_good, "unusable_trailing_snapshots": trailing_bad,
+        "warnings": warnings, "fixed": fixed,
         "online": online, "online_checks": online_checks,
         "offline_ready": offline_ready,
         "authentication_verified": bool(online and online_ready),
@@ -823,13 +897,23 @@ def cmd_doctor(client, args) -> int:
             print("\n  online probe:")
             for c in p["online_checks"]:
                 print(f"  [{'OK' if c['ok'] else '!!'}] {_lj(c['name'], 22)} {c['detail']}")
+        age = p.get("session_age_minutes")
+        age_s = "" if age is None else (f", {age} min old" + (" — likely expired, next command re-logs in"
+                                                                if age > 60 else ""))
         sess = (f"yes (token={'yes' if p['session_token_cached'] else 'no'}, "
-                f"last {p['last_session_refresh'] or '?'})" if p["session_cached"]
+                f"last {p['last_session_refresh'] or '?'}{age_s})" if p["session_cached"]
                 else "none yet — the first command will log in")
         print(f"\n  cached session             : {sess}")
         print("  SMS/passkey policy         : server-controlled; cannot infer from cookie alone")
         print(f"  response cache             : {p['cache_files']} files in {p['cache_dir']}")
         print(f"  configured accounts        : {', '.join(p['accounts']) or '(none)'}")
+        if p["passkey"] is not None:
+            print(f"  cached passkey             : {p['passkey']}")
+        print(f"  last usable snapshot       : {p['last_usable_snapshot'] or '(none)'}")
+        for f in p["fixed"]:
+            print(f"  [FIXED] {f}")
+        for w in p["warnings"]:
+            print(f"  [WARN] {w['code']}: {w['detail']}")
         if not p["online"]:
             print("  (run `paypay doctor --online` to verify the session is actually live)")
         print(f"\n  → {p['status']}" + (" (local configuration only)" if not p["online"] else ""))
@@ -865,11 +949,30 @@ def _build_snapshot(client: PayPayClient, args) -> dict:
     }
 
 
+SNAPSHOT_REJECTED_EXIT = 3
+
+
 def cmd_snapshot(client: PayPayClient, args) -> int:
     """Save / list account snapshots — the CLI's own long-term time series."""
     account = getattr(args, "account", None)
+    if getattr(args, "snap_cmd", "save") == "quarantine":
+        dry = getattr(args, "dry_run", False)
+        moved = snapshots.quarantine_unusable(account, dry_run=dry)
+        payload = {"dry_run": dry, "moved": [p.name for p in moved],
+                   "rejected_dir": str(snapshots.rejected_dir(account))}
+
+        def render_q(p):
+            verb = "would move" if p["dry_run"] else "moved"
+            print(f"{verb} {len(p['moved'])} unusable snapshot(s) → {p['rejected_dir']}")
+            for n in p["moved"]:
+                print(f"  {n}")
+
+        _emit(payload, args.json, render_q)
+        return 0
+
     if getattr(args, "snap_cmd", "save") == "list":
-        rows = [{k: s.get(k) for k in ("ts", "as_of", "grand_total", "cash", "realized_total")}
+        rows = [{**{k: s.get(k) for k in ("ts", "as_of", "grand_total", "cash", "realized_total")},
+                 "problems": snapshots.problems(s)}
                 for s in snapshots.load_all(account)]
         payload = {"snapshots": rows}
 
@@ -879,14 +982,31 @@ def cmd_snapshot(client: PayPayClient, args) -> int:
                 return
             print("saved snapshots:\n")
             print("  " + _lj("ID", 18) + _lj("AS_OF", 22) + _rj("総資産", 12) + _rj("実現", 11))
+            bad = 0
             for s in pl["snapshots"]:
+                flag = "  ⚠ " + "; ".join(s["problems"]) if s.get("problems") else ""
+                bad += bool(s.get("problems"))
                 print("  " + _lj(s["ts"] or "", 18) + _lj(s.get("as_of") or "", 22)
-                      + _rj(_yen(s.get("grand_total")), 12) + _rj(_signed_yen(s.get("realized_total")), 11))
+                      + _rj(_yen(s.get("grand_total")), 12) + _rj(_signed_yen(s.get("realized_total")), 11)
+                      + flag)
+            if bad:
+                print(f"\n  {bad} unusable snapshot(s) — move them out of the series with "
+                      "`paypay snapshot quarantine`")
 
         _emit(payload, args.json, render)
         return 0
 
     snap = _build_snapshot(client, args)
+    bad = snapshots.problems(snap)
+    if bad:
+        # Never let a partial read into the series: it would show up as a fake
+        # crash in the calendar and poison `diff` baselines. Keep it aside for
+        # debugging and fail loudly so cron / Hermes see a non-zero exit.
+        kept = snapshots.save_rejected(account, snap)
+        print(f"error: snapshot NOT saved — {'; '.join(bad)}. "
+              f"Kept for debugging at {kept}. Run `paypay doctor --online` to check login.",
+              file=sys.stderr)
+        return SNAPSHOT_REJECTED_EXIT
     path = snapshots.save(account, snap)
     payload = {"saved": str(path), **snap}
 
@@ -1031,6 +1151,103 @@ def cmd_calendar(client: PayPayClient, args) -> int:
     if n_days == 0:
         print("  ⚠ 还没有日度盈亏 —— 每个账户需要 ≥2 个不同日期的快照。")
         print("    跑 `paypay snapshot save`(或装 bin/snapshot-cron.sh 每日自动存)。")
+    return 0
+
+
+def _trend_payload(per_account: dict, days: int | None) -> dict:
+    """{label: [snapshots]} → per-account trend + a household total. Pure."""
+    since = None
+    if days:
+        since = (datetime.now(timezone.utc).astimezone(_JST) - timedelta(days=days)).strftime("%Y-%m-%d")
+    accounts = {lab: report.trend_summary(snaps, since) for lab, snaps in per_account.items()}
+    have = [t for t in accounts.values() if t.get("start")]
+    household = None
+    if len(per_account) > 1 and have and len(have) == len(accounts):
+        household = {k: sum(t[k] for t in have) for k in ("change", "net_flow", "pnl")}
+        st = sum(t["start"]["total"] or 0 for t in have)
+        starts = sorted(t["start"]["date"] for t in have)
+        household.update({
+            "start_total": st, "end_total": sum(t["end"]["total"] or 0 for t in have),
+            "pnl_pct": report._dietz_pct(household["pnl"], st, household["net_flow"]),
+            "comparable": all(t["comparable"] for t in have),
+            # accounts whose windows start on different days can't be summed as one period
+            "aligned": report._gap_days(starts[0], starts[-1]) <= 1,
+            "starts": starts,
+        })
+    return {"as_of": _now_jst_str(), "window_days": days, "since": since,
+            "accounts": accounts, "household": household,
+            "note": "スナップショットからの事実集計のみ(入出金を除いた資産変化)。投資助言ではありません。"}
+
+
+def cmd_trend(_client, args) -> int:
+    """Trend over saved snapshots (no login): per account and household."""
+    acct_arg = getattr(args, "account", None)
+    profiles = ([acct_arg] if acct_arg and acct_arg != "all"
+                else (config.list_accounts() or [config.DEFAULT_ACCOUNT]))
+    per: dict[str, list] = {}
+    for prof in profiles:
+        label = config.account_label(prof)
+        if label in per:
+            label = f"{label}({prof})"
+        per[label] = snapshots.load_all(prof)
+    payload = _trend_payload(per, getattr(args, "days", None))
+
+    def table(p):
+        span = f"直近 {p['window_days']} 日" if p["window_days"] else "全期間"
+        print(f"PayPay証券 — トレンド ({span}, スナップショット基準)\n")
+        for lab, t in p["accounts"].items():
+            if not t.get("start"):
+                print(f"  [{lab}] 有効なスナップショットなし\n")
+                continue
+            s, e, st = t["start"], t["end"], t["stats"]
+            print(f"  [{lab}] {s['date']} → {e['date']}")
+            print(f"    総資産     : {_yen(s['total'])} → {_yen(e['total'])}  ({_signed_yen(t['change'])})")
+            print(f"    純入金(期間): {_signed_yen(t['net_flow'])}")
+            pct = f" ({t['pnl_pct']:+.2f}%)" if t.get("pnl_pct") is not None else ""
+            print(f"    運用損益   : {_signed_yen(t['pnl'])}{pct}"
+                  + ("" if t["comparable"] else "  ⚠ 台帳範囲が変化、入出金の除去は概算"))
+            print(f"    日次       : 集計 {st['counted_days']} 日 (上昇 {st['up_days']} / 下落 {st['down_days']})"
+                  f", 欠損 {st['missing_days']} 日")
+            if st["best"]:
+                print(f"    最良/最悪日: {st['best']['date']} {_signed_yen(st['best']['pnl'])}"
+                      f" / {st['worst']['date']} {_signed_yen(st['worst']['pnl'])}")
+            for g in st["gaps"]:
+                print(f"    ⚠ 空白期間 {g['from']} → {g['to']}: 区間損益 {_signed_yen(g['range_pnl'])}"
+                      "(日次には含めず)")
+            if t["weeks"]:
+                print("    週次       : " + "  ".join(f"{w['week'][5:]} {_signed_yen(w['pnl'])}"
+                                                    for w in t["weeks"][-6:]))
+            print()
+        h = p.get("household")
+        if h:
+            pct = f" ({h['pnl_pct']:+.2f}%)" if h.get("pnl_pct") is not None else ""
+            print(f"  [世帯合計] 総資産 {_yen(h['start_total'])} → {_yen(h['end_total'])}"
+                  f"  純入金(期間) {_signed_yen(h['net_flow'])}  運用損益 {_signed_yen(h['pnl'])}{pct}")
+            if not h["aligned"]:
+                print(f"    ⚠ 口座ごとに起点が異なる({h['starts'][0]} 〜 {h['starts'][-1]})ため、合計は参考値")
+        print(f"\n  注: {p['note']}")
+
+    def lark(p):
+        span = f"直近 {p['window_days']} 日" if p["window_days"] else "全期間"
+        L = [f"**PayPay証券 トレンド({span})**", ""]
+        for lab, t in p["accounts"].items():
+            if not t.get("start"):
+                L.append(f"- {lab}: 有効なスナップショットなし")
+                continue
+            pct = f" ({t['pnl_pct']:+.2f}%)" if t.get("pnl_pct") is not None else ""
+            L.append(f"- **{lab}** {t['start']['date']}→{t['end']['date']}: 運用損益 "
+                     f"**{_signed_yen(t['pnl'])}**{pct} / 純入金(期間) {_signed_yen(t['net_flow'])} / "
+                     f"総資産 {_yen(t['end']['total'])}")
+            for g in t["stats"]["gaps"]:
+                L.append(f"  - ⚠ 空白期間 {g['from']}→{g['to']}(区間 {_signed_yen(g['range_pnl'])})")
+        h = p.get("household")
+        if h:
+            L.append(f"- **世帯合計** 運用損益 **{_signed_yen(h['pnl'])}** / 総資産 {_yen(h['end_total'])}"
+                     + ("" if h["aligned"] else " (⚠ 口座ごとに起点が異なる・参考値)"))
+        L.append(f"\n> {p['note']}")
+        print("\n".join(L))
+
+    _emit_fmt(payload, _fmt(args), table, lark)
     return 0
 
 
@@ -2084,6 +2301,9 @@ def build_parser() -> argparse.ArgumentParser:
         if name == "doctor":
             sp.add_argument("--online", action="store_true",
                             help="also probe the API (login + 証券/投信 fetch) to confirm the session is live")
+            sp.add_argument("--fix", action="store_true",
+                            help="repair safe local issues: drop stale auth cookies from PAYPAY_COOKIE "
+                                 "(keeps a backup) and chmod 600 the .env")
         if name in ("risk", "assets"):
             sp.add_argument("--accounts", action="store_true",
                             help="add the 口座区分 (特定/NISA成長/つみたて) split — fetches the 投信 ledger")
@@ -2103,8 +2323,11 @@ def build_parser() -> argparse.ArgumentParser:
                      help="path to the bitwarden-use binary with `fido2` support (default: bitwarden-use on PATH)")
 
     snap = sub.add_parser("snapshot", parents=[common]); snap.set_defaults(func=cmd_snapshot)
-    snap.add_argument("snap_cmd", nargs="?", choices=("save", "list"), default="save",
-                      help="save (default) a snapshot of the account, or list saved snapshots")
+    snap.add_argument("snap_cmd", nargs="?", choices=("save", "list", "quarantine"), default="save",
+                      help="save (default) a snapshot of the account; list saved snapshots; "
+                           "or quarantine (move unusable failed-source snapshots out of the series)")
+    snap.add_argument("--dry-run", action="store_true",
+                      help="quarantine: only show what would be moved")
     snap.add_argument("--pages", type=int, default=8,
                       help="ignored — snapshots always scan the full ledger (cumulative deposits)")
 
@@ -2115,6 +2338,12 @@ def build_parser() -> argparse.ArgumentParser:
                      help="baseline selector; 'last' = latest snapshot (the default)")
     dff.add_argument("--pages", type=int, default=8,
                      help="ignored — the live read scans the full ledger, like snapshot save")
+
+    trd = sub.add_parser("trend", parents=[common],
+                         help="P&L trend from saved snapshots (no login); -a all = household")
+    trd.set_defaults(func=cmd_trend)
+    trd.add_argument("--days", type=int, default=30,
+                     help="window in days (default 30; 0 = all history)")
 
     cal = sub.add_parser("calendar", parents=[common]); cal.set_defaults(func=cmd_calendar)
     cal.add_argument("--out", default=None,
@@ -2187,6 +2416,11 @@ def main(argv=None) -> int:
     # account selection (incl. -a all = household) itself.
     if args.func is cmd_calendar:
         return cmd_calendar(None, args)
+    if args.func is cmd_trend:
+        return cmd_trend(None, args)
+    # `snapshot list|quarantine` and `trend` only read saved snapshots from disk.
+    if args.func is cmd_snapshot and getattr(args, "snap_cmd", "save") in ("list", "quarantine"):
+        return cmd_snapshot(None, args)
     # -a all: consolidate across every configured profile (handled inside the cmd).
     if getattr(args, "account", None) == "all":
         if args.func not in (cmd_total, cmd_assets, cmd_risk, cmd_plans, cmd_tax):

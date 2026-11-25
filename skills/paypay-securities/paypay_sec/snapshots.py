@@ -58,8 +58,66 @@ def snap_dir(account: str | None) -> Path:
     return state_dir(account) / "snapshots"
 
 
+REJECTED_SUBDIR = "rejected"
+
+
+def problems(snapshot: dict) -> list[str]:
+    """Why a snapshot is unusable as a data point ([] = usable).
+
+    Unusable = no grand_total, or any source "failed". A failed source means the
+    headline total silently dropped that slice (e.g. only stale cash left after a
+    login failure), so the snapshot would poison diff baselines and the calendar."""
+    if not isinstance(snapshot, dict):
+        return ["malformed"]
+    out = []
+    if snapshot.get("grand_total") is None:
+        out.append("grand_total missing")
+    failed = sorted(k for k, v in (snapshot.get("sources") or {}).items() if v == "failed")
+    if failed:
+        out.append("failed sources: " + ", ".join(failed))
+    return out
+
+
+def is_usable(snapshot: dict | None) -> bool:
+    return snapshot is not None and not problems(snapshot)
+
+
+def rejected_dir(account: str | None) -> Path:
+    return snap_dir(account) / REJECTED_SUBDIR
+
+
+def save_rejected(account: str | None, snapshot: dict) -> Path:
+    """Keep an unusable snapshot for debugging, OUTSIDE the series (list_paths
+    globs only the top level, so nothing downstream ever reads it)."""
+    return _save_into(rejected_dir(account), snapshot)
+
+
+def quarantine_unusable(account: str | None, dry_run: bool = False) -> list[Path]:
+    """Move already-saved unusable snapshots out of the series into rejected/.
+    Returns the source paths that were (or, with dry_run, would be) moved."""
+    moved = []
+    for p in list_paths(account):
+        s = try_load(p)
+        if s is None or is_usable(s):
+            continue
+        moved.append(p)
+        if not dry_run:
+            dest = rejected_dir(account)
+            dest.mkdir(parents=True, exist_ok=True)
+            target = dest / p.name
+            n = 1
+            while target.exists():
+                target = dest / f"{p.stem}_{n}{p.suffix}"
+                n += 1
+            os.replace(p, target)
+    return moved
+
+
 def save(account: str | None, snapshot: dict) -> Path:
-    d = snap_dir(account)
+    return _save_into(snap_dir(account), snapshot)
+
+
+def _save_into(d: Path, snapshot: dict) -> Path:
     d.mkdir(parents=True, exist_ok=True)
     ts = snapshot.get("ts") or now_ts()
     snapshot = {**snapshot, "ts": ts}
@@ -101,9 +159,11 @@ def load_all(account: str | None) -> list[dict]:
 
 
 def _newest_readable(paths: list[Path]) -> dict | None:
+    """Newest snapshot that is readable AND usable (a failed-source snapshot must
+    never become a diff baseline)."""
     for p in reversed(paths):
         s = try_load(p)
-        if s is not None:
+        if is_usable(s):
             return s
     return None
 
@@ -124,8 +184,8 @@ def nearest_before(account: str | None, days: int) -> dict | None:
         s = _newest_readable(older)
         if s is not None:
             return s
-    for p in paths:                    # fallback: oldest readable snapshot
+    for p in paths:                    # fallback: oldest usable snapshot
         s = try_load(p)
-        if s is not None:
+        if is_usable(s):
             return s
     return None

@@ -85,7 +85,7 @@ paypay doctor --online -a second || rc=1; exit "$rc"`.
 ## Common commands
 
 ```bash
-paypay doctor [--online]           # diagnose setup / login readiness (--online probes the live session)
+paypay doctor [--online] [--fix]   # diagnose setup / login readiness (--online probes the live session; --fix cleans stale .env cookies + perms)
 paypay assets [--accounts]         # 証券 + 投信 holdings + cash + grand total (+口座区分 with --accounts)
 paypay review                      # 復盘: 持仓盈亏 / 累計実現 / 整体盈亏 + costs
 paypay risk [--accounts]           # 持仓结构: weights, concentration, FX/category/口座 split (facts only)
@@ -99,7 +99,9 @@ paypay invtrust-history            # 投信 ledger + moving-average realized P&L
 paypay fees [--detail]             # explicit fees + measured FX spread
 paypay trades-summary              # per-brand buy/sell/net/realized P&L
 paypay snapshot save               # save a dated account snapshot (your own time series)
-paypay snapshot list               # list saved snapshots
+paypay snapshot list               # list saved snapshots (⚠ marks unusable ones)
+paypay snapshot quarantine         # move failed-source snapshots out of the series
+paypay trend [--days 30] [-a all]  # P&L trend from snapshots (deposits stripped; no login)
 paypay diff [--days 7]             # diff a live read vs the latest (or N-days-old) snapshot
 paypay calendar                    # build the 每日涨跌日历 HTML from saved snapshots (--json for raw data, --out PATH)
 bin/snapshot-cron.sh install       # schedule a daily read-only snapshot + calendar rebuild + Monday weekly diff (macOS launchd)

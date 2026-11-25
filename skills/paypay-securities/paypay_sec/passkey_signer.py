@@ -41,7 +41,7 @@ __all__ = [
 
 DEFAULT_RP_ID = "paypay-sec.co.jp"
 DEFAULT_ORIGIN = "https://cdn.cross-platform-web.devops-app.paypay-sec.co.jp"
-DEFAULT_CREDENTIAL_ID_B64URL = "U2CXcUWLsvSuccQZ_20OIQ"
+DEFAULT_CREDENTIAL_ID_B64URL = "ABEiM0RVZneImaq7zN3u_w"   # synthetic (self-test only)
 
 # flags 0x1d = UP(0x01) | UV(0x04) | BE(0x08) | BS(0x10)  (Bitwarden software passkey)
 FLAGS = 0x1D

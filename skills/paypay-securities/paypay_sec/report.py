@@ -287,9 +287,104 @@ def _snap_date(snap: dict) -> str | None:
     return a if re.match(r"\d{4}-\d{2}-\d{2}", a) else None
 
 
+def _dietz_pct(pnl: int, start_total: int, net_flow: int) -> float | None:
+    denom = (start_total or 0) + (net_flow or 0) / 2
+    return round(pnl / denom * 100, 2) if denom > 0 else None
+
+
+def trend_summary(snaps: list[dict], since: str | None = None) -> dict:
+    """Facts-only trend over a snapshot series: start→end change with deposits
+    stripped out, plus daily/weekly stats from daily_pnl_series.
+
+    `since` (YYYY-MM-DD) bounds the window; the baseline is the last usable
+    snapshot on or before it (else the first one after it). Unusable snapshots
+    (failed sources / no total) are ignored. Pure: no I/O."""
+    from datetime import date
+
+    def usable(s):
+        return (isinstance(s, dict) and s.get("grand_total") is not None
+                and not any(v == "failed" for v in (s.get("sources") or {}).values()))
+
+    good = sorted((s for s in snaps or [] if usable(s) and _snap_date(s)),
+                  key=lambda s: str(s.get("ts") or ""))
+    if not good:
+        return {"start": None, "end": None, "days": [], "weeks": [], "stats": None}
+    base_idx = 0
+    if since:
+        # Baseline = last usable snapshot on/before `since` — but only if it is close
+        # to it; a months-old one would turn "last 30 days" into "since the outage".
+        before = [i for i, s in enumerate(good) if _snap_date(s) <= since]
+        after = [i for i, s in enumerate(good) if _snap_date(s) > since]
+        if before and _gap_days(_snap_date(good[before[-1]]), since) <= MAX_GAP_DAYS:
+            base_idx = before[-1]
+        elif after:
+            base_idx = after[0]
+        else:
+            base_idx = before[-1]
+    window = good[base_idx:]
+    start, end = window[0], window[-1]
+
+    def point(s):
+        return {"date": _snap_date(s), "total": s.get("grand_total"),
+                "net_deposit": s.get("net_deposit"), "realized_total": s.get("realized_total")}
+
+    net_flow = (end.get("net_deposit") or 0) - (start.get("net_deposit") or 0)
+    change = (end.get("grand_total") or 0) - (start.get("grand_total") or 0)
+    pnl = change - net_flow
+    start_total = start.get("grand_total") or 0
+    comparable = bool(start.get("ledger_full")) == bool(end.get("ledger_full"))
+
+    series = daily_pnl_series(window)
+    start_d = _snap_date(start)
+    days = [{"date": d, **v} for d, v in sorted(series.items()) if d > start_d]
+    counted = [x for x in days if x.get("pnl") is not None]
+    weeks: dict[str, dict] = {}
+    for x in counted:
+        y, w, _ = date.fromisoformat(x["date"]).isocalendar()
+        k = f"{y}-W{w:02d}"
+        wk = weeks.setdefault(k, {"week": k, "pnl": 0, "days": 0})
+        wk["pnl"] += x["pnl"]
+        wk["days"] += 1
+    best = max(counted, key=lambda x: x["pnl"], default=None)
+    worst = min(counted, key=lambda x: x["pnl"], default=None)
+    return {
+        "start": point(start), "end": point(end),
+        "change": change, "net_flow": net_flow, "pnl": pnl,
+        # simple Dietz: deposits during the window count as invested for half of it,
+        # so a big mid-window 入金 doesn't inflate/deflate the percentage
+        "pnl_pct": _dietz_pct(pnl, start_total, net_flow),
+        "comparable": comparable,
+        "days": days,
+        "weeks": [weeks[k] for k in sorted(weeks)],
+        "stats": {
+            "counted_days": len(counted),
+            "up_days": sum(1 for x in counted if x["pnl"] > 0),
+            "down_days": sum(1 for x in counted if x["pnl"] < 0),
+            "missing_days": sum(1 for x in days if x.get("pnl") is None),
+            "gaps": [{"from": x.get("range_from"), "to": x["date"], "range_pnl": x.get("range_pnl")}
+                     for x in days if x.get("range_from")],
+            "best": {"date": best["date"], "pnl": best["pnl"]} if best else None,
+            "worst": {"date": worst["date"], "pnl": worst["pnl"]} if worst else None,
+        },
+    }
+
+
 def _missing_day(note: str) -> dict:
     return {"pnl": None, "pnl_pct": None, "total_assets": None, "net_flow": 0,
             "realized": None, "data_quality": "missing", "note": note}
+
+
+# A gap longer than this between two usable snapshots (calendar days) is too long
+# to book as one day's P&L: weekends + a holiday stay under it, an outage doesn't.
+MAX_GAP_DAYS = 7
+
+
+def _gap_days(d_from: str, d_to: str) -> int:
+    from datetime import date
+    try:
+        return (date.fromisoformat(d_to) - date.fromisoformat(d_from)).days
+    except (TypeError, ValueError):
+        return 0
 
 
 def daily_pnl_series(snapshots: list[dict]) -> dict[str, dict]:
@@ -315,6 +410,11 @@ def daily_pnl_series(snapshots: list[dict]) -> dict[str, dict]:
     deposit as profit/loss — so the day is emitted as missing and the newer
     snapshot becomes the baseline. Pre-`ledger_full` snapshots keep the old
     behavior (their window was capped, so the figures are approximate).
+
+    A gap of more than MAX_GAP_DAYS since the previous usable snapshot (e.g. a
+    months-long login outage) is NOT booked as that day's P&L: the day is emitted
+    as missing with the whole span's change in `range_pnl` / `range_from`, and
+    becomes the new baseline.
 
     Returns {date: {pnl, pnl_pct, total_assets, net_flow, realized,
     data_quality, note}} — the per-account shape the calendar consumes.
@@ -342,6 +442,15 @@ def daily_pnl_series(snapshots: list[dict]) -> dict[str, dict]:
             continue
         if prev is None:
             prev = s            # baseline only — no pnl for the first good day
+            continue
+        pd = _snap_date(prev)
+        gap = _gap_days(pd, d)
+        if gap > MAX_GAP_DAYS:
+            net_flow = (s.get("net_deposit") or 0) - (prev.get("net_deposit") or 0)
+            out[d] = {**_missing_day(f"距上次有效快照({pd}){gap} 天,区间盈亏不计入单日"),
+                      "range_from": pd, "total_assets": gt,
+                      "range_pnl": (gt - (prev.get("grand_total") or 0)) - net_flow}
+            prev = s
             continue
         dep, pdep = s.get("deposits"), prev.get("deposits")
         if (bool(s.get("ledger_full")) != bool(prev.get("ledger_full"))

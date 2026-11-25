@@ -39,8 +39,8 @@ from .passkey_signer import b64url_decode, b64url_encode, build_assertion
 
 def _credential_id_to_b64url(cid: str) -> str:
     """Bitwarden stores a passkey credentialId as a hyphenated hex GUID
-    (e.g. 53609771-458b-b2f4-ae71-c419ff6d0e21), but WebAuthn / PayPay want the
-    raw 16 bytes as base64url (U2CXcUWLsvSuccQZ_20OIQ). Convert hex-GUIDs;
+    (e.g. 00112233-4455-6677-8899-aabbccddeeff), but WebAuthn / PayPay want the
+    raw 16 bytes as base64url (ABEiM0RVZneImaq7zN3u_w). Convert hex-GUIDs;
     pass through anything already base64url."""
     raw = cid.strip()
     hexish = raw.replace("-", "")
@@ -120,6 +120,46 @@ def store_passkey(account: str, blob: dict) -> None:
     if r.returncode != 0:
         raise PasskeyLoginError(
             f"Keychain write failed (security exit {r.returncode}): {r.stderr.strip()}") from None
+
+
+def passkey_status(account: str) -> str:
+    """Offline state of the cached passkey, without exposing it:
+    "ok" | "missing" (not set up) | "locked" (Keychain not readable from this
+    session, e.g. over SSH) | "invalid" (blob present but unusable) | "unavailable"
+    (no `security` binary / timeout)."""
+    try:
+        r = subprocess.run(
+            ["security", "find-generic-password",
+             "-a", _keychain_account(account), "-s", KEYCHAIN_SERVICE, "-w"],
+            check=False, capture_output=True, text=True, timeout=_SECURITY_TIMEOUT,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return "unavailable"
+    if r.returncode == 44:          # errSecItemNotFound
+        return "missing"
+    if r.returncode in (36, 51, 128):   # interaction not allowed / locked / user canceled
+        return "locked"
+    if r.returncode != 0:
+        return "unavailable"
+    try:
+        blob = json.loads(r.stdout.strip())
+        from .passkey_signer import load_private_key
+        load_private_key(blob["private_key_b64url"])
+        if not (blob.get("credential_id") and blob.get("user_handle")):
+            return "invalid"
+    except Exception:   # noqa: BLE001 — never echo the blob
+        return "invalid"
+    return "ok"
+
+
+def stale_auth_cookie_names(cookie_str: str) -> list[str]:
+    """Names in a Cookie header that must not be seeded (see _drop_stale_auth_cookies)."""
+    names = []
+    for part in (cookie_str or "").split(";"):
+        name = part.split("=", 1)[0].strip()
+        if name and name.startswith(_STALE_AUTH_COOKIE_PREFIXES):
+            names.append(name)
+    return names
 
 
 def load_passkey(account: str) -> dict | None:
