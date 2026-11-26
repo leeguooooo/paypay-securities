@@ -1485,7 +1485,7 @@ function getDay(dateStr, account){
       has:true,
       pnl: a.pnl, pnl_pct: a.pnl_pct, total_assets: a.total_assets,
       net_flow: a.net_flow||0, realized: a.realized,
-      data_quality: a.data_quality, note: a.note,
+      data_quality: a.data_quality, note: a.note, comparison_from: a.comparison_from,
       perAcct: { [account]: a }
     };
   }
@@ -1496,17 +1496,18 @@ function getDay(dateStr, account){
   let dq = "full";
   const perAcct = {};
   const starts = new Set();
-  let missingAccount = false;
+  let missingAccount = false, assetsComplete = true;
   DATA.accounts.forEach(acct => {
     const a = rec.accounts[acct];
-    if(!a){ anyNull=true; missingAccount=true; return; }
+    if(!a){ anyNull=true; missingAccount=true; assetsComplete=false; return; }
     perAcct[acct] = a;
+    if(a.total_assets!=null){ ta += a.total_assets; taAny=true; }
+    else assetsComplete=false;
     if(a.pnl==null || a.data_quality==="missing") { anyNull=true; missingAccount=true; return; }
     dq = worstQuality(dq, a.data_quality);
     if(a.comparison_from) starts.add(a.comparison_from);
     else if(DATA.accounts.length > 1) missingAccount=true;
     pnl += a.pnl; pnlAny=true;
-    if(a.total_assets!=null){ ta += a.total_assets; taAny=true; }
     if(a.net_flow!=null){ nf += a.net_flow; }
     if(a.realized!=null){ rz += a.realized; rzAny=true; }
   });
@@ -1519,6 +1520,8 @@ function getDay(dateStr, account){
     pnl: pnlAny && !incompatible ? pnl : null,
     pnl_pct: null,                 // 合计不提供单一收益率
     total_assets: taAny ? ta : null,
+    assets_partial: !assetsComplete,
+    comparison_from: starts.size===1 && !missingAccount ? [...starts][0] : null,
     net_flow: nf,
     realized: rzAny ? rz : null,
     data_quality: dq,
@@ -1665,7 +1668,7 @@ function monthCell(dt){
 
   const hs = heatStyle(day.pnl, dq);
   const txtClass = hs.txt==="txt-white" ? "" : hs.txt;
-  const style = `background:${hs.bg};${hs.txt==='txt-white'?'color:#fff;':''}`;
+  const style = `background-color:${hs.bg};${hs.txt==='txt-white'?'color:#fff;':''}`;
   const cls = ["cell", dq==="partial"?"partial":""].join(" ");
   const arrow = arrowOf(day.pnl);
   const pctStr = day.pnl_pct!=null ? fmtPct(day.pnl_pct) : "";
@@ -1685,13 +1688,18 @@ function monthCell(dt){
   </td>`;
 }
 
+function countableInPeriod(day, period){
+  return day.has && day.pnl!=null && day.data_quality!=='missing' &&
+    !(state.account==='total' && day.data_quality!=='full') &&
+    (!day.comparison_from || day.comparison_from.startsWith(period));
+}
 function monthSummary(year, month){
   let sum=0, best=null, worst=null, up=0, down=0, flat=0, valid=0;
   const daysInMonth = new Date(year, month+1, 0).getDate();
   for(let d=1; d<=daysInMonth; d++){
     const ds = ymd(new Date(year, month, d));
     const day = getDay(ds, state.account);
-    if(!day.has || day.pnl==null || day.data_quality==='missing' || (state.account==='total' && day.data_quality!=='full')) continue;
+    if(!countableInPeriod(day, ds.slice(0,7))) continue;
     valid++;
     sum += day.pnl;
     if(best===null || day.pnl>best.pnl) best={ds, pnl:day.pnl};
@@ -1706,7 +1714,7 @@ function monthSummary(year, month){
   return `<div class="month-summary" aria-label="本月汇总">
     <div class="stat"><div class="k">${state.account==='total'?'可比日累计盈亏':'本月累计盈亏'}</div>
       <div class="v ${sumCls}">${valid?fmtJPY(sum):'—'}</div>
-      <div class="vsub">${valid} 个可计入日${state.account==='total'?' · 排除部分/缺失':''}</div></div>
+      <div class="vsub">${valid} 个可计入日 · 排除跨月区间${state.account==='total'?'及部分/缺失':''}</div></div>
     <div class="stat"><div class="k">最佳单日</div>
       <div class="v ${best?'txt-'+signClass(best.pnl):''}">${best?fmtJPY(best.pnl):'—'}</div>
       <div class="vsub">${dlabel(best)}</div></div>
@@ -1730,10 +1738,10 @@ function renderYear(){
   for(const d of DATA.days){
     if(!d.date.startsWith(String(year)+"-")) continue;
     const day = getDay(d.date, state.account);
-    if(!day.has || day.pnl==null || day.data_quality==='missing' || (state.account==='total' && day.data_quality!=='full')) continue;
+    if(!countableInPeriod(day, String(year))) continue;
     valid++; sum+=day.pnl;
     const m = Number(d.date.split("-")[1])-1;
-    monthSum[m]+=day.pnl; monthHas[m]=true;
+    if(countableInPeriod(day, d.date.slice(0,7))){ monthSum[m]+=day.pnl; monthHas[m]=true; }
     if(best===null||day.pnl>best.pnl) best={ds:d.date,pnl:day.pnl};
     if(worst===null||day.pnl<worst.pnl) worst={ds:d.date,pnl:day.pnl};
     if(day.pnl>0) up++; else if(day.pnl<0) down++;
@@ -1747,7 +1755,7 @@ function renderYear(){
   const sumCls="txt-"+signClass(sum);
 
   let html = `<div class="year-summary" aria-label="全年汇总">
-    <div class="stat"><div class="k">${state.account==='total'?'全年可比日累计盈亏':'全年累计盈亏'}</div><div class="v ${sumCls}">${valid?fmtJPY(sum):'—'}</div><div class="vsub">${valid} 个可计入日${state.account==='total'?' · 排除部分/缺失':''}</div></div>
+    <div class="stat"><div class="k">${state.account==='total'?'全年可比日累计盈亏':'全年累计盈亏'}</div><div class="v ${sumCls}">${valid?fmtJPY(sum):'—'}</div><div class="vsub">${valid} 个可计入日 · 排除跨年区间${state.account==='total'?'及部分/缺失':''}</div></div>
     <div class="stat"><div class="k">最佳单日</div><div class="v ${best?'txt-'+signClass(best.pnl):''}">${best?fmtJPY(best.pnl):'—'}</div><div class="vsub">${best?best.ds.slice(5):'—'}</div></div>
     <div class="stat"><div class="k">最差单日</div><div class="v ${worst?'txt-'+signClass(worst.pnl):''}">${worst?fmtJPY(worst.pnl):'—'}</div><div class="vsub">${worst?worst.ds.slice(5):'—'}</div></div>
     <div class="stat"><div class="k">最佳 / 最差月份</div><div class="v" style="font-size:15px">${bestM!=null?(bestM+1)+'月':'—'} / ${worstM!=null?(worstM+1)+'月':'—'}</div><div class="vsub">${bestM!=null?fmtJPY(monthSum[bestM]):''}${worstM!=null?' · '+fmtJPY(monthSum[worstM]):''}</div></div>
@@ -1820,7 +1828,7 @@ function buildHeatmap(year){
         cls += " missing"; aria = `${ds} 数据缺失`; tabindex="0";
       }else{
         const hs = heatStyle(day.pnl, day.data_quality);
-        style = `background:${hs.bg};`;
+        style = `background-color:${hs.bg};`;
         if(day.data_quality==="partial") cls += " partial";
         aria = `${ds}，盈亏 ${fmtJPY(day.pnl)}`; tabindex="0";
       }
@@ -1845,6 +1853,8 @@ function tooltipHTML(ds){
 
   if(day.data_quality==="missing" || day.pnl===null){
     html += `<div class="t-meta">当日无数据（missing）</div>`;
+    if(day.total_assets!=null)
+      html += `<div class="t-row"><span class="nm">${day.assets_partial?'收盘资产（部分）':'收盘总资产'}</span><span class="vl">${fmtJPY(day.total_assets,{sign:false})}</span></div>`;
     if(day.note) html += `<div class="t-note">${day.note}</div>`;
     return html;
   }
@@ -1866,7 +1876,7 @@ function tooltipHTML(ds){
 
   html += '<hr>';
   if(day.total_assets!=null)
-    html += `<div class="t-row"><span class="nm">收盘总资产</span><span class="vl">${fmtJPY(day.total_assets,{sign:false})}</span></div>`;
+    html += `<div class="t-row"><span class="nm">${day.assets_partial?'收盘资产（部分）':'收盘总资产'}</span><span class="vl">${fmtJPY(day.total_assets,{sign:false})}</span></div>`;
   if(day.realized!=null && day.realized!==0)
     html += `<div class="t-row"><span class="nm">已实现盈亏</span><span class="vl ${'t-'+signClass(day.realized)}">${fmtJPY(day.realized)}</span></div>`;
   if(day.net_flow && day.net_flow!==0)
@@ -1929,12 +1939,12 @@ document.getElementById("viewSeg").addEventListener("click", e=>{
   state.view = b.dataset.view; render();
 });
 document.getElementById("prevBtn").addEventListener("click", ()=>{
-  if(state.view==="month") state.cursor.setMonth(state.cursor.getMonth()-1);
+  if(state.view==="month") state.cursor = new Date(state.cursor.getFullYear(), state.cursor.getMonth()-1, 1);
   else state.cursor.setFullYear(state.cursor.getFullYear()-1);
   render();
 });
 document.getElementById("nextBtn").addEventListener("click", ()=>{
-  if(state.view==="month") state.cursor.setMonth(state.cursor.getMonth()+1);
+  if(state.view==="month") state.cursor = new Date(state.cursor.getFullYear(), state.cursor.getMonth()+1, 1);
   else state.cursor.setFullYear(state.cursor.getFullYear()+1);
   render();
 });
