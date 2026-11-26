@@ -473,6 +473,7 @@ def daily_pnl_series(snapshots: list[dict]) -> dict[str, dict]:
         if any(v not in ("ok", "live", None) for v in src.values()):
             quality = "partial"
         out[d] = {
+            "comparison_from": _snap_date(prev),
             "pnl": pnl,
             "pnl_pct": round(pnl / pgt * 100, 2) if pgt else None,
             "total_assets": gt,

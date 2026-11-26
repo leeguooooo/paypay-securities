@@ -1,0 +1,28 @@
+// Run with node; execute the actual viewer aggregation and summary code.
+const fs = require('fs'), vm = require('vm'), assert = require('assert');
+const html = fs.readFileSync(__dirname + '/../paypay_sec/calendar_template.html', 'utf8');
+const extract = (a,b) => html.slice(html.indexOf(a), html.indexOf(b));
+const js = extract('function worstQuality', '/* ======================= 热力分档') +
+  extract('function monthSummary', '/* ======================= 年视图');
+const day = (p, from='2026-11-01', quality='full') => ({pnl:p, comparison_from:from, data_quality:quality});
+function run(accounts, records) {
+  const ctx = {DATA:{accounts,days:records}, state:{account:'total'}, fmtJPY:n=>String(n), signClass:()=>'', ymd:d=>`${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`};
+  vm.createContext(ctx); vm.runInContext(js,ctx); return ctx;
+}
+let c=run(['leo','lisa'],[{date:'2026-11-02',accounts:{lisa:day(-100)}}]);
+assert.equal(c.getDay('2026-11-02','total').data_quality,'partial');
+assert.equal(c.getDay('2026-11-02','total').pnl,-100);
+assert(c.monthSummary(2026,10).includes('0 个可计入日'));
+assert(!c.monthSummary(2026,10).includes('>-100<'));
+c=run(['leo','lisa'],[{date:'2026-11-02',accounts:{leo:day(null),lisa:day(-100)}}]);
+assert.equal(c.getDay('2026-11-02','total').data_quality,'partial');
+c=run(['leo','lisa'],[{date:'2026-11-02',accounts:{leo:day(200),lisa:day(-100)}}]);
+assert.equal(c.getDay('2026-11-02','total').pnl,100);
+assert.equal(c.getDay('2026-11-02','total').data_quality,'full');
+assert(c.monthSummary(2026,10).includes('>100<'));
+c=run(['leo','lisa'],[{date:'2026-11-02',accounts:{leo:day(200,'2026-10-31'),lisa:day(-100)}}]);
+assert.equal(c.getDay('2026-11-02','total').data_quality,'missing');
+assert.equal(c.getDay('2026-11-02','total').pnl,null);
+c=run(['leo','lisa'],[{date:'2026-11-02',accounts:{leo:day(null),lisa:day(null)}}]);
+assert.equal(c.getDay('2026-11-02','total').data_quality,'missing');
+console.log('calendar viewer regression tests passed');

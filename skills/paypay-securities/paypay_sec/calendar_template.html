@@ -1495,21 +1495,28 @@ function getDay(dateStr, account){
   let pnlAny=false, taAny=false, rzAny=false, anyNull=false;
   let dq = "full";
   const perAcct = {};
+  const starts = new Set();
+  let missingAccount = false;
   DATA.accounts.forEach(acct => {
     const a = rec.accounts[acct];
-    if(!a){ anyNull=true; dq = worstQuality(dq,"missing"); return; }
+    if(!a){ anyNull=true; missingAccount=true; return; }
     perAcct[acct] = a;
+    if(a.pnl==null || a.data_quality==="missing") { anyNull=true; missingAccount=true; return; }
     dq = worstQuality(dq, a.data_quality);
-    if(a.pnl!=null){ pnl += a.pnl; pnlAny=true; } else { anyNull=true; }
+    if(a.comparison_from) starts.add(a.comparison_from);
+    else if(DATA.accounts.length > 1) missingAccount=true;
+    pnl += a.pnl; pnlAny=true;
     if(a.total_assets!=null){ ta += a.total_assets; taAny=true; }
     if(a.net_flow!=null){ nf += a.net_flow; }
     if(a.realized!=null){ rz += a.realized; rzAny=true; }
   });
-  // 任一账户字段为 null 而仍按可得部分相加 → 至少 partial
-  if(anyNull && dq==="full") dq = "partial";
+  // Never present incompatible windows as a household sum.
+  const incompatible = starts.size > 1;
+  if(!pnlAny || incompatible) dq = "missing";
+  else if(anyNull || missingAccount) dq = "partial";
   return {
     has:true,
-    pnl: pnlAny ? pnl : null,
+    pnl: pnlAny && !incompatible ? pnl : null,
     pnl_pct: null,                 // 合计不提供单一收益率
     total_assets: taAny ? ta : null,
     net_flow: nf,
@@ -1672,7 +1679,7 @@ function monthCell(dt){
   return `<td class="${cls}" tabindex="0" data-date="${ds}" style="${style}" aria-label="${aria}">
     <span class="dnum">${dnum}</span>
     ${corner}
-    <div class="amt ${txtClass}"><span class="arrow">${arrow}</span> ${fmtJPY(day.pnl)}</div>
+    <div class="amt ${txtClass}"><span class="arrow">${arrow}</span> ${fmtJPY(day.pnl)}${state.account==='total' && dq==='partial'?' · 部分':''}</div>
     ${pctStr?`<div class="pct ${txtClass}">${pctStr}</div>`:""}
     ${flowTag}
   </td>`;
@@ -1684,7 +1691,7 @@ function monthSummary(year, month){
   for(let d=1; d<=daysInMonth; d++){
     const ds = ymd(new Date(year, month, d));
     const day = getDay(ds, state.account);
-    if(!day.has || day.pnl===null) continue;
+    if(!day.has || day.pnl==null || day.data_quality==='missing' || (state.account==='total' && day.data_quality!=='full')) continue;
     valid++;
     sum += day.pnl;
     if(best===null || day.pnl>best.pnl) best={ds, pnl:day.pnl};
@@ -1697,9 +1704,9 @@ function monthSummary(year, month){
   function dlabel(o){ if(!o) return "—"; const [,,dd]=o.ds.split("-"); return `${Number(dd)}日`; }
 
   return `<div class="month-summary" aria-label="本月汇总">
-    <div class="stat"><div class="k">本月累计盈亏</div>
-      <div class="v ${sumCls}">${fmtJPY(sum)}</div>
-      <div class="vsub">${valid} 个交易日</div></div>
+    <div class="stat"><div class="k">${state.account==='total'?'可比日累计盈亏':'本月累计盈亏'}</div>
+      <div class="v ${sumCls}">${valid?fmtJPY(sum):'—'}</div>
+      <div class="vsub">${valid} 个可计入日${state.account==='total'?' · 排除部分/缺失':''}</div></div>
     <div class="stat"><div class="k">最佳单日</div>
       <div class="v ${best?'txt-'+signClass(best.pnl):''}">${best?fmtJPY(best.pnl):'—'}</div>
       <div class="vsub">${dlabel(best)}</div></div>
@@ -1723,7 +1730,7 @@ function renderYear(){
   for(const d of DATA.days){
     if(!d.date.startsWith(String(year)+"-")) continue;
     const day = getDay(d.date, state.account);
-    if(!day.has || day.pnl===null) continue;
+    if(!day.has || day.pnl==null || day.data_quality==='missing' || (state.account==='total' && day.data_quality!=='full')) continue;
     valid++; sum+=day.pnl;
     const m = Number(d.date.split("-")[1])-1;
     monthSum[m]+=day.pnl; monthHas[m]=true;
@@ -1740,7 +1747,7 @@ function renderYear(){
   const sumCls="txt-"+signClass(sum);
 
   let html = `<div class="year-summary" aria-label="全年汇总">
-    <div class="stat"><div class="k">全年累计盈亏</div><div class="v ${sumCls}">${fmtJPY(sum)}</div><div class="vsub">${valid} 个交易日</div></div>
+    <div class="stat"><div class="k">${state.account==='total'?'全年可比日累计盈亏':'全年累计盈亏'}</div><div class="v ${sumCls}">${valid?fmtJPY(sum):'—'}</div><div class="vsub">${valid} 个可计入日${state.account==='total'?' · 排除部分/缺失':''}</div></div>
     <div class="stat"><div class="k">最佳单日</div><div class="v ${best?'txt-'+signClass(best.pnl):''}">${best?fmtJPY(best.pnl):'—'}</div><div class="vsub">${best?best.ds.slice(5):'—'}</div></div>
     <div class="stat"><div class="k">最差单日</div><div class="v ${worst?'txt-'+signClass(worst.pnl):''}">${worst?fmtJPY(worst.pnl):'—'}</div><div class="vsub">${worst?worst.ds.slice(5):'—'}</div></div>
     <div class="stat"><div class="k">最佳 / 最差月份</div><div class="v" style="font-size:15px">${bestM!=null?(bestM+1)+'月':'—'} / ${worstM!=null?(worstM+1)+'月':'—'}</div><div class="vsub">${bestM!=null?fmtJPY(monthSum[bestM]):''}${worstM!=null?' · '+fmtJPY(monthSum[worstM]):''}</div></div>
