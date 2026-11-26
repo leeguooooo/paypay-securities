@@ -23,6 +23,7 @@ def test_daily_pnl_excludes_cash_flow():
     s = report.daily_pnl_series(snaps)
     assert "2026-06-01" not in s                # first day = baseline, no pnl
     assert s["2026-06-02"]["pnl"] == 5000
+    assert s["2026-06-02"]["comparison_from"] == "2026-06-01"
     assert s["2026-06-02"]["net_flow"] == 0
     # 2026-06-03: assets +55000, but 30000 was a deposit → market pnl = 25000
     assert s["2026-06-03"]["pnl"] == 25000
