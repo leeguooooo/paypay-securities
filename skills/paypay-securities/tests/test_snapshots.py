@@ -167,6 +167,9 @@ def test_unreadable_snapshot_is_skipped_not_fatal():
 
 
 def _fake_client(ledger, invledger, brands_html=None, japan_fails=False):
+    class CompleteRecords(list):
+        complete = True
+    ledger, invledger = CompleteRecords(ledger), CompleteRecords(invledger)
     d = Path(tempfile.mkdtemp(prefix="pp_fetch_test_"))
 
     def brands(mkt):

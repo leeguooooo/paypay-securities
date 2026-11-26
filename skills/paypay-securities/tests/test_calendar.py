@@ -11,7 +11,7 @@ from paypay_sec import report, cli
 
 def _snap(ts, gt, nd=0, rz=0, **extra):
     return {"ts": ts, "as_of": ts, "grand_total": gt, "net_deposit": nd,
-            "realized_total": rz, **extra}
+            "realized_total": rz, "ledger_full": True, **extra}
 
 
 def test_daily_pnl_excludes_cash_flow():
@@ -93,7 +93,7 @@ def test_ledger_coverage_change_is_missing_then_rebaselines():
     # old capped-window snapshot → new full-history one: net_deposit jumps because
     # the window grew, not because money arrived. Don't book it as a cash flow.
     snaps = [
-        _snap("20260601-120000", 500000, nd=100000, deposits=100000),
+        _snap("20260601-120000", 500000, nd=100000, deposits=100000, ledger_full=False),
         _snap("20260602-120000", 501000, nd=400000, deposits=400000, ledger_full=True),
         _snap("20260603-120000", 503000, nd=400000, deposits=400000, ledger_full=True),
     ]

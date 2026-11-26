@@ -292,6 +292,14 @@ def _dietz_pct(pnl: int, start_total: int, net_flow: int) -> float | None:
     return round(pnl / denom * 100, 2) if denom > 0 else None
 
 
+def _cash_flow_comparable(a: dict, b: dict) -> bool:
+    """Only verified full ledgers with known cumulative cash flow are comparable."""
+    return (a.get("ledger_full") is True and b.get("ledger_full") is True
+            and a.get("net_deposit") is not None and b.get("net_deposit") is not None
+            and not (a.get("deposits") is not None and b.get("deposits") is not None
+                     and b["deposits"] < a["deposits"]))
+
+
 def trend_summary(snaps: list[dict], since: str | None = None) -> dict:
     """Facts-only trend over a snapshot series: start→end change with deposits
     stripped out, plus daily/weekly stats from daily_pnl_series.
@@ -328,11 +336,11 @@ def trend_summary(snaps: list[dict], since: str | None = None) -> dict:
         return {"date": _snap_date(s), "total": s.get("grand_total"),
                 "net_deposit": s.get("net_deposit"), "realized_total": s.get("realized_total")}
 
-    net_flow = (end.get("net_deposit") or 0) - (start.get("net_deposit") or 0)
-    change = (end.get("grand_total") or 0) - (start.get("grand_total") or 0)
-    pnl = change - net_flow
+    comparable = _cash_flow_comparable(start, end)
+    net_flow = end["net_deposit"] - start["net_deposit"] if comparable else None
+    change = end["grand_total"] - start["grand_total"]
+    pnl = change - net_flow if comparable else None
     start_total = start.get("grand_total") or 0
-    comparable = bool(start.get("ledger_full")) == bool(end.get("ledger_full"))
 
     series = daily_pnl_series(window)
     start_d = _snap_date(start)
@@ -352,7 +360,7 @@ def trend_summary(snaps: list[dict], since: str | None = None) -> dict:
         "change": change, "net_flow": net_flow, "pnl": pnl,
         # simple Dietz: deposits during the window count as invested for half of it,
         # so a big mid-window 入金 doesn't inflate/deflate the percentage
-        "pnl_pct": _dietz_pct(pnl, start_total, net_flow),
+        "pnl_pct": _dietz_pct(pnl, start_total, net_flow) if comparable else None,
         "comparable": comparable,
         "days": days,
         "weeks": [weeks[k] for k in sorted(weeks)],
@@ -370,7 +378,7 @@ def trend_summary(snaps: list[dict], since: str | None = None) -> dict:
 
 
 def _missing_day(note: str) -> dict:
-    return {"pnl": None, "pnl_pct": None, "total_assets": None, "net_flow": 0,
+    return {"pnl": None, "pnl_pct": None, "total_assets": None, "net_flow": None,
             "realized": None, "data_quality": "missing", "note": note}
 
 
@@ -405,11 +413,10 @@ def daily_pnl_series(snapshots: list[dict]) -> dict[str, dict]:
     day's pnl spans the gap. The first good day has no baseline and is omitted.
 
     net_flow is only meaningful when both snapshots summed the SAME ledger span.
-    A pair whose `ledger_full` markers differ, or whose cumulative deposits went
-    DOWN (an old 入金 fell out of a capped ledger window), would book that
-    deposit as profit/loss — so the day is emitted as missing and the newer
-    snapshot becomes the baseline. Pre-`ledger_full` snapshots keep the old
-    behavior (their window was capped, so the figures are approximate).
+    An incomplete/unknown ledger or cumulative deposits going DOWN makes the
+    cash flow unreliable — so the day is emitted as missing and the newer
+    snapshot becomes the baseline. Incomplete or unmarked ledgers and missing
+    net deposits are not sufficient evidence to calculate cash-adjusted P&L.
 
     A gap of more than MAX_GAP_DAYS since the previous usable snapshot (e.g. a
     months-long login outage) is NOT booked as that day's P&L: the day is emitted
@@ -448,8 +455,7 @@ def daily_pnl_series(snapshots: list[dict]) -> dict[str, dict]:
         if gap > MAX_GAP_DAYS:
             net_flow = (s.get("net_deposit") or 0) - (prev.get("net_deposit") or 0)
             dep, pdep = s.get("deposits"), prev.get("deposits")
-            span_ok = (bool(s.get("ledger_full")) == bool(prev.get("ledger_full"))
-                       and not (dep is not None and pdep is not None and dep < pdep))
+            span_ok = _cash_flow_comparable(prev, s)
             note = f"距上次有效快照({pd}){gap} 天,区间盈亏不计入单日"
             if not span_ok:
                 note += ";账本覆盖范围变化,区间盈亏无法剔除现金流"
@@ -458,8 +464,7 @@ def daily_pnl_series(snapshots: list[dict]) -> dict[str, dict]:
             prev = s
             continue
         dep, pdep = s.get("deposits"), prev.get("deposits")
-        if (bool(s.get("ledger_full")) != bool(prev.get("ledger_full"))
-                or (dep is not None and pdep is not None and dep < pdep)):
+        if not _cash_flow_comparable(prev, s):
             out[d] = _missing_day("账本覆盖范围变化,当天盈亏无法剔除现金流")
             prev = s            # comparable from here on
             continue
@@ -470,7 +475,8 @@ def daily_pnl_series(snapshots: list[dict]) -> dict[str, dict]:
         if s.get("realized_total") is not None and prev.get("realized_total") is not None:
             realized = s["realized_total"] - prev["realized_total"]
         quality = "full"
-        if any(v not in ("ok", "live", None) for v in src.values()):
+        if any(v not in ("ok", "live", None)
+               for snap in (prev, s) for v in (snap.get("sources") or {}).values()):
             quality = "partial"
         out[d] = {
             "pnl": pnl,

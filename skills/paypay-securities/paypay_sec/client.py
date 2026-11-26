@@ -342,6 +342,12 @@ class PayPayClient:
 
     _SETTLEMENT_PAGE_SIZE = 20
 
+    class LedgerRecords(list):
+        """List-compatible ledger with an explicit pagination completion marker."""
+        def __init__(self):
+            super().__init__()
+            self.complete = False
+
     def _paged_ledger(self, url: str, referer: str, label: str, cache_tag: str,
                       max_pages: int) -> list:
         """Shared pager for the CO_TRADE_HIST ledgers. `url` takes {off}.
@@ -349,7 +355,7 @@ class PayPayClient:
         NOTE: PAGE_NUM is a RECORD OFFSET, not a page index (PAGE_NUM=1 overlaps
         PAGE_NUM=0 by 19/20). So we step by the page size and de-dup by SEQ_NO."""
         self.ensure_session()
-        out: list = []
+        out = self.LedgerRecords()
         seen: set = set()
         for i in range(max_pages):
             offset = i * self._SETTLEMENT_PAGE_SIZE
@@ -385,7 +391,10 @@ class PayPayClient:
             for x in fresh:
                 seen.add(x.get("SEQ_NO"))
             out.extend(fresh)
-            if not j.get("NEXT_FLG") or not fresh:
+            if recs and fresh and j.get("NEXT_FLG") in (False, 0) and "NEXT_FLG" in j:
+                out.complete = True
+                break
+            if not fresh or not j.get("NEXT_FLG"):
                 break
         return out
 

@@ -469,11 +469,9 @@ def _gather(client: PayPayClient, pages: int = 8) -> dict:
                 for r in sorted(a["rows"], key=lambda r: r["category"] != "証券")]
     cash = a["cash"]
     total = sum(h["valuation"] for h in holdings) + (cash or 0)
-    # both ledgers returned AND neither hit its page cap → cumulative figures
-    # (deposits / realized) cover the whole account history
-    ledger_complete = (bool(ledger) and bool(invledger)
-                       and len(ledger) < pages * _PAGE_SIZE
-                       and len(invledger) < inv_pages * _PAGE_SIZE)
+    # Only the pager can verify both feeds actually reached their terminal page.
+    ledger_complete = (getattr(ledger, "complete", False) is True
+                       and getattr(invledger, "complete", False) is True)
     return {"txns": parsers.parse_transactions(ledger),
             "inv_txns": parsers.parse_invtrust_transactions(invledger),
             "holdings": holdings, "cash": cash or 0, "cash_fresh": a["cash_fresh"],
@@ -1169,12 +1167,14 @@ def _trend_payload(per_account: dict, days: int | None) -> dict:
     have = [t for t in accounts.values() if t.get("start")]
     household = None
     if len(per_account) > 1 and have and len(have) == len(accounts):
-        household = {k: sum(t[k] for t in have) for k in ("change", "net_flow", "pnl")}
+        household = {k: (sum(t[k] for t in have) if all(t[k] is not None for t in have) else None)
+                     for k in ("change", "net_flow", "pnl")}
         st = sum(t["start"]["total"] or 0 for t in have)
         starts = sorted(t["start"]["date"] for t in have)
         household.update({
             "start_total": st, "end_total": sum(t["end"]["total"] or 0 for t in have),
-            "pnl_pct": report._dietz_pct(household["pnl"], st, household["net_flow"]),
+            "pnl_pct": (report._dietz_pct(household["pnl"], st, household["net_flow"])
+                        if household["pnl"] is not None else None),
             "comparable": all(t["comparable"] for t in have),
             # accounts whose windows start on different days can't be summed as one period
             "aligned": report._gap_days(starts[0], starts[-1]) <= 1,
@@ -1198,6 +1198,9 @@ def cmd_trend(_client, args) -> int:
         per[label] = snapshots.load_all(prof)
     payload = _trend_payload(per, getattr(args, "days", None))
 
+    def trend_yen(value):
+        return _signed_yen(value) if value is not None else "算出不可"
+
     def table(p):
         span = f"直近 {p['window_days']} 日" if p["window_days"] else "全期間"
         print(f"PayPay証券 — トレンド ({span}, スナップショット基準)\n")
@@ -1208,10 +1211,10 @@ def cmd_trend(_client, args) -> int:
             s, e, st = t["start"], t["end"], t["stats"]
             print(f"  [{lab}] {s['date']} → {e['date']}")
             print(f"    総資産     : {_yen(s['total'])} → {_yen(e['total'])}  ({_signed_yen(t['change'])})")
-            print(f"    純入金(期間): {_signed_yen(t['net_flow'])}")
+            print(f"    純入金(期間): {trend_yen(t['net_flow'])}")
             pct = f" ({t['pnl_pct']:+.2f}%)" if t.get("pnl_pct") is not None else ""
-            print(f"    運用損益   : {_signed_yen(t['pnl'])}{pct}"
-                  + ("" if t["comparable"] else "  ⚠ 台帳範囲が変化、入出金の除去は概算"))
+            print(f"    運用損益   : {trend_yen(t['pnl'])}{pct}"
+                  + ("" if t["comparable"] else "  ⚠ 台帳の網羅性不足または不明"))
             print(f"    日次       : 集計 {st['counted_days']} 日 (上昇 {st['up_days']} / 下落 {st['down_days']})"
                   f", 欠損 {st['missing_days']} 日")
             if st["best"]:
@@ -1229,7 +1232,7 @@ def cmd_trend(_client, args) -> int:
         if h:
             pct = f" ({h['pnl_pct']:+.2f}%)" if h.get("pnl_pct") is not None else ""
             print(f"  [世帯合計] 総資産 {_yen(h['start_total'])} → {_yen(h['end_total'])}"
-                  f"  純入金(期間) {_signed_yen(h['net_flow'])}  運用損益 {_signed_yen(h['pnl'])}{pct}")
+                  f"  純入金(期間) {trend_yen(h['net_flow'])}  運用損益 {trend_yen(h['pnl'])}{pct}")
             if not h["aligned"]:
                 print(f"    ⚠ 口座ごとに起点が異なる({h['starts'][0]} 〜 {h['starts'][-1]})ため、合計は参考値")
         print(f"\n  注: {p['note']}")
@@ -1243,14 +1246,14 @@ def cmd_trend(_client, args) -> int:
                 continue
             pct = f" ({t['pnl_pct']:+.2f}%)" if t.get("pnl_pct") is not None else ""
             L.append(f"- **{lab}** {t['start']['date']}→{t['end']['date']}: 運用損益 "
-                     f"**{_signed_yen(t['pnl'])}**{pct} / 純入金(期間) {_signed_yen(t['net_flow'])} / "
+                     f"**{trend_yen(t['pnl'])}**{pct} / 純入金(期間) {trend_yen(t['net_flow'])} / "
                      f"総資産 {_yen(t['end']['total'])}")
             for g in t["stats"]["gaps"]:
                 L.append(f"  - ⚠ 空白期間 {g['from']}→{g['to']}"
                          + (f"(区間 {_signed_yen(g['range_pnl'])})" if g["range_pnl"] is not None else ""))
         h = p.get("household")
         if h:
-            L.append(f"- **世帯合計** 運用損益 **{_signed_yen(h['pnl'])}** / 総資産 {_yen(h['end_total'])}"
+            L.append(f"- **世帯合計** 運用損益 **{trend_yen(h['pnl'])}** / 総資産 {_yen(h['end_total'])}"
                      + ("" if h["aligned"] else " (⚠ 口座ごとに起点が異なる・参考値)"))
         L.append(f"\n> {p['note']}")
         print("\n".join(L))

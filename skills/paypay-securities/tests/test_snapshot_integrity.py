@@ -19,7 +19,7 @@ def _tmp_redirect():
 
 def _snap(ts, gt, nd=0, rz=0, sources=None, **extra):
     return {"ts": ts, "as_of": ts, "grand_total": gt, "net_deposit": nd, "realized_total": rz,
-            "sources": sources or {"securities": "ok", "invtrust": "ok", "ledger": "ok",
+            "ledger_full": True, "sources": sources or {"securities": "ok", "invtrust": "ok", "ledger": "ok",
                                    "invledger": "ok", "cash": "live"}, **extra}
 
 
