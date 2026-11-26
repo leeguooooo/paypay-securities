@@ -140,9 +140,14 @@ days) read-only snapshot of **every** profile + a calendar rebuild + a Monday
 
 **`trend`** reads only the saved snapshots (no login): start→end 総資産 change,
 期間の純入金, and 運用損益 = change − net deposits (% = simple Dietz), daily up/down
-counts, best/worst day and weekly sums. A gap of more than 7 days between usable
-snapshots is shown as a gap with its range P&L, never booked as one day (same rule in
-`calendar`). `-a all` adds a household line, flagged when the accounts' windows
+counts, best/worst day and weekly sums. Cash-adjusted P&L requires both endpoint
+snapshots to have complete ledgers and known net deposits; otherwise trend and
+calendar report it as unavailable (JSON `null`), not zero or an estimate. Legacy
+snapshots without a completeness marker are treated as unknown. Old snapshots
+marked complete before this fix may still need to be regenerated because earlier
+versions inferred completeness from record count. A gap of more than 7 days between
+usable snapshots is shown as a gap, never booked as one day (same rule in `calendar`);
+its range P&L is only shown when cash flows are comparable. `-a all` adds a household line, flagged when the accounts' windows
 don't start on the same day. Facts only.
 
 **`calendar`** reads only the saved snapshots (no creds/network) and builds a
