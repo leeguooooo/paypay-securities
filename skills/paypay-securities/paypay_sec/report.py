@@ -479,6 +479,7 @@ def daily_pnl_series(snapshots: list[dict]) -> dict[str, dict]:
                for snap in (prev, s) for v in (snap.get("sources") or {}).values()):
             quality = "partial"
         out[d] = {
+            "comparison_from": _snap_date(prev),
             "pnl": pnl,
             "pnl_pct": round(pnl / pgt * 100, 2) if pgt else None,
             "total_assets": gt,
