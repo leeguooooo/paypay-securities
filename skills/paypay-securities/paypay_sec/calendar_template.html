@@ -1688,10 +1688,14 @@ function monthCell(dt){
   </td>`;
 }
 
-function countableInPeriod(day, period){
+function countableInPeriod(day, period, endDate){
+  // Adjacent calendar-day returns belong to their end date, including at
+  // month/year boundaries. UTC arithmetic avoids DST-dependent lengths.
+  const oneDay = day.comparison_from && endDate &&
+    Date.parse(endDate+'T00:00:00Z') - Date.parse(day.comparison_from+'T00:00:00Z') === 86400000;
   return day.has && day.pnl!=null && day.data_quality!=='missing' &&
     !(state.account==='total' && day.data_quality!=='full') &&
-    (!day.comparison_from || day.comparison_from.startsWith(period));
+    (!day.comparison_from || day.comparison_from.startsWith(period) || oneDay);
 }
 function monthSummary(year, month){
   let sum=0, best=null, worst=null, up=0, down=0, flat=0, valid=0;
@@ -1699,7 +1703,7 @@ function monthSummary(year, month){
   for(let d=1; d<=daysInMonth; d++){
     const ds = ymd(new Date(year, month, d));
     const day = getDay(ds, state.account);
-    if(!countableInPeriod(day, ds.slice(0,7))) continue;
+    if(!countableInPeriod(day, ds.slice(0,7), ds)) continue;
     valid++;
     sum += day.pnl;
     if(best===null || day.pnl>best.pnl) best={ds, pnl:day.pnl};
@@ -1709,21 +1713,21 @@ function monthSummary(year, month){
   const winRate = (up+down)>0 ? Math.round(up/(up+down)*100) : 0;
   const sumCls = "txt-"+signClass(sum);
 
-  function dlabel(o){ if(!o) return "—"; const [,,dd]=o.ds.split("-"); return `${Number(dd)}日`; }
+  function dlabel(o){ if(!o) return "—"; const [,,dd]=o.ds.split("-"); return `结束于 ${Number(dd)}日`; }
 
   return `<div class="month-summary" aria-label="本月汇总">
-    <div class="stat"><div class="k">${state.account==='total'?'可比日累计盈亏':'本月累计盈亏'}</div>
+    <div class="stat"><div class="k">${state.account==='total'?'可比区间累计盈亏':'本月累计盈亏'}</div>
       <div class="v ${sumCls}">${valid?fmtJPY(sum):'—'}</div>
-      <div class="vsub">${valid} 个可计入日 · 排除跨月区间${state.account==='total'?'及部分/缺失':''}</div></div>
-    <div class="stat"><div class="k">最佳单日</div>
+      <div class="vsub">${valid} 个可计入区间 · 排除跨月多日区间${state.account==='total'?'及部分/缺失':''}</div></div>
+    <div class="stat"><div class="k">最佳区间</div>
       <div class="v ${best?'txt-'+signClass(best.pnl):''}">${best?fmtJPY(best.pnl):'—'}</div>
       <div class="vsub">${dlabel(best)}</div></div>
-    <div class="stat"><div class="k">最差单日</div>
+    <div class="stat"><div class="k">最差区间</div>
       <div class="v ${worst?'txt-'+signClass(worst.pnl):''}">${worst?fmtJPY(worst.pnl):'—'}</div>
       <div class="vsub">${dlabel(worst)}</div></div>
-    <div class="stat"><div class="k">涨 / 跌 天数</div>
+    <div class="stat"><div class="k">涨 / 跌 区间数</div>
       <div class="v"><span class="txt-up">${up}</span> / <span class="txt-dn">${down}</span></div>
-      <div class="vsub">胜率 ${winRate}%</div></div>
+      <div class="vsub">区间胜率 ${winRate}%</div></div>
   </div>`;
 }
 
@@ -1738,10 +1742,10 @@ function renderYear(){
   for(const d of DATA.days){
     if(!d.date.startsWith(String(year)+"-")) continue;
     const day = getDay(d.date, state.account);
-    if(!countableInPeriod(day, String(year))) continue;
+    if(!countableInPeriod(day, String(year), d.date)) continue;
     valid++; sum+=day.pnl;
     const m = Number(d.date.split("-")[1])-1;
-    if(countableInPeriod(day, d.date.slice(0,7))){ monthSum[m]+=day.pnl; monthHas[m]=true; }
+    if(countableInPeriod(day, d.date.slice(0,7), d.date)){ monthSum[m]+=day.pnl; monthHas[m]=true; }
     if(best===null||day.pnl>best.pnl) best={ds:d.date,pnl:day.pnl};
     if(worst===null||day.pnl<worst.pnl) worst={ds:d.date,pnl:day.pnl};
     if(day.pnl>0) up++; else if(day.pnl<0) down++;
@@ -1755,11 +1759,11 @@ function renderYear(){
   const sumCls="txt-"+signClass(sum);
 
   let html = `<div class="year-summary" aria-label="全年汇总">
-    <div class="stat"><div class="k">${state.account==='total'?'全年可比日累计盈亏':'全年累计盈亏'}</div><div class="v ${sumCls}">${valid?fmtJPY(sum):'—'}</div><div class="vsub">${valid} 个可计入日 · 排除跨年区间${state.account==='total'?'及部分/缺失':''}</div></div>
-    <div class="stat"><div class="k">最佳单日</div><div class="v ${best?'txt-'+signClass(best.pnl):''}">${best?fmtJPY(best.pnl):'—'}</div><div class="vsub">${best?best.ds.slice(5):'—'}</div></div>
-    <div class="stat"><div class="k">最差单日</div><div class="v ${worst?'txt-'+signClass(worst.pnl):''}">${worst?fmtJPY(worst.pnl):'—'}</div><div class="vsub">${worst?worst.ds.slice(5):'—'}</div></div>
+    <div class="stat"><div class="k">${state.account==='total'?'全年可比区间累计盈亏':'全年累计盈亏'}</div><div class="v ${sumCls}">${valid?fmtJPY(sum):'—'}</div><div class="vsub">${valid} 个可计入区间 · 排除跨年多日区间${state.account==='total'?'及部分/缺失':''}</div></div>
+    <div class="stat"><div class="k">最佳区间</div><div class="v ${best?'txt-'+signClass(best.pnl):''}">${best?fmtJPY(best.pnl):'—'}</div><div class="vsub">${best?'结束于 '+best.ds.slice(5):'—'}</div></div>
+    <div class="stat"><div class="k">最差区间</div><div class="v ${worst?'txt-'+signClass(worst.pnl):''}">${worst?fmtJPY(worst.pnl):'—'}</div><div class="vsub">${worst?'结束于 '+worst.ds.slice(5):'—'}</div></div>
     <div class="stat"><div class="k">最佳 / 最差月份</div><div class="v" style="font-size:15px">${bestM!=null?(bestM+1)+'月':'—'} / ${worstM!=null?(worstM+1)+'月':'—'}</div><div class="vsub">${bestM!=null?fmtJPY(monthSum[bestM]):''}${worstM!=null?' · '+fmtJPY(monthSum[worstM]):''}</div></div>
-    <div class="stat"><div class="k">涨 / 跌 天数</div><div class="v"><span class="txt-up">${up}</span> / <span class="txt-dn">${down}</span></div><div class="vsub">胜率 ${(up+down)>0?Math.round(up/(up+down)*100):0}%</div></div>
+    <div class="stat"><div class="k">涨 / 跌 区间数</div><div class="v"><span class="txt-up">${up}</span> / <span class="txt-dn">${down}</span></div><div class="vsub">区间胜率 ${(up+down)>0?Math.round(up/(up+down)*100):0}%</div></div>
   </div>`;
 
   html += `<section class="card" aria-label="年度热力图"><div class="heatmap-scroll">${buildHeatmap(year)}</div></section>`;
@@ -1861,7 +1865,9 @@ function tooltipHTML(ds){
 
   // 主值
   const cls = "t-"+signClass(day.pnl);
-  html += `<div class="t-row"><span class="nm">当日盈亏</span><span class="vl ${cls}">${arrowOf(day.pnl)} ${fmtJPY(day.pnl)}${day.pnl_pct!=null?'  '+fmtPct(day.pnl_pct):''}</span></div>`;
+  html += `<div class="t-row"><span class="nm">区间盈亏</span><span class="vl ${cls}">${arrowOf(day.pnl)} ${fmtJPY(day.pnl)}${day.pnl_pct!=null?'  '+fmtPct(day.pnl_pct):''}</span></div>`;
+
+  if(day.comparison_from) html += `<div class="t-note">区间 ${day.comparison_from} → ${ds}</div>`;
 
   // 合计时展开各账户明细
   if(state.account==="total" && day.perAcct){

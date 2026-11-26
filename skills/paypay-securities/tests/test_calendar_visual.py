@@ -34,7 +34,9 @@ with sync_playwright() as p:
     assert len(colors) > 2, 'partial stripes absent from rendered screenshot'
     cell.hover()
     assert '收盘资产（部分）' in page.locator('#tip').inner_text()
-    assert '0 个可计入日' in page.locator('.month-summary').inner_text()
+    assert '0 个可计入区间' in page.locator('.month-summary').inner_text()
+    page.locator('[data-date="2026-02-02"]').hover()
+    assert '区间 2026-01-31 → 2026-02-02' in page.locator('#tip').inner_text()
     page.locator('#prevBtn').click()
     assert '2026年1月' in page.locator('#periodLabel').inner_text()
     page.locator('#nextBtn').click()
